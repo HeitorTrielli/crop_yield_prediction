@@ -94,6 +94,16 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
     model.train()
     scaler = GradScaler("cuda")
 
+    # Debug: Store initial weights for first batch to check if they change
+    if hasattr(train_epoch_aggregated, "_first_batch"):
+        first_batch = False
+    else:
+        first_batch = True
+        train_epoch_aggregated._first_batch = False
+        # Store a sample weight to check if it changes
+        sample_param = next(iter(model.parameters()))
+        train_epoch_aggregated._initial_weight = sample_param.data.clone()
+
     # Prioritize MAX_PIXEL_BATCH_SIZE for speed (reduces forward passes)
     # Increase CHUNKS_PER_GRAD_UPDATE for stability (doesn't affect speed much)
     MAX_PIXEL_BATCH_SIZE = (
@@ -193,7 +203,7 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                         municipality_X_chunk, device
                     )
 
-                    with autocast("cuda"):
+                    with autocast("cuda", dtype=torch.float32):
                         chunk_predictions = model(municipality_X_chunk)
 
                     # Clip predictions to prevent extreme values that could cause overflow
@@ -340,39 +350,37 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                                 municipality_sum_normalized.flatten()[0:1]
                             )
 
-                        # Ensure target has same shape
-                        target_normalized = target.squeeze()
+                        # Ensure target has same shape and dtype
+                        target_normalized = target.squeeze().to(torch.float32)
                         if target_normalized.dim() == 0:
                             target_normalized = target_normalized.unsqueeze(0)
 
-                        # Debug: Print values for all municipalities (first update only to avoid spam)
-                        if chunk_idx <= CHUNKS_PER_GRAD_UPDATE:
+                        # Ensure municipality_sum_normalized is float32
+                        municipality_sum_normalized = municipality_sum_normalized.to(
+                            torch.float32
+                        )
+
+                        # Compare accumulated sum to proportional target
+                        # For intermediate updates, scale target by fraction of chunks processed
+                        # This ensures we're comparing partial sum to partial target
+                        fraction_processed = (
+                            chunk_idx / total_chunks if total_chunks > 0 else 1.0
+                        )
+                        expected_partial_target = (
+                            target_normalized * fraction_processed
+                        ).to(torch.float32)
+
+                        # Debug: Print condensed info for first update only
+                        if idx == 0 and chunk_idx <= CHUNKS_PER_GRAD_UPDATE:
                             print(
-                                f"  🔍 DEBUG: Municipality {municipality_code} (batch idx {muni_idx})"
-                            )
-                            print(f"      Target: {target_normalized.item():.4f}")
-                            print(
-                                f"      Accumulated sum: {municipality_sum_normalized.item():.4f}"
-                            )
-                            print(f"      Chunks processed: {chunk_idx}/{total_chunks}")
-                            print(
-                                f"      Sum is NaN: {torch.isnan(municipality_sum_normalized).any().item()}"
-                            )
-                            print(
-                                f"      Target is NaN: {torch.isnan(target_normalized).any().item()}"
+                                f"  🔍 Muni {municipality_code}: target={target_normalized.item():.0f}, pred={municipality_sum_normalized.item():.0f}, chunks={chunk_idx}/{total_chunks}"
                             )
 
-                        # Compare accumulated sum to full target
-                        # For incremental updates, we scale by 1/num_updates to get correct average
-                        num_updates = (
-                            total_chunks + CHUNKS_PER_GRAD_UPDATE - 1
-                        ) // CHUNKS_PER_GRAD_UPDATE
-                        update_weight = 1.0 / num_updates if num_updates > 0 else 1.0
-
-                        with autocast("cuda"):
-                            muni_loss = torch.nn.functional.mse_loss(
-                                municipality_sum_normalized, target_normalized
-                            )
+                        # Compute loss in float32 to avoid overflow (loss values can be very large)
+                        # Don't use autocast here since we need float32 precision for large loss values
+                        muni_loss = torch.nn.functional.mse_loss(
+                            municipality_sum_normalized, expected_partial_target
+                        )
 
                         # Debug: Check loss
                         if torch.isnan(muni_loss) or torch.isinf(muni_loss):
@@ -380,13 +388,29 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                                 f"  ❌ DEBUG: Municipality {municipality_code} has invalid loss: {muni_loss.item()}"
                             )
                             print(
-                                f"      Target: {target_normalized.item()}, Sum: {municipality_sum_normalized.item()}"
+                                f"      Expected partial target: {expected_partial_target.item():.4f}, Sum: {municipality_sum_normalized.item():.4f}"
                             )
-                            print(f"      Chunks: {chunk_idx}/{total_chunks}")
+                            print(
+                                f"      Chunks: {chunk_idx}/{total_chunks}, Fraction processed: {fraction_processed:.4f}"
+                            )
                             break
 
-                        # Scale loss by update weight for correct gradient accumulation
+                        # Scale loss by 1/num_updates for gradient accumulation across multiple updates
+                        num_updates = (
+                            total_chunks + CHUNKS_PER_GRAD_UPDATE - 1
+                        ) // CHUNKS_PER_GRAD_UPDATE
+                        update_weight = 1.0 / num_updates if num_updates > 0 else 1.0
                         scaled_loss = muni_loss * update_weight
+
+                        # Loss info only shown if there's an issue (handled below)
+
+                        # Skip backward if loss is invalid
+                        if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
+                            print(
+                                f"  ❌ DEBUG: Skipping backward for municipality {municipality_code} - scaled_loss is invalid: {scaled_loss.item()}"
+                            )
+                            break
+
                         scaler.scale(scaled_loss).backward()
                         batch_has_gradients = (
                             True  # Mark that gradients were accumulated
@@ -418,14 +442,19 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                                 municipality_sum_normalized.flatten()[0:1]
                             )
 
-                        target_normalized = target.squeeze()
+                        target_normalized = target.squeeze().to(torch.float32)
                         if target_normalized.dim() == 0:
                             target_normalized = target_normalized.unsqueeze(0)
 
-                        with autocast("cuda"):
-                            final_loss = torch.nn.functional.mse_loss(
-                                municipality_sum_normalized, target_normalized
-                            )
+                        # Ensure municipality_sum_normalized is float32
+                        municipality_sum_normalized = municipality_sum_normalized.to(
+                            torch.float32
+                        )
+
+                        # Compute final loss in float32 to avoid overflow
+                        final_loss = torch.nn.functional.mse_loss(
+                            municipality_sum_normalized, target_normalized
+                        )
 
                         if torch.isnan(final_loss) or torch.isinf(final_loss):
                             print(
@@ -441,9 +470,57 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                 # Only if at least one municipality accumulated gradients
                 if (muni_idx + 1) == num_municipalities:
                     if batch_has_gradients:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
+                        # Debug: Check if gradients exist before stepping
+                        has_grad = any(
+                            p.grad is not None and p.grad.abs().sum() > 0
+                            for p in model.parameters()
+                        )
+                        # Check for NaN gradients before optimizer step
+                        has_nan_grad = any(
+                            p.grad is not None and torch.isnan(p.grad).any()
+                            for p in model.parameters()
+                        )
+
+                        if idx == 0:  # Print only for first batch
+                            if has_nan_grad:
+                                print(
+                                    f"  ⚠️  WARNING: NaN gradients detected - skipping optimizer step!"
+                                )
+                            else:
+                                total_grad_norm = sum(
+                                    p.grad.norm().item()
+                                    for p in model.parameters()
+                                    if p.grad is not None
+                                )
+                                print(
+                                    f"  🔧 Optimizer step: grad_norm={total_grad_norm:.2e}, lr={optimizer.param_groups[0]['lr']:.2e}"
+                                )
+
+                        if has_nan_grad:
+                            optimizer.zero_grad()
+                        else:
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad()
+
+                            # Debug: Check if weights changed (only for first batch)
+                            if first_batch and idx == 0:
+                                sample_param = next(iter(model.parameters()))
+                                weight_diff = (
+                                    (
+                                        sample_param.data
+                                        - train_epoch_aggregated._initial_weight
+                                    )
+                                    .abs()
+                                    .max()
+                                    .item()
+                                )
+                                if weight_diff < 1e-10:
+                                    print(f"      ⚠️  WARNING: Weights did not change!")
+                                else:
+                                    print(
+                                        f"      ✓ Weights updated (change: {weight_diff:.2e})"
+                                    )
                     else:
                         # No gradients accumulated in this batch, skip optimizer step
                         optimizer.zero_grad()
@@ -521,7 +598,7 @@ def test_epoch_aggregated(model, criterion, dataloader, device, args):
                             municipality_X_chunk, device
                         )
 
-                        with autocast("cuda"):
+                        with autocast("cuda", dtype=torch.float32):
                             chunk_predictions = model(municipality_X_chunk)
                         pixel_predictions_chunks.append(chunk_predictions.cpu())
 
@@ -530,7 +607,7 @@ def test_epoch_aggregated(model, criterion, dataloader, device, args):
                     )
                     predictions_list.append(pixel_predictions)
 
-                with autocast("cuda"):
+                with autocast("cuda", dtype=torch.float32):
                     loss = criterion(predictions_list, targets, num_pixels_list)
                 losses.update(loss.item(), len(municipalities))
 

@@ -223,7 +223,7 @@ def train(args):
 
     if args.pretrained:
         print(f"Loading pretrained model from {args.pretrained}")
-        checkpoint = torch.load(args.pretrained, map_location=device)
+        checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state"], strict=False)
 
     if args.suffix:
@@ -319,7 +319,7 @@ def train(args):
 
     # Test
     print("Restoring best model weights for testing...")
-    checkpoint = torch.load(best_model_path)
+    checkpoint = torch.load(best_model_path, weights_only=False)
     state_dict = {k: v for k, v in checkpoint["model_state"].items()}
     criterion = checkpoint["criterion"]
     torch.save({"model_state": state_dict, "criterion": criterion}, best_model_path)
