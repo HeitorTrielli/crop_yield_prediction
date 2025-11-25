@@ -1,0 +1,55 @@
+[project]
+name = "sits-moco"
+version = "0.1.0"
+description = "Satellite Image Time Series for Yield Prediction using MoCo"
+requires-python = ">=3.8,<3.12"
+dependencies = [
+    # Core ML/DL
+    "torch>=1.11.0",
+    "torchvision>=0.12.0",
+    "numpy>=1.22.0,<1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+
+    # Data handling
+    "pandas>=1.3.5,<2.0.0",
+    "pyarrow>=10.0.0",      # For Parquet support
+    "polars>=0.19.0",       # For faster index loading (Polars-optimized version)
+    "h5py>=3.7.0",
+
+    # Geospatial
+    "geopandas>=0.10.2",
+    "rasterio>=1.2.10",
+    "shapely>=1.8.0",
+    "pyproj>=3.3.0",
+    "fiona>=1.8.20",
+
+    # Visualization
+    "matplotlib>=3.5.1",
+    "seaborn>=0.11.0",
+
+    # Utilities
+    "tqdm>=4.62.0",
+    "pyyaml>=6.0",
+    "pillow>=9.1.0",
+    "requests>=2.28.0",
+    "unidecode>=1.3.0", # For municipality name normalization
+
+    # Jupyter (optional, for development)
+    "jupyterlab>=3.5.0",
+    "ipython>=8.0.0",
+    "notebook>=6.5.0",
+]
+
+[project.optional-dependencies]
+dev = ["black>=23.3.0", "pytest>=7.3.0", "pytest-benchmark>=3.4.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["datasets", "models", "moco"]
+
+[tool.uv]
+dev-dependencies = []
