@@ -34,8 +34,10 @@ class USCropsAggregatedNPY(Dataset):
         dataaug=None,
         randomchoice=False,
         interp=False,
-        seed=111,
+        seed=27,
         preload_ram=False,
+        target_mean=None,
+        target_std=None,
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -47,6 +49,11 @@ class USCropsAggregatedNPY(Dataset):
         self.sequencelength = sequencelength
         self.rc = randomchoice
         self.interp = interp
+
+        # Store normalization parameters
+        self.target_mean = target_mean if target_mean is not None else 0.0
+        self.target_std = target_std if target_std is not None else 1.0
+        self.normalize_targets = target_mean is not None and target_std is not None
 
         # Load yield targets with Polars
         print(f"Loading yield targets from {yield_csv}...")
@@ -192,6 +199,10 @@ class USCropsAggregatedNPY(Dataset):
                 target = float(target)
             except (ValueError, TypeError):
                 target = 0.0
+
+        # Normalize target if normalization is enabled
+        if self.normalize_targets:
+            target = (target - self.target_mean) / self.target_std
 
         # Return municipality code (no metadata needed - we load directly from .npy)
         return municipality_code, torch.tensor(target, dtype=torch.float32), num_pixels

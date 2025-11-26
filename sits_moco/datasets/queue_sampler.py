@@ -94,9 +94,10 @@ class QueueSampler(Sampler):
                 samples_needed = 0
             else:
                 # Take all remaining items from queue
+                items_taken_this_iteration = len(self.queue)
                 while len(self.queue) > 0:
                     sampled_indices.append(self.queue.popleft())
-                samples_needed -= len(sampled_indices)
+                samples_needed -= items_taken_this_iteration
 
                 # Refill queue (ensures no boundary overlap)
                 self._refill_queue()

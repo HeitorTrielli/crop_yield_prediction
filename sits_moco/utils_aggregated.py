@@ -35,16 +35,22 @@ def regression_metrics(y_pred, y_true):
 class AggregatedMSELoss(nn.Module):
     """Loss function: sums pixel predictions per municipality, compares to municipality target."""
 
-    def __init__(self, reduction="mean"):
+    def __init__(
+        self, reduction="mean", loss_scale_factor=1e4, target_mean=None, target_std=None
+    ):
         super().__init__()
         self.reduction = reduction
         self.mse = nn.MSELoss(reduction="none")
+        self.loss_scale_factor = loss_scale_factor
+        self.target_mean = target_mean if target_mean is not None else 0.0
+        self.target_std = target_std if target_std is not None else 1.0
+        self.normalize = target_mean is not None and target_std is not None
 
     def forward(self, predictions_list, targets, num_pixels_list=None):
         """
         Args:
             predictions_list: List of tensors, one per municipality [num_pixels, num_outputs]
-            targets: [batch_size] - Municipality-level targets
+            targets: [batch_size] - Municipality-level targets (already normalized if normalize=True)
         """
         aggregated_predictions = []
         for pred in predictions_list:
@@ -58,7 +64,19 @@ class AggregatedMSELoss(nn.Module):
         if targets.dim() > 1 and targets.size(1) == 1:
             targets = targets.squeeze(1)
 
-        loss = self.mse(aggregated, targets)
+        # Normalize predictions if normalization is enabled (targets are already normalized)
+        if self.normalize:
+            aggregated = (aggregated - self.target_mean) / self.target_std
+
+        # Scale predictions and targets before computing loss to avoid overflow in mixed precision
+        aggregated_scaled = aggregated / self.loss_scale_factor
+        targets_scaled = targets / self.loss_scale_factor
+
+        # Compute loss on scaled values
+        loss_scaled = self.mse(aggregated_scaled, targets_scaled)
+
+        # Scale loss back to original scale
+        loss = loss_scaled * (self.loss_scale_factor**2)
 
         if self.reduction == "mean":
             return loss.mean()
@@ -83,7 +101,16 @@ def aggregated_collate_fn(batch):
     return municipalities, targets, num_pixels_list
 
 
-def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args):
+def train_epoch_aggregated(
+    model,
+    optimizer,
+    criterion,
+    dataloader,
+    device,
+    args,
+    target_mean=None,
+    target_std=None,
+):
     """Training epoch: process municipalities, sum pixel predictions, compare to targets."""
     from torch.amp import GradScaler, autocast
     from tqdm import tqdm
@@ -111,6 +138,10 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
     )
     CHUNKS_PER_GRAD_UPDATE = 200  # Lower is fine: mainly affects gradient accumulation, not computation speed
 
+    # Loss scaling factor for mixed precision (bfloat16/float16)
+    # Values are scaled down before loss computation to avoid overflow, then scaled back
+    LOSS_SCALE_FACTOR = 1e4  # Scale predictions/targets by this before computing loss
+
     with tqdm(enumerate(dataloader), total=len(dataloader), leave=True) as iterator:
         for idx, (municipalities, targets, num_pixels_list) in iterator:
             targets = targets.to(device).float()
@@ -132,10 +163,7 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                         f"  ❌ DEBUG: Municipality {municipality_code} has invalid target: {target}"
                     )
                     continue
-                if target.item() < 0:
-                    print(
-                        f"  ⚠️  DEBUG: Municipality {municipality_code} has negative target: {target.item()}"
-                    )
+                # Note: Negative targets are normal after normalization, so we don't warn about them
 
                 dataset = dataloader.dataset
                 municipality_sum = None
@@ -203,7 +231,8 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                         municipality_X_chunk, device
                     )
 
-                    with autocast("cuda", dtype=torch.float32):
+                    # Use bfloat16 for faster computation with Tensor Cores
+                    with autocast("cuda", dtype=torch.bfloat16):
                         chunk_predictions = model(municipality_X_chunk)
 
                     # Clip predictions to prevent extreme values that could cause overflow
@@ -355,10 +384,16 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                         if target_normalized.dim() == 0:
                             target_normalized = target_normalized.unsqueeze(0)
 
-                        # Ensure municipality_sum_normalized is float32
+                        # Ensure municipality_sum_normalized is float32 for accumulation
                         municipality_sum_normalized = municipality_sum_normalized.to(
                             torch.float32
                         )
+
+                        # Normalize predictions if normalization is enabled (targets are already normalized)
+                        if target_mean is not None and target_std is not None:
+                            municipality_sum_normalized = (
+                                municipality_sum_normalized - target_mean
+                            ) / target_std
 
                         # Compare accumulated sum to proportional target
                         # For intermediate updates, scale target by fraction of chunks processed
@@ -370,17 +405,25 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                             target_normalized * fraction_processed
                         ).to(torch.float32)
 
-                        # Debug: Print condensed info for first update only
-                        if idx == 0 and chunk_idx <= CHUNKS_PER_GRAD_UPDATE:
-                            print(
-                                f"  🔍 Muni {municipality_code}: target={target_normalized.item():.0f}, pred={municipality_sum_normalized.item():.0f}, chunks={chunk_idx}/{total_chunks}"
-                            )
-
-                        # Compute loss in float32 to avoid overflow (loss values can be very large)
-                        # Don't use autocast here since we need float32 precision for large loss values
-                        muni_loss = torch.nn.functional.mse_loss(
-                            municipality_sum_normalized, expected_partial_target
+                        # Scale predictions and targets before computing loss to avoid overflow in mixed precision
+                        # This allows us to use bfloat16 autocast while avoiding numerical issues
+                        municipality_sum_scaled = (
+                            municipality_sum_normalized / LOSS_SCALE_FACTOR
                         )
+                        expected_partial_target_scaled = (
+                            expected_partial_target / LOSS_SCALE_FACTOR
+                        )
+
+                        # Compute loss on scaled values (will be much smaller, avoiding overflow)
+                        muni_loss_scaled = torch.nn.functional.mse_loss(
+                            municipality_sum_scaled, expected_partial_target_scaled
+                        )
+
+                        # Scale loss back to original scale: loss = loss_scaled * scale^2
+                        # This ensures gradients are computed correctly
+                        muni_loss = muni_loss_scaled * (LOSS_SCALE_FACTOR**2)
+
+                        # Don't print intermediate updates - only print final result per municipality
 
                         # Debug: Check loss
                         if torch.isnan(muni_loss) or torch.isinf(muni_loss):
@@ -402,8 +445,6 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                         update_weight = 1.0 / num_updates if num_updates > 0 else 1.0
                         scaled_loss = muni_loss * update_weight
 
-                        # Loss info only shown if there's an issue (handled below)
-
                         # Skip backward if loss is invalid
                         if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
                             print(
@@ -418,6 +459,12 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
 
                         # Detach to break computational graph for next iteration
                         municipality_sum = municipality_sum.detach()
+
+                        # Continue processing remaining chunks (don't exit loop early)
+                        # Only break if this was the last chunk
+                        if is_last_chunk:
+                            break
+                        continue
 
                 # Calculate final loss for this municipality (for logging)
                 if municipality_sum is not None and chunk_idx > 0:
@@ -451,10 +498,25 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                             torch.float32
                         )
 
-                        # Compute final loss in float32 to avoid overflow
-                        final_loss = torch.nn.functional.mse_loss(
-                            municipality_sum_normalized, target_normalized
+                        # Normalize predictions if normalization is enabled (targets are already normalized)
+                        if target_mean is not None and target_std is not None:
+                            municipality_sum_normalized = (
+                                municipality_sum_normalized - target_mean
+                            ) / target_std
+
+                        # Scale predictions and targets before computing loss to avoid overflow
+                        municipality_sum_scaled = (
+                            municipality_sum_normalized / LOSS_SCALE_FACTOR
                         )
+                        target_scaled = target_normalized / LOSS_SCALE_FACTOR
+
+                        # Compute loss on scaled values
+                        final_loss_scaled = torch.nn.functional.mse_loss(
+                            municipality_sum_scaled, target_scaled
+                        )
+
+                        # Scale loss back to original scale
+                        final_loss = final_loss_scaled * (LOSS_SCALE_FACTOR**2)
 
                         if torch.isnan(final_loss) or torch.isinf(final_loss):
                             print(
@@ -464,6 +526,22 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                                 f"      Target: {target_normalized.item()}, Sum: {municipality_sum_normalized.item()}"
                             )
                         else:
+                            # Debug: Print final result for this municipality (one line only)
+                            # Show denormalized values for readability
+                            if target_mean is not None and target_std is not None:
+                                target_denorm = (
+                                    target_normalized.item() * target_std + target_mean
+                                )
+                                pred_denorm = (
+                                    municipality_sum_normalized.item() * target_std
+                                    + target_mean
+                                )
+                            else:
+                                target_denorm = target_normalized.item()
+                                pred_denorm = municipality_sum_normalized.item()
+                            print(
+                                f"  Muni {municipality_code}: target={target_denorm:.0f}, pred={pred_denorm:.0f}, chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
+                            )
                             total_loss += final_loss.item()
 
                 # Step optimizer after processing all municipalities in the batch
@@ -481,24 +559,31 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
                             for p in model.parameters()
                         )
 
-                        if idx == 0:  # Print only for first batch
-                            if has_nan_grad:
-                                print(
-                                    f"  ⚠️  WARNING: NaN gradients detected - skipping optimizer step!"
-                                )
-                            else:
-                                total_grad_norm = sum(
-                                    p.grad.norm().item()
-                                    for p in model.parameters()
-                                    if p.grad is not None
-                                )
-                                print(
-                                    f"  🔧 Optimizer step: grad_norm={total_grad_norm:.2e}, lr={optimizer.param_groups[0]['lr']:.2e}"
-                                )
-
                         if has_nan_grad:
                             optimizer.zero_grad()
                         else:
+                            # Clip gradients to prevent explosion
+                            # Max norm of 1.0 is standard; scale by loss_scale_factor to account for loss scaling
+                            max_grad_norm = (
+                                1.0 * LOSS_SCALE_FACTOR
+                            )  # Scale clipping threshold (1e4)
+                            scaler.unscale_(
+                                optimizer
+                            )  # Unscale gradients before clipping
+                            # clip_grad_norm_ returns the total norm before clipping
+                            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), max_norm=max_grad_norm
+                            )
+
+                            clipped_status = (
+                                "clipped"
+                                if total_grad_norm > max_grad_norm
+                                else "not clipped"
+                            )
+                            print(
+                                f"  🔧 Optimizer step: grad_norm={total_grad_norm:.2e} ({clipped_status}, max={max_grad_norm:.2e}), lr={optimizer.param_groups[0]['lr']:.2e}"
+                            )
+
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad()
@@ -554,7 +639,9 @@ def train_epoch_aggregated(model, optimizer, criterion, dataloader, device, args
     return losses.avg
 
 
-def test_epoch_aggregated(model, criterion, dataloader, device, args):
+def test_epoch_aggregated(
+    model, criterion, dataloader, device, args, target_mean=None, target_std=None
+):
     """Test/validation epoch."""
     from torch.amp import autocast
     from tqdm import tqdm
@@ -598,7 +685,8 @@ def test_epoch_aggregated(model, criterion, dataloader, device, args):
                             municipality_X_chunk, device
                         )
 
-                        with autocast("cuda", dtype=torch.float32):
+                        # Use bfloat16 for faster computation with Tensor Cores
+                        with autocast("cuda", dtype=torch.bfloat16):
                             chunk_predictions = model(municipality_X_chunk)
                         pixel_predictions_chunks.append(chunk_predictions.cpu())
 
@@ -607,7 +695,9 @@ def test_epoch_aggregated(model, criterion, dataloader, device, args):
                     )
                     predictions_list.append(pixel_predictions)
 
-                with autocast("cuda", dtype=torch.float32):
+                # Use bfloat16 for faster computation with Tensor Cores
+                # Note: criterion handles aggregation internally
+                with autocast("cuda", dtype=torch.bfloat16):
                     loss = criterion(predictions_list, targets, num_pixels_list)
                 losses.update(loss.item(), len(municipalities))
 
@@ -617,7 +707,13 @@ def test_epoch_aggregated(model, criterion, dataloader, device, args):
                 if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
                     aggregated_preds = aggregated_preds.squeeze(1)
 
-                all_aggregated_preds.append(aggregated_preds.cpu().numpy())
+                # Denormalize predictions and targets for evaluation metrics
+                if target_mean is not None and target_std is not None:
+                    aggregated_preds = aggregated_preds * target_std + target_mean
+                    targets = targets * target_std + target_mean
+
+                # Convert to float32 before numpy conversion (bfloat16 not supported by NumPy)
+                all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
                 all_targets.append(targets.cpu().numpy())
 
         all_aggregated_preds = np.concatenate(all_aggregated_preds)

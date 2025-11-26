@@ -14,13 +14,13 @@ import torch.optim
 from torch.utils.data import DataLoader
 
 from datasets import USCropsAggregatedNPY
+from models.weight_init import weight_init_regression
 from utils import (
     AverageMeter,
     adjust_learning_rate,
     get_ntrainparams,
     recursive_todevice,
     save,
-    weight_init,
 )
 from utils_aggregated import (
     AggregatedMSELoss,
@@ -34,7 +34,7 @@ from utils_aggregated import (
 DATAPATH = Path(r"files/yield_dataset")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
 YEARS = [2023]
-SEEDS = [111]
+SEEDS = [27]
 
 
 def parse_args():
@@ -68,8 +68,8 @@ def parse_args():
         "-j",
         "--workers",
         type=int,
-        default=0,
-        help="number of CPU workers to load the next batch",
+        default=8,
+        help="number of CPU workers to load the next batch (default: 8)",
     )
     parser.add_argument(
         "-e", "--epochs", type=int, default=100, help="number of training epochs"
@@ -129,7 +129,7 @@ def parse_args():
         default=None,
         help="path to yield CSV file with municipality codes and production",
     )
-    parser.add_argument("--seed", type=int, default=111, help="random seed")
+    parser.add_argument("--seed", type=int, default=27, help="random seed")
     parser.add_argument(
         "--sample-ratio",
         type=float,
@@ -216,7 +216,8 @@ def train(args):
     print(
         f"Initialized {model.modelname}: Total trainable parameters: {get_ntrainparams(model)}"
     )
-    model.apply(weight_init)
+    # Use regression-specific initialization with smaller output layer weights
+    model.apply(weight_init_regression)
 
     if args.pretrained:
         print(f"Loading pretrained model from {args.pretrained}")
@@ -232,12 +233,27 @@ def train(args):
             f"Yield_{model.modelname}_{args.rc_str}_{args.year}_Seed{args.seed}"
         )
 
+    # Compile model for faster execution (PyTorch 2.0+)
+    # Wrap in try-except in case compilation fails (e.g., missing Python headers in WSL)
+    if hasattr(torch, "compile"):
+        try:
+            print("Compiling model with torch.compile() for faster execution...")
+            model = torch.compile(model)
+            print("Model compilation successful!")
+        except Exception as e:
+            print(
+                f"⚠️  Warning: torch.compile() failed ({type(e).__name__}), continuing without compilation"
+            )
+            print(f"   Error: {str(e)[:200]}...")
+            # Continue with uncompiled model
+
     logdir = Path(args.logdir) / model.modelname
     logdir.mkdir(parents=True, exist_ok=True)
     best_model_path = logdir / "model_best.pth"
     print(f"Logging results to {logdir}")
 
-    criterion = AggregatedMSELoss()
+    # Use loss scaling factor of 1e4 to match training loss scaling
+    criterion = AggregatedMSELoss(loss_scale_factor=1e4)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -420,6 +436,9 @@ def main():
             torch.manual_seed(SEED)
             torch.cuda.manual_seed_all(SEED)
             torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = (
+                True  # Enable cuDNN benchmarking for faster convolutions
+            )
 
             logdir = train(args)
 

@@ -2,7 +2,7 @@
 name = "sits-moco"
 version = "0.1.0"
 description = "Satellite Image Time Series for Yield Prediction using MoCo"
-requires-python = ">=3.8,<3.12"
+requires-python = ">=3.8,<3.13"
 dependencies = [
     # Core ML/DL
     "torch>=1.11.0",
