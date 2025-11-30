@@ -4,27 +4,40 @@ Adapted from STNet classification model.
 """
 
 import math
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .STNet import linlayer, PositionalEncoding
+from .STNet import PositionalEncoding, linlayer
 
 
 class STNetRegression(nn.Module):
     """
     STNet model adapted for regression tasks.
-    
+
     Changes from classification version:
     - Output layer outputs num_outputs (default 1) instead of num_classes
     - No softmax activation
     - Returns continuous values instead of class logits
     """
-    def __init__(self, input_dim=10, num_outputs=1, d_model=128, n_head=16, n_layers=1, 
-                 d_inner=128, activation="relu", dropout=0.2, max_len=366, max_seq_len=70, 
-                 T=1000, max_temporal_shift=30):
+
+    def __init__(
+        self,
+        input_dim=10,
+        num_outputs=1,
+        d_model=128,
+        n_head=16,
+        n_layers=1,
+        d_inner=128,
+        activation="relu",
+        dropout=0.2,
+        max_len=366,
+        max_seq_len=70,
+        T=1000,
+        max_temporal_shift=30,
+    ):
         super(STNetRegression, self).__init__()
         self.modelname = "STNetRegression"
         self.max_seq_len = max_seq_len
@@ -38,11 +51,17 @@ class STNetRegression(nn.Module):
         self.inlayernorm = nn.LayerNorm(d_model)
 
         self.dropout = nn.Dropout(dropout)
-        self.position_enc = PositionalEncoding(d_model, max_len=max_len + 2 * max_temporal_shift, T=T)
+        self.position_enc = PositionalEncoding(
+            d_model, max_len=max_len + 2 * max_temporal_shift, T=T
+        )
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model, n_head, d_inner, dropout, activation, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, n_head, d_inner, dropout, activation, batch_first=True
+        )
         encoder_norm = nn.LayerNorm(d_model)
-        self.transformerencoder = nn.TransformerEncoder(encoder_layer, n_layers, encoder_norm)
+        self.transformerencoder = nn.TransformerEncoder(
+            encoder_layer, n_layers, encoder_norm
+        )
 
         # Regression decoder: outputs num_outputs continuous values
         layers = []
@@ -50,10 +69,13 @@ class STNetRegression(nn.Module):
         for i in range(len(decoder) - 1):
             layers.append(nn.Linear(decoder[i], decoder[i + 1]))
             if i < (len(decoder) - 2):
-                layers.extend([
-                    nn.BatchNorm1d(decoder[i + 1]),
-                    nn.ReLU()
-                ])
+                layers.extend(
+                    [
+                        nn.BatchNorm1d(decoder[i + 1]),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),  # Add dropout to prediction layers
+                    ]
+                )
         self.decoder = nn.Sequential(*layers)
 
     def forward(self, x, is_bert=False):
@@ -80,6 +102,5 @@ class STNetRegression(nn.Module):
 
         # Regression output: continuous values (no softmax)
         output = self.decoder(x)
-        
-        return output
 
+        return output

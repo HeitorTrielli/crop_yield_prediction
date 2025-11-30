@@ -37,7 +37,7 @@ from utils_aggregated import (
 DATAPATH = Path(r"files/yield_dataset")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
 YEARS = [2023]
-SEEDS = [4343]
+SEEDS = [4348]
 
 
 def parse_args():
@@ -88,7 +88,7 @@ def parse_args():
         "-lr",
         "--learning-rate",
         type=float,
-        default=1e-3,
+        default=1e-4,
         help="optimizer learning rate (default 1e-3)",
     )
     parser.add_argument(
@@ -132,7 +132,7 @@ def parse_args():
         default=None,
         help="path to yield CSV file with municipality codes and production",
     )
-    parser.add_argument("--seed", type=int, default=4343, help="random seed")
+    parser.add_argument("--seed", type=int, default=4348, help="random seed")
     parser.add_argument(
         "--sample-ratio",
         type=float,
@@ -282,12 +282,75 @@ def train(args):
     # Use regression-specific initialization with smaller output layer weights
     model.apply(weight_init_regression)
 
+    # Load pretrained model weights (will load full state later if resuming)
+    pretrained_checkpoint = None
     if args.pretrained:
-        print(f"Loading pretrained model from {args.pretrained}")
-        checkpoint = torch.load(
-            args.pretrained, map_location=device, weights_only=False
+        pretrained_path = Path(args.pretrained)
+        print(f"Loading pretrained model from {pretrained_path}")
+        pretrained_checkpoint = torch.load(
+            pretrained_path, map_location=device, weights_only=False
         )
-        model.load_state_dict(checkpoint["model_state"], strict=False)
+
+        # Load all weights including decoder (for regression checkpoints)
+        pretrain_state = pretrained_checkpoint["model_state"]
+        model_dict = model.state_dict()
+
+        # Handle MoCo checkpoints (encoder_q prefix) - only for MoCo pretraining
+        if "moco" in str(pretrained_path).lower() or any(
+            k.startswith("encoder_q") for k in pretrain_state.keys()
+        ):
+            # For MoCo checkpoints, extract encoder_q weights and map to model
+            state_dict = {}
+            for k in list(pretrain_state.keys()):
+                if (
+                    k.startswith("encoder_q")
+                    and not k.startswith("encoder_q.decoder")
+                    and not k.startswith("encoder_q.classification")
+                    and not k.startswith("encoder_q.position_enc.pe")
+                ):
+                    # Remove encoder_q prefix
+                    state_dict[k[len("encoder_q.") :]] = pretrain_state[k]
+            model_dict.update(state_dict)
+            model.load_state_dict(model_dict, strict=False)
+            # Re-initialize decoder for MoCo -> Regression transfer
+            print("  ✓ Loaded MoCo encoder weights, re-initializing decoder")
+            model.decoder.apply(weight_init_regression)
+        else:
+            # For regression checkpoints, load everything including decoder
+            # Filter to only matching keys to avoid shape mismatches
+            state_dict = {
+                k: v for k, v in pretrain_state.items() if k in model_dict.keys()
+            }
+            missing_keys = set(model_dict.keys()) - set(state_dict.keys())
+            unexpected_keys = set(state_dict.keys()) - set(model_dict.keys())
+
+            if missing_keys:
+                print(
+                    f"  ⚠️  Missing keys (will use initialized values): {list(missing_keys)[:5]}..."
+                )
+            if unexpected_keys:
+                print(
+                    f"  ⚠️  Unexpected keys (will be ignored): {list(unexpected_keys)[:5]}..."
+                )
+
+            # Load state dict - handle compiled models if needed
+            load_result = model.load_state_dict(state_dict, strict=False)
+            if load_result.missing_keys:
+                print(
+                    f"  ⚠️  Missing keys after load: {load_result.missing_keys[:5]}..."
+                )
+            if load_result.unexpected_keys:
+                print(
+                    f"  ⚠️  Unexpected keys after load: {load_result.unexpected_keys[:5]}..."
+                )
+            print(f"  ✓ Loaded {len(state_dict)}/{len(model_dict)} model parameters")
+
+            # Verify decoder weights were loaded
+            decoder_keys = [k for k in state_dict.keys() if "decoder" in k]
+            if decoder_keys:
+                print(f"  ✓ Loaded decoder weights: {len(decoder_keys)} parameters")
+            else:
+                print(f"  ⚠️  Warning: No decoder weights found in checkpoint!")
 
     if args.suffix:
         model.modelname = f"Yield_{model.modelname}_{args.rc_str}_{args.year}_Seed{args.seed}_{args.suffix}"
@@ -326,12 +389,71 @@ def train(args):
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
 
+    # Initialize training state
+    start_epoch = 0
     log = list()
     val_loss_min = np.Inf
     not_improved_count = 0
 
+    # Resume from checkpoint if pretrained model is provided
+    if pretrained_checkpoint is not None:
+        checkpoint = pretrained_checkpoint
+        print(f"Resuming training from checkpoint...")
+
+        # Load optimizer state if available
+        if "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            print("  ✓ Loaded optimizer state")
+
+        # Load training state if available
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"]
+            print(f"  ✓ Resuming from epoch {start_epoch}")
+
+        if "val_loss_min" in checkpoint:
+            val_loss_min = checkpoint["val_loss_min"]
+            print(f"  ✓ Loaded best validation loss: {val_loss_min:.4f}")
+        elif "val_loss" in checkpoint:
+            # Fallback for older checkpoints
+            val_loss_min = checkpoint["val_loss"]
+            print(f"  ✓ Loaded validation loss: {val_loss_min:.4f}")
+
+        if "not_improved_count" in checkpoint:
+            not_improved_count = checkpoint["not_improved_count"]
+            print(f"  ✓ Loaded not_improved_count: {not_improved_count}")
+
+        # Note: target_mean and target_std are recomputed from data, but saved for reference
+        if "target_mean" in checkpoint and "target_std" in checkpoint:
+            saved_mean = checkpoint["target_mean"]
+            saved_std = checkpoint["target_std"]
+            if (
+                abs(saved_mean - target_mean) > 1e-3
+                or abs(saved_std - target_std) > 1e-3
+            ):
+                print(f"  ⚠️  Warning: Normalization stats differ!")
+                print(f"      Saved: mean={saved_mean:.2f}, std={saved_std:.2f}")
+                print(f"      Current: mean={target_mean:.2f}, std={target_std:.2f}")
+            else:
+                print(f"  ✓ Normalization stats match")
+
+        # Load existing training log if it exists
+        trainlog_path = logdir / "trainlog.csv"
+        if trainlog_path.exists():
+            try:
+                existing_log_df = pd.read_csv(trainlog_path, index_col="epoch")
+                log = existing_log_df.to_dict("records")
+                # Convert epoch index back to int if it's not "test"
+                for entry in log:
+                    if isinstance(entry.get("epoch"), str) and entry["epoch"] != "test":
+                        entry["epoch"] = int(entry["epoch"])
+                print(f"  ✓ Loaded existing training log with {len(log)} entries")
+            except Exception as e:
+                print(f"  ⚠️  Could not load existing log: {e}, starting fresh")
+        else:
+            print("  ℹ️  No existing training log found, starting fresh")
+
     print(f"Training {model.modelname}...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Update sampler epoch for different shuffles each epoch
         if hasattr(traindataloader.sampler, "set_epoch"):
             traindataloader.sampler.set_epoch(epoch)
@@ -370,7 +492,19 @@ def train(args):
 
         if val_loss < val_loss_min:
             not_improved_count = 0
-            save(model, path=best_model_path, criterion=criterion)
+            save(
+                model,
+                path=best_model_path,
+                criterion=criterion,
+                optimizer_state=optimizer.state_dict(),
+                epoch=epoch + 1,
+                val_loss=val_loss,
+                train_loss=train_loss,
+                val_loss_min=val_loss,
+                not_improved_count=not_improved_count,
+                target_mean=target_mean,
+                target_std=target_std,
+            )
             val_loss_min = val_loss
             print(f"lowest val loss in epoch {epoch + 1}\n")
         else:
@@ -395,6 +529,10 @@ def train(args):
                 epoch=epoch + 1,
                 val_loss=val_loss,
                 train_loss=train_loss,
+                val_loss_min=val_loss_min,
+                not_improved_count=not_improved_count,
+                target_mean=target_mean,
+                target_std=target_std,
             )
             print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
 
@@ -413,7 +551,12 @@ def train(args):
     state_dict = {k: v for k, v in checkpoint["model_state"].items()}
     criterion = checkpoint["criterion"]
     torch.save({"model_state": state_dict, "criterion": criterion}, best_model_path)
-    model.load_state_dict(state_dict)
+
+    # Handle compiled models - load into underlying model if compiled
+    if hasattr(model, "_orig_mod"):
+        model._orig_mod.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
 
     test_loss, scores = test_epoch_aggregated(
         model, criterion, testdataloader, device, args, target_mean, target_std

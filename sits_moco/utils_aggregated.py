@@ -2,6 +2,8 @@
 Utilities for aggregated regression: pixel-level predictions → municipality-level targets.
 """
 
+from datetime import datetime
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -142,7 +144,16 @@ def train_epoch_aggregated(
     # Values are scaled down before loss computation to avoid overflow, then scaled back
     LOSS_SCALE_FACTOR = 1e4  # Scale predictions/targets by this before computing loss
 
-    with tqdm(enumerate(dataloader), total=len(dataloader), leave=True) as iterator:
+    # Create progress bar with timestamp prefix
+    timestamp_format = "%H:%M:%S"
+    initial_timestamp = datetime.now().strftime(timestamp_format)
+    with tqdm(
+        enumerate(dataloader),
+        total=len(dataloader),
+        leave=True,
+        bar_format=f"[{initial_timestamp}] "
+        + "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    ) as iterator:
         for idx, (municipalities, targets, num_pixels_list) in iterator:
             targets = targets.to(device).float()
             total_loss = 0.0
@@ -539,8 +550,9 @@ def train_epoch_aggregated(
                             else:
                                 target_denorm = target_normalized.item()
                                 pred_denorm = municipality_sum_normalized.item()
+                            timestamp = datetime.now().strftime("%H:%M:%S")
                             print(
-                                f"  Muni {municipality_code}: target={target_denorm:.0f}, pred={pred_denorm:.0f}, chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
+                                f"[{timestamp}] Muni {municipality_code}: target={target_denorm:.0f}, pred={pred_denorm:.0f}, chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
                             )
                             total_loss += final_loss.item()
 
@@ -658,7 +670,16 @@ def test_epoch_aggregated(
     )
 
     with torch.no_grad():
-        with tqdm(enumerate(dataloader), total=len(dataloader), leave=True) as iterator:
+        # Create progress bar with timestamp prefix
+        timestamp_format = "%H:%M:%S"
+        initial_timestamp = datetime.now().strftime(timestamp_format)
+        with tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            leave=True,
+            bar_format=f"[{initial_timestamp}] "
+            + "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        ) as iterator:
             for idx, (municipalities, targets, num_pixels_list) in iterator:
                 targets = targets.to(device).float()
                 predictions_list = []
@@ -707,9 +728,17 @@ def test_epoch_aggregated(
                 if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
                     aggregated_preds = aggregated_preds.squeeze(1)
 
-                # Denormalize predictions and targets for evaluation metrics
+                # Normalize predictions first (model outputs raw values, but targets are normalized)
+                # Then denormalize both for metrics computation in original scale
                 if target_mean is not None and target_std is not None:
-                    aggregated_preds = aggregated_preds * target_std + target_mean
+                    # Normalize predictions to match normalized targets
+                    aggregated_preds_normalized = (
+                        aggregated_preds - target_mean
+                    ) / target_std
+                    # Now both are in normalized space, denormalize for metrics
+                    aggregated_preds = (
+                        aggregated_preds_normalized * target_std + target_mean
+                    )
                     targets = targets * target_std + target_mean
 
                 # Convert to float32 before numpy conversion (bfloat16 not supported by NumPy)
