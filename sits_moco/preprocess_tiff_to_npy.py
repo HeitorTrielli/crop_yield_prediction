@@ -603,14 +603,6 @@ def main():
     print(f"  Yield template saved to: {yield_file}")
     print(f"  Please fill in yield_tons column with actual yield data")
 
-    print(f"\n⚠️  Note: You'll need to adapt the dataset class to read from .npy files")
-    print(f"    See: datasets/uscrops.py - modify __getitem__ to load from .npy")
-
-
-if __name__ == "__main__":
-    main()
-    print(f"    See: datasets/uscrops.py - modify __getitem__ to load from .npy")
-
 
 if __name__ == "__main__":
     main()

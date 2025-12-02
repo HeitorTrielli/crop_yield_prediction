@@ -29,7 +29,21 @@ def regression_metrics(y_pred, y_true):
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
     r2 = 1 - (ss_res / (ss_tot + 1e-10))
 
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-10))) * 100
+    # MAPE: Filter out values where y_true is too small (less than 1% of mean or absolute threshold)
+    # This prevents division by near-zero values that cause MAPE to explode
+    mean_y_true = np.mean(np.abs(y_true))
+    threshold = max(
+        mean_y_true * 0.01, 100.0
+    )  # At least 1% of mean or 100, whichever is larger
+    mape_mask = np.abs(y_true) >= threshold
+    if mape_mask.sum() > 0:
+        mape = (
+            np.mean(np.abs((y_true[mape_mask] - y_pred[mape_mask]) / y_true[mape_mask]))
+            * 100
+        )
+    else:
+        # If all values are too small, MAPE is not meaningful
+        mape = np.nan
 
     return {"rmse": rmse, "mae": mae, "r2": r2, "mape": mape}
 
@@ -37,13 +51,10 @@ def regression_metrics(y_pred, y_true):
 class AggregatedMSELoss(nn.Module):
     """Loss function: sums pixel predictions per municipality, compares to municipality target."""
 
-    def __init__(
-        self, reduction="mean", loss_scale_factor=1e4, target_mean=None, target_std=None
-    ):
+    def __init__(self, reduction="mean", target_mean=None, target_std=None):
         super().__init__()
         self.reduction = reduction
         self.mse = nn.MSELoss(reduction="none")
-        self.loss_scale_factor = loss_scale_factor
         self.target_mean = target_mean if target_mean is not None else 0.0
         self.target_std = target_std if target_std is not None else 1.0
         self.normalize = target_mean is not None and target_std is not None
@@ -70,15 +81,8 @@ class AggregatedMSELoss(nn.Module):
         if self.normalize:
             aggregated = (aggregated - self.target_mean) / self.target_std
 
-        # Scale predictions and targets before computing loss to avoid overflow in mixed precision
-        aggregated_scaled = aggregated / self.loss_scale_factor
-        targets_scaled = targets / self.loss_scale_factor
-
-        # Compute loss on scaled values
-        loss_scaled = self.mse(aggregated_scaled, targets_scaled)
-
-        # Scale loss back to original scale
-        loss = loss_scaled * (self.loss_scale_factor**2)
+        # Compute loss directly on normalized values
+        loss = self.mse(aggregated, targets)
 
         if self.reduction == "mean":
             return loss.mean()
@@ -139,10 +143,6 @@ def train_epoch_aggregated(
         2000  # Reduced to stay within dedicated VRAM (avoid slower shared memory)
     )
     CHUNKS_PER_GRAD_UPDATE = 200  # Lower is fine: mainly affects gradient accumulation, not computation speed
-
-    # Loss scaling factor for mixed precision (bfloat16/float16)
-    # Values are scaled down before loss computation to avoid overflow, then scaled back
-    LOSS_SCALE_FACTOR = 1e4  # Scale predictions/targets by this before computing loss
 
     # Create progress bar with timestamp prefix
     timestamp_format = "%H:%M:%S"
@@ -416,23 +416,10 @@ def train_epoch_aggregated(
                             target_normalized * fraction_processed
                         ).to(torch.float32)
 
-                        # Scale predictions and targets before computing loss to avoid overflow in mixed precision
-                        # This allows us to use bfloat16 autocast while avoiding numerical issues
-                        municipality_sum_scaled = (
-                            municipality_sum_normalized / LOSS_SCALE_FACTOR
+                        # Compute loss directly on normalized values
+                        muni_loss = torch.nn.functional.mse_loss(
+                            municipality_sum_normalized, expected_partial_target
                         )
-                        expected_partial_target_scaled = (
-                            expected_partial_target / LOSS_SCALE_FACTOR
-                        )
-
-                        # Compute loss on scaled values (will be much smaller, avoiding overflow)
-                        muni_loss_scaled = torch.nn.functional.mse_loss(
-                            municipality_sum_scaled, expected_partial_target_scaled
-                        )
-
-                        # Scale loss back to original scale: loss = loss_scaled * scale^2
-                        # This ensures gradients are computed correctly
-                        muni_loss = muni_loss_scaled * (LOSS_SCALE_FACTOR**2)
 
                         # Don't print intermediate updates - only print final result per municipality
 
@@ -515,19 +502,10 @@ def train_epoch_aggregated(
                                 municipality_sum_normalized - target_mean
                             ) / target_std
 
-                        # Scale predictions and targets before computing loss to avoid overflow
-                        municipality_sum_scaled = (
-                            municipality_sum_normalized / LOSS_SCALE_FACTOR
+                        # Compute loss directly on normalized values
+                        final_loss = torch.nn.functional.mse_loss(
+                            municipality_sum_normalized, target_normalized
                         )
-                        target_scaled = target_normalized / LOSS_SCALE_FACTOR
-
-                        # Compute loss on scaled values
-                        final_loss_scaled = torch.nn.functional.mse_loss(
-                            municipality_sum_scaled, target_scaled
-                        )
-
-                        # Scale loss back to original scale
-                        final_loss = final_loss_scaled * (LOSS_SCALE_FACTOR**2)
 
                         if torch.isnan(final_loss) or torch.isinf(final_loss):
                             print(
@@ -575,10 +553,9 @@ def train_epoch_aggregated(
                             optimizer.zero_grad()
                         else:
                             # Clip gradients to prevent explosion
-                            # Max norm of 1.0 is standard; scale by loss_scale_factor to account for loss scaling
-                            max_grad_norm = (
-                                1.0 * LOSS_SCALE_FACTOR
-                            )  # Scale clipping threshold (1e4)
+                            # Max norm of 5.0 is reasonable for normalized loss values
+                            # Allows gradients to flow while preventing extreme values
+                            max_grad_norm = 5.0
                             scaler.unscale_(
                                 optimizer
                             )  # Unscale gradients before clipping

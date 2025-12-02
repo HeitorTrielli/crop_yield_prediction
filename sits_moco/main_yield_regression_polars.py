@@ -37,7 +37,7 @@ from utils_aggregated import (
 DATAPATH = Path(r"files/yield_dataset")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
 YEARS = [2023]
-SEEDS = [4348]
+SEEDS = [4350]
 
 
 def parse_args():
@@ -132,7 +132,7 @@ def parse_args():
         default=None,
         help="path to yield CSV file with municipality codes and production",
     )
-    parser.add_argument("--seed", type=int, default=4348, help="random seed")
+    parser.add_argument("--seed", type=int, default=4350, help="random seed")
     parser.add_argument(
         "--sample-ratio",
         type=float,
@@ -378,10 +378,8 @@ def train(args):
     best_model_path = logdir / "model_best.pth"
     print(f"Logging results to {logdir}")
 
-    # Use loss scaling factor of 1e4 to match training loss scaling
     # Pass normalization stats for denormalization in evaluation
     criterion = AggregatedMSELoss(
-        loss_scale_factor=1e4,
         target_mean=target_mean,
         target_std=target_std,
     )

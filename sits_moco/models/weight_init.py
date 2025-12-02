@@ -95,14 +95,11 @@ def weight_init_regression(m):
         init.normal_(m.weight.data, mean=0, std=1)
         init.constant_(m.bias.data, 0)
     elif isinstance(m, nn.Linear):
-        # Check if this is the final output layer (has 1 output)
         if m.out_features == 1:
-            # Initialize final layer with much smaller weights for regression
             init.normal_(m.weight.data, mean=0.0, std=0.01)
             if m.bias is not None:
-                init.constant_(m.bias.data, 0.0)  # Start with zero bias
+                init.constant_(m.bias.data, 0.0)
         else:
-            # Use standard initialization for hidden layers
             init.kaiming_normal_(m.weight.data)
             if m.bias is not None:
                 init.normal_(m.bias.data)

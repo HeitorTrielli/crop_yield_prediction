@@ -73,7 +73,7 @@ class STNetRegression(nn.Module):
                     [
                         nn.BatchNorm1d(decoder[i + 1]),
                         nn.ReLU(),
-                        nn.Dropout(dropout),  # Add dropout to prediction layers
+                        nn.Dropout(dropout),
                     ]
                 )
         self.decoder = nn.Sequential(*layers)
@@ -88,19 +88,16 @@ class STNetRegression(nn.Module):
         x = self.inlayernorm(x)
         x = self.dropout(x + self.position_enc(doy))
 
-        # Transformer expects [N, T, D] format with batch_first=True
         x = self.transformerencoder(x, src_key_padding_mask=mask)
 
         # weight
         if not is_bert:
             weight = self.dropout(weight)
-            # Prevent division by zero: add small epsilon if sum is zero
             weight_sum = weight.sum(1).unsqueeze(1)
             weight_sum = torch.clamp(weight_sum, min=1e-8)  # Prevent division by zero
             weight /= weight_sum
             x = torch.bmm(weight.unsqueeze(1), x).squeeze()
 
-        # Regression output: continuous values (no softmax)
         output = self.decoder(x)
 
         return output
