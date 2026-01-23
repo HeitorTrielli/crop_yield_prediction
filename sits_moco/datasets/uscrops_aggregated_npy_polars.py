@@ -45,6 +45,7 @@ class USCropsAggregatedNPY(Dataset):
         assert mode in ["train", "valid", "eval"]
 
         self.root = Path(root)
+        self.year = year
         self.mode = mode
         self.sequencelength = sequencelength
         self.rc = randomchoice
@@ -95,41 +96,113 @@ class USCropsAggregatedNPY(Dataset):
             split_mapping = {"train": "train", "valid": "valid", "eval": "eval"}
             target_split = split_mapping.get(mode, mode)
             yield_df = yield_df.filter(pl.col("split") == target_split)
-            print(f"Filtered to {target_split} split: {len(yield_df)} municipalities")
+            print(f"Filtered to {target_split} split: {len(yield_df)} rows")
         elif "mode" in yield_df.columns:
             yield_df = yield_df.filter(pl.col("mode") == mode)
-            print(f"Filtered to {mode} mode: {len(yield_df)} municipalities")
+            print(f"Filtered to {mode} mode: {len(yield_df)} rows")
 
-        # Build yield map
+        # Build yield map and track (municipality, year) pairs for multi-year mode
         yield_dict = yield_df.select([municipality_code_col, yield_col]).to_dict()
         self.yield_map = dict(
             zip(yield_dict[municipality_code_col], yield_dict[yield_col])
         )
-        print(f"Loaded yield targets for {len(self.yield_map)} municipalities")
+        
+        # For multi-year mode, track which (municipality, year) pairs are in this split
+        self.split_pairs = set()  # Set of (municipality_code, year) tuples
+        if "year" in yield_df.columns and self.year is None:
+            # Multi-year mode: track which (municipality, year) pairs belong to this split
+            year_dict = yield_df.select([municipality_code_col, "year"]).to_dict()
+            for muni_code, year_val in zip(year_dict[municipality_code_col], year_dict["year"]):
+                if year_val is not None:
+                    try:
+                        year_int = int(year_val)
+                        self.split_pairs.add((str(muni_code), year_int))
+                    except (ValueError, TypeError):
+                        continue
+        
+        print(f"Loaded yield targets for {len(self.yield_map)} municipality entries")
 
         # No index needed - load pixel counts directly from .npy files
         print(f"Loading pixel counts from .npy files...")
-        municipality_pixel_counts = {}  # {muni_code: num_pixels}
+        municipality_pixel_counts = (
+            {}
+        )  # {(muni_code, year): num_pixels} or {muni_code: num_pixels}
+        municipality_years = {}  # {(muni_code, year): year} or {muni_code: year}
 
         target_municipalities = set(self.yield_map.keys())
 
         # Check which municipalities have .npy files and get pixel counts
+        # Files are organized as root/year/municipality_code/municipality_code.npy
+        missing_municipalities = []
         for muni_code in target_municipalities:
-            muni_npy_file = self.root / muni_code / f"{muni_code}.npy"
-            if muni_npy_file.exists():
-                try:
-                    # Load with memory mapping to get shape without loading full file
-                    data = np.load(muni_npy_file, mmap_mode="r")
-                    num_pixels = len(data)
-                    if num_pixels > 0:
-                        municipality_pixel_counts[muni_code] = num_pixels
-                except Exception as e:
-                    print(f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}")
-                    continue
+            found = False
+            if self.year is not None:
+                # Check specific year
+                muni_npy_file = self.root / str(self.year) / f"{muni_code}.npy"
+                if not muni_npy_file.exists():
+                    # Try subdirectory path: root/year/municipality_code/municipality_code.npy
+                    muni_npy_file = (
+                        self.root / str(self.year) / muni_code / f"{muni_code}.npy"
+                    )
+                if muni_npy_file.exists():
+                    try:
+                        data = np.load(muni_npy_file, mmap_mode="r")
+                        num_pixels = len(data)
+                        if num_pixels > 0:
+                            municipality_pixel_counts[muni_code] = num_pixels
+                            municipality_years[muni_code] = self.year
+                            found = True
+                    except Exception as e:
+                        if len(missing_municipalities) < 3:
+                            print(f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}")
+                        missing_municipalities.append(muni_code)
+            else:
+                # Check ALL year directories - create separate samples for each year
+                # BUT only for (municipality, year) pairs that are in the current split
+                for year_dir in sorted(self.root.iterdir()):
+                    if year_dir.is_dir() and year_dir.name.isdigit():
+                        year = int(year_dir.name)
+                        
+                        # If we have split_pairs, only include this year if (muni_code, year) is in the split
+                        if self.split_pairs and (muni_code, year) not in self.split_pairs:
+                            continue
+                        
+                        # Try direct path first: root/year/municipality_code.npy
+                        muni_npy_file = year_dir / f"{muni_code}.npy"
+                        if not muni_npy_file.exists():
+                            # Try subdirectory path: root/year/municipality_code/municipality_code.npy
+                            muni_npy_file = year_dir / muni_code / f"{muni_code}.npy"
+                        if muni_npy_file.exists():
+                            try:
+                                data = np.load(muni_npy_file, mmap_mode="r")
+                                num_pixels = len(data)
+                                if num_pixels > 0:
+                                    # Store as (muni_code, year) tuple for multi-year support
+                                    key = (muni_code, year)
+                                    municipality_pixel_counts[key] = num_pixels
+                                    municipality_years[key] = year
+                                    found = True
+                                    # Don't break - continue to find all years in this split
+                            except Exception as e:
+                                if len(missing_municipalities) < 3:
+                                    print(
+                                        f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}"
+                                    )
+                                continue
+            if not found:
+                missing_municipalities.append(muni_code)
+
+        if len(missing_municipalities) > 0:
+            print(
+                f"  ⚠️  Warning: {len(missing_municipalities)} municipalities without .npy files"
+            )
 
         # Filter to only municipalities with pixels
+        # When year=None, keys are (muni_code, year) tuples; otherwise just muni_code
         self.municipality_list = sorted(municipality_pixel_counts.keys())
         self.municipality_pixel_counts = municipality_pixel_counts
+        self.municipality_years = municipality_years
+        self.use_multi_year = self.year is None  # Flag to indicate multi-year mode
 
         print(
             f"Found {len(self.municipality_list)} municipalities with pixels and yield data"
@@ -152,9 +225,59 @@ class USCropsAggregatedNPY(Dataset):
         self.npy_cache = {}
         self.npy_cache_max_size = 50
 
-    def load_pixels_from_municipality(self, municipality_code, chunk_size=10000):
-        """Load pixels from municipality .npy file in chunks."""
-        muni_npy_file = self.root / municipality_code / f"{municipality_code}.npy"
+    def load_pixels_from_municipality(
+        self, municipality_code, year=None, chunk_size=10000
+    ):
+        """Load pixels from municipality .npy file in chunks.
+
+        Args:
+            municipality_code: Municipality code
+            year: Year to load (required if use_multi_year=True, optional otherwise)
+            chunk_size: Number of pixels per chunk
+        """
+        # Determine which year to use
+        if year is None:
+            if self.year is not None:
+                year = self.year
+            elif self.use_multi_year:
+                # In multi-year mode, year should be provided
+                # Fallback: try to find any year
+                for year_dir in sorted(self.root.iterdir()):
+                    if year_dir.is_dir() and year_dir.name.isdigit():
+                        candidate = (
+                            year_dir / municipality_code / f"{municipality_code}.npy"
+                        )
+                        if candidate.exists():
+                            year = int(year_dir.name)
+                            break
+                if year is None:
+                    return  # No file found
+            else:
+                # Single-year mode: use stored year
+                if municipality_code in self.municipality_years:
+                    year = self.municipality_years[municipality_code]
+                else:
+                    # Fallback: Find first available year directory with this municipality
+                    for year_dir in sorted(self.root.iterdir()):
+                        if year_dir.is_dir() and year_dir.name.isdigit():
+                            candidate = (
+                                year_dir
+                                / municipality_code
+                                / f"{municipality_code}.npy"
+                            )
+                            if candidate.exists():
+                                year = int(year_dir.name)
+                                break
+                    if year is None:
+                        return  # No file found
+
+        # Files are organized as root/year/municipality_code/municipality_code.npy
+        muni_npy_file = self.root / str(year) / f"{municipality_code}.npy"
+        if not muni_npy_file.exists():
+            # Try subdirectory path
+            muni_npy_file = (
+                self.root / str(year) / municipality_code / f"{municipality_code}.npy"
+            )
 
         if muni_npy_file not in self.npy_cache:
             if muni_npy_file.exists():
@@ -187,8 +310,16 @@ class USCropsAggregatedNPY(Dataset):
 
     def __getitem__(self, index):
         """Return municipality code and municipality-level yield target."""
-        municipality_code = self.municipality_list[index]
-        num_pixels = self.municipality_pixel_counts[municipality_code]
+        key = self.municipality_list[index]
+
+        # Handle both single-year (key is muni_code) and multi-year (key is (muni_code, year)) modes
+        if self.use_multi_year:
+            municipality_code, year = key
+        else:
+            municipality_code = key
+            year = self.municipality_years[municipality_code]
+
+        num_pixels = self.municipality_pixel_counts[key]
 
         target = self.yield_map[municipality_code]
         # Handle null/NaN values (Polars uses None for null)
@@ -204,8 +335,13 @@ class USCropsAggregatedNPY(Dataset):
         if self.normalize_targets:
             target = (target - self.target_mean) / self.target_std
 
-        # Return municipality code (no metadata needed - we load directly from .npy)
-        return municipality_code, torch.tensor(target, dtype=torch.float32), num_pixels
+        # Return municipality code, target, num_pixels, and year (year needed for loading correct .npy file)
+        return (
+            municipality_code,
+            torch.tensor(target, dtype=torch.float32),
+            num_pixels,
+            year,
+        )
 
     def _transform_pixel(self, x):
         """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY."""

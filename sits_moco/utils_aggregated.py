@@ -97,14 +97,23 @@ def aggregated_collate_fn(batch):
     municipalities = []
     targets = []
     num_pixels_list = []
+    years = []
 
-    for X_tuple, target, num_pixels in batch:
-        municipalities.append(X_tuple)
+    for item in batch:
+        if len(item) == 4:
+            # Multi-year mode: (municipality_code, target, num_pixels, year)
+            municipality_code, target, num_pixels, year = item
+            years.append(year)
+        else:
+            # Single-year mode: (municipality_code, target, num_pixels)
+            municipality_code, target, num_pixels = item
+            years.append(None)
+        municipalities.append(municipality_code)
         targets.append(target)
         num_pixels_list.append(num_pixels)
 
     targets = torch.stack(targets)
-    return municipalities, targets, num_pixels_list
+    return municipalities, targets, num_pixels_list, years
 
 
 def train_epoch_aggregated(
@@ -154,7 +163,7 @@ def train_epoch_aggregated(
         bar_format=f"[{initial_timestamp}] "
         + "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ) as iterator:
-        for idx, (municipalities, targets, num_pixels_list) in iterator:
+        for idx, (municipalities, targets, num_pixels_list, years) in iterator:
             targets = targets.to(device).float()
             total_loss = 0.0
             num_municipalities = len(municipalities)
@@ -192,8 +201,10 @@ def train_epoch_aggregated(
                     )
                     continue
 
+                # Get year for this municipality (if multi-year mode)
+                year = years[muni_idx] if years[muni_idx] is not None else None
                 for pixel_chunk in dataset.load_pixels_from_municipality(
-                    municipality_code, chunk_size=MAX_PIXEL_BATCH_SIZE
+                    municipality_code, year=year, chunk_size=MAX_PIXEL_BATCH_SIZE
                 ):
                     # Skip empty chunks
                     if len(pixel_chunk) == 0:
@@ -657,7 +668,7 @@ def test_epoch_aggregated(
             bar_format=f"[{initial_timestamp}] "
             + "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         ) as iterator:
-            for idx, (municipalities, targets, num_pixels_list) in iterator:
+            for idx, (municipalities, targets, num_pixels_list, years) in iterator:
                 targets = targets.to(device).float()
                 predictions_list = []
 
@@ -665,13 +676,27 @@ def test_epoch_aggregated(
                     dataset = dataloader.dataset
                     pixel_predictions_chunks = []
 
+                    # Get year for this municipality (if multi-year mode)
+                    year = years[muni_idx] if years[muni_idx] is not None else None
                     for pixel_chunk in dataset.load_pixels_from_municipality(
-                        municipality_code, chunk_size=MAX_PIXEL_BATCH_SIZE
+                        municipality_code, year=year, chunk_size=MAX_PIXEL_BATCH_SIZE
                     ):
+                        # Skip empty chunks
+                        if len(pixel_chunk) == 0:
+                            continue
+
                         chunk_x = torch.stack([p[0] for p in pixel_chunk])
                         chunk_mask = torch.stack([p[1] for p in pixel_chunk])
                         chunk_doy = torch.stack([p[2] for p in pixel_chunk])
                         chunk_weight = torch.stack([p[3] for p in pixel_chunk])
+
+                        # Ensure chunk_x has correct shape: [batch_size, seq_len, features]
+                        # If it's 2D, add batch dimension
+                        if chunk_x.dim() == 2:
+                            chunk_x = chunk_x.unsqueeze(0)
+                            chunk_mask = chunk_mask.unsqueeze(0)
+                            chunk_doy = chunk_doy.unsqueeze(0)
+                            chunk_weight = chunk_weight.unsqueeze(0)
 
                         municipality_X_chunk = (
                             chunk_x,

@@ -22,9 +22,9 @@ import rasterio
 from tqdm import tqdm
 
 # Configuration
-TIFF_ROOT_DIR = Path("files/gee_images")  # Root directory with municipality subfolders
-OUTPUT_DIR = Path("files/yield_dataset")  # Where to save data
-YIELD_CSV = Path("files/yield_data.csv")  # Municipality yield targets (to be created)
+TIFF_ROOT_DIR = Path("files")
+OUTPUT_DIR = Path("files/yield_dataset")
+YIELD_CSV = Path("files/yield_data.csv")
 
 # Band names (10 spectral bands)
 BANDNAMES = [
@@ -244,15 +244,18 @@ def process_tile(args):
     return tile_data, len(all_pixel_data), str(npy_filename)
 
 
-def process_municipality(municipality_code, tiff_files, output_dir, num_workers=None):
+def process_municipality(
+    municipality_code, year, tiff_files, output_dir, num_workers=None
+):
     """
-    Process all .tiff files for one municipality.
-    Extract all pixels from all tiles and save as a single .npy file per municipality.
+    Process all .tiff files for one municipality/year combination.
+    Extract all pixels from all tiles and save as a single .npy file per municipality/year.
 
     Args:
         municipality_code: Municipality code (e.g., '4100103')
-        tiff_files: List of .tiff file paths for this municipality
-        output_dir: Directory to save data
+        year: Year (e.g., 2018)
+        tiff_files: List of .tiff file paths for this municipality/year
+        output_dir: Directory to save data (will create year subdirectory)
 
     Returns:
         Number of pixels processed
@@ -260,11 +263,14 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
     # Group files by month
     files_by_month = defaultdict(list)
     for tiff_file in tiff_files:
-        _, year, month, _, _ = parse_filename(tiff_file)
+        _, file_year, month, _, _ = parse_filename(tiff_file)
+        if file_year != year:
+            continue  # Skip files from different years
         files_by_month[month].append(tiff_file)
 
-    # Create output directory for this municipality
-    muni_dir = output_dir / municipality_code
+    # Create output directory for this municipality/year: OUTPUT_DIR/year/municipality_code
+    year_dir = output_dir / str(year)
+    muni_dir = year_dir / municipality_code
     muni_dir.mkdir(parents=True, exist_ok=True)
 
     # Get all unique tile positions
@@ -278,7 +284,7 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
     num_expected_months = len(expected_months)
 
     print(
-        f"Processing municipality {municipality_code}: {len(tile_positions)} tiles, {num_expected_months} months"
+        f"Processing municipality {municipality_code} ({year}): {len(tile_positions)} tiles, {num_expected_months} months"
     )
 
     # Prepare tile info for processing
@@ -322,13 +328,15 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
 
     # Prepare arguments for parallel processing
     # Pass expected_months to ensure all tiles produce arrays with same shape
+    # Pass year_dir so process_tile creates correct directory structure
+    year_dir = output_dir / str(year)
     tile_args = [
         (
             municipality_code,
             info["tile_x"],
             info["tile_y"],
             info["tile_files_by_month"],
-            output_dir,
+            year_dir,  # Pass year_dir instead of output_dir
             progress_counter,
             progress_lock,
             expected_months,  # Pass expected months to ensure consistent shapes
@@ -378,7 +386,7 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
     with Pool(processes=num_workers) as pool:
         tile_progress = tqdm(
             total=total_expected_pixels,
-            desc=f"  Tiles ({municipality_code})",
+            desc=f"  Tiles ({municipality_code}, {year})",
             leave=False,
             unit="px",
         )
@@ -397,10 +405,11 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
 
         tile_progress.close()
 
-    # Combine all tiles into single .npy file per municipality
+    # Combine all tiles into single .npy file per municipality/year
     # Ensure output_dir is a Path object and resolve to absolute path for Windows compatibility
     output_dir = Path(output_dir).resolve()
-    muni_dir = output_dir / municipality_code
+    year_dir = output_dir / str(year)
+    muni_dir = year_dir / municipality_code
     muni_dir.mkdir(parents=True, exist_ok=True)
     muni_npy_file = muni_dir / f"{municipality_code}.npy"
 
@@ -436,7 +445,7 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
                         np.save(f, combined_data)
                 except Exception as e:
                     print(
-                        f"  ❌ Error saving combined data for {municipality_code}: {e}"
+                        f"  ❌ Error saving combined data for {municipality_code} ({year}): {e}"
                     )
                     raise
                 total_pixels = len(combined_data)
@@ -445,13 +454,15 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
                 # All pixels were filtered out - skip saving empty file
                 # Just return 0 to indicate no pixels were saved
                 # This avoids creating empty files and path issues
-                print(f"  ⚠️  Skipping {municipality_code} (all pixels filtered out)")
+                print(
+                    f"  ⚠️  Skipping {municipality_code} ({year}) (all pixels filtered out)"
+                )
                 total_pixels = 0
         else:
             # No tiles processed - skip saving empty file
             # Just return 0 to indicate no pixels were processed
             # This avoids creating empty files and path issues
-            print(f"  ⚠️  Skipping {municipality_code} (no tiles to process)")
+            print(f"  ⚠️  Skipping {municipality_code} ({year}) (no tiles to process)")
             total_pixels = 0
 
         # Clean up all temporary tile files (even if some failed to load)
@@ -486,7 +497,7 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
         return total_pixels
 
     except Exception as e:
-        print(f"  ❌ Error processing {municipality_code}: {e}")
+        print(f"  ❌ Error processing {municipality_code} ({year}): {e}")
         # Try to clean up temporary files even on error
         for tile_path in processed_tile_files:
             try:
@@ -497,47 +508,123 @@ def process_municipality(municipality_code, tiff_files, output_dir, num_workers=
         raise
 
 
+def find_year_folders(root_dir):
+    """
+    Find all year folders matching pattern gee_images_30m_YYYY.
+
+    Returns:
+        List of (year, folder_path) tuples
+    """
+    year_folders = []
+    for item in root_dir.iterdir():
+        if not item.is_dir():
+            continue
+        # Check if folder matches pattern: gee_images_30m_YYYY
+        if item.name.startswith("gee_images_30m_"):
+            try:
+                year_str = item.name.replace("gee_images_30m_", "")
+                year = int(year_str)
+                year_folders.append((year, item))
+            except ValueError:
+                continue
+    return sorted(year_folders)
+
+
+def find_tiff_files_in_year_folder(year_folder):
+    """
+    Find all .tif files in a year folder.
+    Handles two structures:
+    1. Files directly in year folder: gee_images_30m_2018/*.tif
+    2. Files in municipality subfolders: gee_images_30m_2020/municipality_code_*/ *.tif
+
+    Returns:
+        List of .tif file paths
+    """
+    tiff_files = []
+
+    # First, check for files directly in year folder
+    direct_files = list(year_folder.glob("*.tif"))
+    if direct_files:
+        tiff_files.extend(direct_files)
+
+    # Also check municipality subfolders (for years like 2020)
+    for subfolder in year_folder.iterdir():
+        if subfolder.is_dir():
+            tiff_files.extend(list(subfolder.glob("*.tif")))
+
+    return tiff_files
+
+
 def main():
     """Main preprocessing function."""
     print("=" * 60)
-    print("Fast Preprocessing: .tiff files → .npy files")
+    print("Fast Preprocessing: .tiff files → .npy files (Year by Year)")
     print("=" * 60)
 
     # Create output directory
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Find all .tiff files (recursively in municipality subfolders)
-    tiff_files = []
-    for muni_folder in TIFF_ROOT_DIR.iterdir():
-        if muni_folder.is_dir():
-            tiff_files.extend(list(muni_folder.glob("*.tif")))
+    # Find all year folders
+    year_folders = find_year_folders(TIFF_ROOT_DIR)
+    if not year_folders:
+        print(f"❌ No year folders found in {TIFF_ROOT_DIR}")
+        print(
+            "   Expected folders like: gee_images_30m_2018, gee_images_30m_2019, etc."
+        )
+        return
 
-    print(f"Found {len(tiff_files)} .tiff files")
+    print(f"Found {len(year_folders)} year folders: {[y for y, _ in year_folders]}")
 
-    # Group by municipality
-    municipalities = defaultdict(list)
-    for tiff_file in tiff_files:
-        municipality_code, _, _, _, _ = parse_filename(tiff_file)
-        municipalities[municipality_code].append(tiff_file)
+    # Process each year separately
+    all_municipalities_by_year = defaultdict(lambda: defaultdict(list))
 
-    print(f"Found {len(municipalities)} municipalities")
+    for year, year_folder in year_folders:
+        print(f"\n📁 Processing year {year} from {year_folder.name}...")
+        tiff_files = find_tiff_files_in_year_folder(year_folder)
+        print(f"   Found {len(tiff_files)} .tif files")
+
+        # Group by municipality for this year
+        for tiff_file in tiff_files:
+            try:
+                municipality_code, file_year, _, _, _ = parse_filename(tiff_file)
+                if file_year == year:  # Ensure year matches
+                    all_municipalities_by_year[year][municipality_code].append(
+                        tiff_file
+                    )
+            except Exception as e:
+                print(f"   ⚠️  Warning: Could not parse {tiff_file.name}: {e}")
+                continue
+
+        print(
+            f"   Found {len(all_municipalities_by_year[year])} municipalities for year {year}"
+        )
+
+    total_municipalities = sum(
+        len(munis) for munis in all_municipalities_by_year.values()
+    )
+    print(f"\nTotal: {total_municipalities} municipality/year combinations to process")
 
     # Determine number of workers
     num_workers = min(cpu_count(), 12)  # Limit to avoid too many file handles
     print(f"Using {num_workers} parallel workers\n")
 
-    # Process each municipality
-    municipality_items = list(municipalities.items())
+    # Process each municipality/year combination
+    all_items = []
+    for year, municipalities in sorted(all_municipalities_by_year.items()):
+        for municipality_code, muni_files in sorted(municipalities.items()):
+            all_items.append((year, municipality_code, muni_files))
+
     muni_progress = tqdm(
-        municipality_items, desc="Municipalities", unit="muni", position=0, leave=True
+        all_items, desc="Processing", unit="muni", position=0, leave=True
     )
 
     main_start_time = time.time()
-    for municipality_code, muni_files in muni_progress:
-        muni_progress.set_description(f"Municipality {municipality_code}")
+    for year, municipality_code, muni_files in muni_progress:
+        muni_progress.set_description(f"{municipality_code} ({year})")
 
-        # Check if municipality is already processed (single .npy file exists)
-        muni_dir = OUTPUT_DIR / municipality_code
+        # Check if municipality/year is already processed
+        year_dir = OUTPUT_DIR / str(year)
+        muni_dir = year_dir / municipality_code
         muni_npy_file = muni_dir / f"{municipality_code}.npy"
 
         if muni_npy_file.exists():
@@ -546,7 +633,7 @@ def main():
                 data = np.load(muni_npy_file, mmap_mode="r")
                 if len(data) > 0:
                     print(
-                        f"  ⏭️  Skipping {municipality_code} (already processed - {len(data):,} pixels)"
+                        f"  ⏭️  Skipping {municipality_code} ({year}) (already processed - {len(data):,} pixels)"
                     )
                     # Clean up any leftover tile files
                     for tile_file in muni_dir.glob(f"{municipality_code}_tile_*.npy"):
@@ -560,48 +647,70 @@ def main():
                 pass
 
         num_pixels = process_municipality(
-            municipality_code, muni_files, OUTPUT_DIR, num_workers=num_workers
+            municipality_code, year, muni_files, OUTPUT_DIR, num_workers=num_workers
         )
         elapsed = time.time() - main_start_time
         total_pixels_processed = sum(
-            len(np.load(OUTPUT_DIR / muni / f"{muni}.npy", mmap_mode="r"))
+            len(np.load(OUTPUT_DIR / str(y) / muni / f"{muni}.npy", mmap_mode="r"))
+            for y, municipalities in all_municipalities_by_year.items()
             for muni in municipalities.keys()
-            if (OUTPUT_DIR / muni / f"{muni}.npy").exists()
+            if (OUTPUT_DIR / str(y) / muni / f"{muni}.npy").exists()
         )
         pixels_per_sec = total_pixels_processed / elapsed if elapsed > 0 else 0
         muni_progress.set_postfix(
             {"pixels": total_pixels_processed, "px/s": f"{pixels_per_sec:.1f}"}
         )
 
-    # Count total pixels processed
+    # Count total pixels processed by year
     total_pixels = 0
     municipalities_processed = 0
-    for municipality_code in municipalities.keys():
-        muni_npy_file = OUTPUT_DIR / municipality_code / f"{municipality_code}.npy"
-        if muni_npy_file.exists():
-            try:
-                data = np.load(muni_npy_file, mmap_mode="r")
-                total_pixels += len(data)
-                municipalities_processed += 1
-            except Exception:
-                pass
+    print("\n" + "=" * 60)
+    print("Summary by Year:")
+    print("=" * 60)
+
+    for year in sorted(all_municipalities_by_year.keys()):
+        year_pixels = 0
+        year_munis = 0
+        year_dir = OUTPUT_DIR / str(year)
+
+        for municipality_code in all_municipalities_by_year[year].keys():
+            muni_npy_file = year_dir / municipality_code / f"{municipality_code}.npy"
+            if muni_npy_file.exists():
+                try:
+                    data = np.load(muni_npy_file, mmap_mode="r")
+                    year_pixels += len(data)
+                    year_munis += 1
+                except Exception:
+                    pass
+
+        if year_munis > 0:
+            print(f"  {year}: {year_munis} municipalities, {year_pixels:,} pixels")
+            total_pixels += year_pixels
+            municipalities_processed += year_munis
 
     print(f"\n✓ Preprocessing complete!")
-    print(f"  Processed {municipalities_processed} municipalities")
+    print(f"  Processed {municipalities_processed} municipality/year combinations")
     print(f"  Total pixels: {total_pixels:,}")
-    print(f"  Saved as .npy files (one per municipality, no index needed)")
+    print(
+        f"  Saved as .npy files organized by year: OUTPUT_DIR/year/municipality_code/municipality_code.npy"
+    )
 
     # Create yield CSV template (using pandas for CSV compatibility)
+    all_municipality_codes = set()
+    for municipalities in all_municipalities_by_year.values():
+        all_municipality_codes.update(municipalities.keys())
+
     yield_template = pd.DataFrame(
         {
-            "municipality_code": sorted(municipalities.keys()),
+            "municipality_code": sorted(all_municipality_codes),
+            "year": np.nan,  # Fill this with actual year
             "yield_tons": np.nan,  # Fill this with actual yield data
         }
     )
     yield_file = OUTPUT_DIR / "yield_template.csv"
     yield_template.to_csv(yield_file, index=False)
     print(f"  Yield template saved to: {yield_file}")
-    print(f"  Please fill in yield_tons column with actual yield data")
+    print(f"  Please fill in year and yield_tons columns with actual data")
 
 
 if __name__ == "__main__":

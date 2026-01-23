@@ -282,4 +282,5 @@ dependencies:
     - toma==1.1.0
     - torch==1.11.0+cu113
     - torchvision==0.12.0+cu113
+    - polars>=0.19.0
 prefix: C:\Miniconda3\envs\py38

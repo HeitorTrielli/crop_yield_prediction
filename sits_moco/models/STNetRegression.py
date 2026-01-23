@@ -96,7 +96,7 @@ class STNetRegression(nn.Module):
             weight_sum = weight.sum(1).unsqueeze(1)
             weight_sum = torch.clamp(weight_sum, min=1e-8)  # Prevent division by zero
             weight /= weight_sum
-            x = torch.bmm(weight.unsqueeze(1), x).squeeze()
+            x = torch.bmm(weight.unsqueeze(1), x).squeeze(1)
 
         output = self.decoder(x)
 

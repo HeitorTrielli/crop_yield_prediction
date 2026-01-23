@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import torch
 import torch.optim
 from torch.utils.data import DataLoader
@@ -36,8 +37,8 @@ from utils_aggregated import (
 # Default paths
 DATAPATH = Path(r"files/yield_dataset")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
-YEARS = [2023]
-SEEDS = [4350]
+YEARS = [None]
+SEEDS = [5004]
 
 
 def parse_args():
@@ -88,7 +89,7 @@ def parse_args():
         "-lr",
         "--learning-rate",
         type=float,
-        default=1e-4,
+        default=1e-5,
         help="optimizer learning rate (default 1e-3)",
     )
     parser.add_argument(
@@ -132,7 +133,7 @@ def parse_args():
         default=None,
         help="path to yield CSV file with municipality codes and production",
     )
-    parser.add_argument("--seed", type=int, default=4350, help="random seed")
+    parser.add_argument("--seed", type=int, default=5000, help="random seed")
     parser.add_argument(
         "--sample-ratio",
         type=float,
@@ -166,9 +167,38 @@ def parse_args():
     return args
 
 
-def compute_target_statistics(yield_csv, year):
-    """Compute mean and std of training targets for normalization."""
-    import polars as pl
+def find_available_years(datapath):
+    """Find all years for which we have imagery data."""
+    datapath = Path(datapath)
+    available_years = []
+
+    if not datapath.exists():
+        return available_years
+
+    # Check for year subdirectories (e.g., files/yield_dataset/2018, 2019, etc.)
+    for item in datapath.iterdir():
+        if item.is_dir():
+            try:
+                year = int(item.name)
+                # Check if directory has any .npy files
+                if any(item.rglob("*.npy")):
+                    available_years.append(year)
+            except ValueError:
+                continue
+
+    return sorted(available_years)
+
+
+def compute_target_statistics(yield_csv, datapath):
+    """
+    Compute mean and std of training targets for normalization.
+    Only uses training data from years where we have imagery data.
+    Automatically excludes test years (marked as 'test' in split column).
+
+    Args:
+        yield_csv: Path to yield CSV file
+        datapath: Path to dataset directory (to find available years)
+    """
 
     print(f"Computing target statistics from {yield_csv}...")
     yield_df = pl.read_csv(
@@ -188,15 +218,27 @@ def compute_target_statistics(yield_csv, year):
             f"Could not find yield column. Available: {list(yield_df.columns)}"
         )
 
-    # Filter to training split only
-    if "split" in yield_df.columns:
-        train_df = yield_df.filter(pl.col("split") == "train")
-    elif "mode" in yield_df.columns:
-        train_df = yield_df.filter(pl.col("mode") == "train")
-    else:
-        train_df = yield_df
+    available_years = find_available_years(datapath)
+    if not available_years:
+        raise ValueError(
+            f"No available years found in {datapath}. Check that year subdirectories exist."
+        )
 
-    # Get valid (non-null) targets
+    print(f"  Found imagery data for years: {available_years}")
+
+    train_df = yield_df
+
+    if "year" in yield_df.columns:
+        train_df = train_df.filter(pl.col("year").is_in(available_years))
+        print(f"  Filtered to available years: {len(train_df)} rows")
+
+    if "split" in yield_df.columns:
+        train_df = train_df.filter(pl.col("split") == "train")
+        print(f"  Filtered to train split: {len(train_df)} rows")
+    elif "mode" in yield_df.columns:
+        train_df = train_df.filter(pl.col("mode") == "train")
+        print(f"  Filtered to train mode: {len(train_df)} rows")
+
     valid_targets = train_df.select(yield_col).drop_nulls()[yield_col].to_list()
     valid_targets = [float(t) for t in valid_targets if t is not None and t != ""]
 
@@ -213,13 +255,13 @@ def compute_target_statistics(yield_csv, year):
 
     print(f"  Target statistics: mean={target_mean:.2f}, std={target_std:.2f}")
     print(f"  Target range: min={min(valid_targets):.2f}, max={max(valid_targets):.2f}")
+    print(f"  Number of training samples used: {len(valid_targets)}")
 
     return target_mean, target_std
 
 
 def train(args):
-    # Compute target statistics from training data
-    target_mean, target_std = compute_target_statistics(args.yield_csv, args.year)
+    target_mean, target_std = compute_target_statistics(args.yield_csv, args.datapath)
 
     print("=> creating dataloader (Polars-optimized)")
     traindataloader, train_meta = get_aggregated_dataloader(
@@ -352,11 +394,12 @@ def train(args):
             else:
                 print(f"  ⚠️  Warning: No decoder weights found in checkpoint!")
 
+    year_str = "AllYears" if args.year is None else str(args.year)
     if args.suffix:
-        model.modelname = f"Yield_{model.modelname}_{args.rc_str}_{args.year}_Seed{args.seed}_{args.suffix}"
+        model.modelname = f"Yield_{model.modelname}_{args.rc_str}_{year_str}_Seed{args.seed}_{args.suffix}"
     else:
         model.modelname = (
-            f"Yield_{model.modelname}_{args.rc_str}_{args.year}_Seed{args.seed}"
+            f"Yield_{model.modelname}_{args.rc_str}_{year_str}_Seed{args.seed}"
         )
 
     # Compile model for faster execution (PyTorch 2.0+)
@@ -383,14 +426,18 @@ def train(args):
         target_mean=target_mean,
         target_std=target_std,
     )
+    print(f"DEBUG: args.learning_rate = {args.learning_rate:.2e}")
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+    print(
+        f"DEBUG: optimizer.param_groups[0]['lr'] = {optimizer.param_groups[0]['lr']:.2e}"
     )
 
     # Initialize training state
     start_epoch = 0
     log = list()
-    val_loss_min = np.Inf
+    val_loss_min = np.inf
     not_improved_count = 0
 
     # Resume from checkpoint if pretrained model is provided
@@ -516,8 +563,7 @@ def train(args):
         log_df = pd.DataFrame(log).set_index("epoch")
         log_df.to_csv(Path(logdir) / "trainlog.csv")
 
-        # Save checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 1 == 0:
             checkpoint_path = logdir / f"checkpoint_epoch_{epoch + 1}.pth"
             save(
                 model,
@@ -641,9 +687,13 @@ def get_aggregated_dataloader(
 def main():
     args = parse_args()
     years = YEARS
-    for year in years:
-        print(f" ===================== {year} ======================= ")
-        args.year = year
+    use_all_years = None in years or "all" in years
+
+    if use_all_years:
+        print(
+            " ===================== Training ONE model on ALL train data ======================= "
+        )
+        args.year = None
         seeds = SEEDS
         print("seed in", seeds)
         for seed in seeds:
@@ -661,6 +711,29 @@ def main():
             )
 
             logdir = train(args)
+    else:
+        for year in years:
+            print(
+                f" ===================== {year} (model name only, uses all train data) ======================= "
+            )
+            args.year = year
+            seeds = SEEDS
+            print("seed in", seeds)
+            for seed in seeds:
+                args.seed = seed
+                print(f"Seed = {args.seed} --------------- ")
+
+                SEED = args.seed
+                random.seed(SEED)
+                np.random.seed(SEED)
+                torch.manual_seed(SEED)
+                torch.cuda.manual_seed_all(SEED)
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = (
+                    True  # Enable cuDNN benchmarking for faster convolutions
+                )
+
+                logdir = train(args)
 
 
 if __name__ == "__main__":
