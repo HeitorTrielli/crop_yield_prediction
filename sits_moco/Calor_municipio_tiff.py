@@ -9,18 +9,17 @@ and that each TIFF is multiband (10 bandas espectrais).
 """
 
 import argparse
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import torch
-from torch.amp import autocast
-from tqdm import tqdm
-
 from datautils import getWeight
 from STNetRegression import STNetRegression
+from torch.amp import autocast
+from tqdm import tqdm
 
 
 # -------------------------------------------------------
@@ -231,7 +230,7 @@ def discover_tiles(tiff_dir, municipality_code, year):
         print(f"❌ Nenhuma pasta encontrada para {municipality_code} em {tiff_dir}")
         return None, None, None, None
 
-    muni_dir = muni_dirs[0]   # pega a primeira que combina
+    muni_dir = muni_dirs[0]  # pega a primeira que combina
     print(f"✔ Usando pasta: {muni_dir}")
 
     tiff_files = list(muni_dir.glob("*.tif"))
@@ -244,7 +243,10 @@ def discover_tiles(tiff_dir, municipality_code, year):
         mcode, file_year, month, tile_x, tile_y = parse_filename_tiff(tiff_file.name)
         if mcode != municipality_code or file_year != year:
             continue
-        key = (tile_x, tile_y)
+        # Convert to integers for proper sorting
+        tile_x_int = int(tile_x)
+        tile_y_int = int(tile_y)
+        key = (tile_x_int, tile_y_int)
         if key not in tiles:
             tiles[key] = {}
         tiles[key][month] = tiff_file
@@ -287,55 +289,84 @@ def run_model_on_tiffs(
         return None
 
     # ------------------------------------------------------------------
-    # 1) Descobrir posição (x, y) de cada tile usando o transform do TIFF
-    #    Vamos usar o canto superior esquerdo como referência
+    # 1) Primeira passagem: coletar todos os transforms e calcular bounds geográficos
     # ------------------------------------------------------------------
-    tile_positions = {}  # (tile_x, tile_y) -> (x0, y0)
+    tile_transforms = {}  # (tile_x, tile_y) -> transform
+    tile_shapes = {}  # (tile_x, tile_y) -> (height, width)
+    all_x_coords = []
+    all_y_coords = []
+
     for tile_key, month_dict in tiles.items():
-        # pega qualquer mês desse tile (o primeiro da lista)
+        # Pega qualquer mês deste tile para obter o transform
         some_month = sorted(month_dict.keys())[0]
         some_file = month_dict[some_month]
         with rasterio.open(some_file) as src:
-            # coordenadas do pixel (0, 0)
-            x0, y0 = src.transform * (0, 0)
-        tile_positions[tile_key] = (x0, y0)
+            transform = src.transform
+            height, width = src.height, src.width
+            tile_transforms[tile_key] = transform
+            tile_shapes[tile_key] = (height, width)
 
-    # lista de coordenadas únicas em X (oeste-leste) e Y (norte-sul)
-    x_vals = sorted({pos[0] for pos in tile_positions.values()})          # esquerda -> direita
-    y_vals = sorted({pos[1] for pos in tile_positions.values()}, reverse=True)  # topo -> baixo
+            # Calcula coordenadas dos 4 cantos do tile
+            corners = [
+                transform * (0, 0),  # top-left
+                transform * (width, 0),  # top-right
+                transform * (0, height),  # bottom-left
+                transform * (width, height),  # bottom-right
+            ]
+            all_x_coords.extend([c[0] for c in corners])
+            all_y_coords.extend([c[1] for c in corners])
 
-    # mapeia tile -> índice da linha/coluna na grade de tiles
-    tile_to_col = {
-        tile_key: x_vals.index(tile_positions[tile_key][0]) for tile_key in tiles
-    }
-    tile_to_row = {
-        tile_key: y_vals.index(tile_positions[tile_key][1]) for tile_key in tiles
-    }
+    # Bounds geográficos de todos os tiles
+    min_x = min(all_x_coords)
+    max_x = max(all_x_coords)
+    min_y = min(all_y_coords)
+    max_y = max(all_y_coords)
+
+    # Pega o pixel size do primeiro tile (assumindo que todos têm o mesmo)
+    first_tile_key = next(iter(tiles.keys()))
+    first_transform = tile_transforms[first_tile_key]
+    pixel_size_x = abs(first_transform[0])  # pixel width em graus
+    pixel_size_y = abs(first_transform[4])  # pixel height em graus (pode ser negativo)
 
     # ------------------------------------------------------------------
-    # 2) Tamanho do mosaico final
+    # 2) Criar grid do heatmap baseado em coordenadas geográficas
     # ------------------------------------------------------------------
-    n_rows_tiles = len(y_vals)
-    n_cols_tiles = len(x_vals)
+    # Calcula quantos pixels são necessários para cobrir toda a área
+    # Usa o mesmo pixel size dos tiles originais
+    total_width = int(np.ceil((max_x - min_x) / pixel_size_x))
+    total_height = int(np.ceil((max_y - min_y) / pixel_size_y))
 
-    total_height = n_rows_tiles * tile_height
-    total_width = n_cols_tiles * tile_width
+    # Cria função para mapear coordenadas geográficas para índices do heatmap
+    def geo_to_pixel(lon, lat):
+        """Converte coordenadas geográficas (lon, lat) para índices (row, col) no heatmap."""
+        col = int(np.round((lon - min_x) / pixel_size_x))
+        row = int(
+            np.round((max_y - lat) / pixel_size_y)
+        )  # Inverte Y porque max_y é norte
+        return row, col
 
     heatmap = np.full((total_height, total_width), np.nan, dtype=np.float32)
 
     model.eval()
 
     # ------------------------------------------------------------------
-    # 3) Loop sobre tiles, montar séries temporais e preencher o mosaico
+    # 3) Sort tiles para processamento (opcional, mas ajuda na organização)
+    # ------------------------------------------------------------------
+    sorted_tiles = sorted(tiles.items())
+
+    # ------------------------------------------------------------------
+    # 4) Loop sobre tiles, montar séries temporais e preencher o mosaico
     # ------------------------------------------------------------------
     for (tile_x, tile_y), month_dict in tqdm(
-        tiles.items(), desc="Processing tiles", unit="tile"
+        sorted_tiles, desc="Processing tiles", unit="tile"
     ):
         months = sorted(month_dict.keys())
         num_times = len(months)
 
         # Carrega todos os meses deste tile em memória
         tile_stack = None
+        tile_transform = tile_transforms[(tile_x, tile_y)]
+
         for t_idx, month in enumerate(months):
             tiff_file = month_dict[month]
             with rasterio.open(tiff_file) as src:
@@ -352,14 +383,10 @@ def run_model_on_tiffs(
         # DOYs para cada time step
         doys = np.array([month_midpoint_doy(year, m) for m in months], dtype=np.float32)
 
-        # índice da "linha" e "coluna" de tiles no mosaico global
-        tile_row_idx = tile_to_row[(tile_x, tile_y)]
-        tile_col_idx = tile_to_col[(tile_x, tile_y)]
-
         current_chunk = []
         chunk_positions = []
 
-        # Usa a altura/largura reais deste tile (podem ser menores na borda)
+        # Usa a altura/largura reais deste tile
         local_height = tile_stack.shape[2]
         local_width = tile_stack.shape[3]
 
@@ -379,9 +406,11 @@ def run_model_on_tiffs(
                 )
                 current_chunk.append(X_tuple)
 
-                # posição global na matriz grande
-                global_row = tile_row_idx * tile_height + row
-                global_col = tile_col_idx * tile_width + col
+                # Calcula coordenadas geográficas reais deste pixel usando o transform do tile
+                lon, lat = tile_transform * (col, row)  # rasterio usa (col, row)
+
+                # Mapeia para posição no heatmap global
+                global_row, global_col = geo_to_pixel(lon, lat)
                 chunk_positions.append((global_row, global_col))
 
                 if len(current_chunk) >= chunk_size:
@@ -408,8 +437,6 @@ def run_model_on_tiffs(
     return heatmap
 
 
-
-
 def process_chunk(model, chunk, positions, heatmap, device):
     """Roda o modelo num batch de pixels e escreve no heatmap."""
     chunk_x = torch.stack([p[0] for p in chunk])
@@ -432,7 +459,6 @@ def process_chunk(model, chunk, positions, heatmap, device):
         # garante que não estoura os limites do heatmap
         if 0 <= row < H and 0 <= col < W:
             heatmap[row, col] = pred
-
 
 
 # -------------------------------------------------------
@@ -470,17 +496,16 @@ def create_heatmap_figure(heatmap, output_path, municipality_code):
         f"Total (sum over pixels): {vals.sum():.2f} tons\n"
         f"Pixels: {vals.size:,}"
     )
-    
-    fig.text(
-    0.5,
-    0.02,
-    stats_text,
-    ha="center",
-    va="bottom",
-    fontsize=11,
-    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8)
-)
 
+    fig.text(
+        0.5,
+        0.02,
+        stats_text,
+        ha="center",
+        va="bottom",
+        fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+    )
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
