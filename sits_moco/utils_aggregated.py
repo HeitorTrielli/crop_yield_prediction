@@ -8,6 +8,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# Pixels per forward pass
+MAX_PIXEL_BATCH_SIZE = 200
+
 
 def regression_metrics(y_pred, y_true):
     """Calculate regression metrics: RMSE, MAE, R², MAPE."""
@@ -146,22 +149,14 @@ def train_epoch_aggregated(
         sample_param = next(iter(model.parameters()))
         train_epoch_aggregated._initial_weight = sample_param.data.clone()
 
-    # Prioritize MAX_PIXEL_BATCH_SIZE for speed (reduces forward passes)
-    # Increase CHUNKS_PER_GRAD_UPDATE for stability (doesn't affect speed much)
-    MAX_PIXEL_BATCH_SIZE = (
-        2000  # Reduced to stay within dedicated VRAM (avoid slower shared memory)
+    CHUNKS_PER_GRAD_UPDATE = (
+        50  # Lower is fine: mainly affects gradient accumulation, not computation speed
     )
-    CHUNKS_PER_GRAD_UPDATE = 200  # Lower is fine: mainly affects gradient accumulation, not computation speed
 
-    # Create progress bar with timestamp prefix
-    timestamp_format = "%H:%M:%S"
-    initial_timestamp = datetime.now().strftime(timestamp_format)
     with tqdm(
         enumerate(dataloader),
         total=len(dataloader),
         leave=True,
-        bar_format=f"[{initial_timestamp}] "
-        + "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ) as iterator:
         for idx, (municipalities, targets, num_pixels_list, years) in iterator:
             targets = targets.to(device).float()
@@ -206,8 +201,8 @@ def train_epoch_aggregated(
                 for pixel_chunk in dataset.load_pixels_from_municipality(
                     municipality_code, year=year, chunk_size=MAX_PIXEL_BATCH_SIZE
                 ):
-                    # Skip empty chunks
-                    if len(pixel_chunk) == 0:
+                    # Skip empty or single-sample chunks (BatchNorm needs batch_size > 1)
+                    if len(pixel_chunk) < 2:
                         continue
 
                     chunk_x = torch.stack([p[0] for p in pixel_chunk])
@@ -653,20 +648,11 @@ def test_epoch_aggregated(
     all_aggregated_preds = []
     all_targets = []
 
-    MAX_PIXEL_BATCH_SIZE = (
-        1000  # Increased to use more GPU memory (process 1000 pixels at once)
-    )
-
     with torch.no_grad():
-        # Create progress bar with timestamp prefix
-        timestamp_format = "%H:%M:%S"
-        initial_timestamp = datetime.now().strftime(timestamp_format)
         with tqdm(
             enumerate(dataloader),
             total=len(dataloader),
             leave=True,
-            bar_format=f"[{initial_timestamp}] "
-            + "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         ) as iterator:
             for idx, (municipalities, targets, num_pixels_list, years) in iterator:
                 targets = targets.to(device).float()
@@ -681,8 +667,8 @@ def test_epoch_aggregated(
                     for pixel_chunk in dataset.load_pixels_from_municipality(
                         municipality_code, year=year, chunk_size=MAX_PIXEL_BATCH_SIZE
                     ):
-                        # Skip empty chunks
-                        if len(pixel_chunk) == 0:
+                        # Skip empty or single-sample chunks
+                        if len(pixel_chunk) < 2:
                             continue
 
                         chunk_x = torch.stack([p[0] for p in pixel_chunk])

@@ -38,7 +38,7 @@ from utils_aggregated import (
 DATAPATH = Path(r"files/yield_dataset")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
 YEARS = [None]
-SEEDS = [5004]
+SEEDS = [6003]
 
 
 def parse_args():
@@ -65,14 +65,14 @@ def parse_args():
         "-seq",
         "--sequencelength",
         type=int,
-        default=6,
-        help="Maximum length of time series data (default: 6 for 6 months)",
+        default=45,
+        help="Max time steps per pixel (pad/sample to this). Match your data: ~11 for daily with few dates; larger values use more GPU memory (default: 15).",
     )
     parser.add_argument(
         "-j",
         "--workers",
         type=int,
-        default=8,
+        default=4,
         help="number of CPU workers to load the next batch (default: 8)",
     )
     parser.add_argument(
@@ -82,14 +82,14 @@ def parse_args():
         "-b",
         "--batchsize",
         type=int,
-        default=8,
+        default=4,
         help="batch size (number of municipalities per batch, default: 16)",
     )
     parser.add_argument(
         "-lr",
         "--learning-rate",
         type=float,
-        default=1e-5,
+        default=1e-6,
         help="optimizer learning rate (default 1e-3)",
     )
     parser.add_argument(
@@ -140,11 +140,36 @@ def parse_args():
         default=1.0,
         help="Fraction of municipalities to sample per epoch (0.0-1.0, default: 1.0 = use all)",
     )
+    parser.add_argument(
+        "--harvest-years",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated harvest years for multi-season training, e.g. 2019,2020,2022,2023,2024 "
+            "to use those seasons only (omit 2021 to hold out that harvest). Requires a 'year' column "
+            "in the yield CSV (harvest year). Folder Y1-Y2 under --datapath maps to harvest year Y2. "
+            "Implies multi-year mode; --year is ignored when this is set."
+        ),
+    )
     args = parser.parse_args()
 
     args.dataset = "USCropsAggregatedNPY"
     args.datapath = Path(args.datapath) if args.datapath else DATAPATH
     args.yield_csv = Path(args.yield_csv) if args.yield_csv else YIELD_CSV
+
+    if args.harvest_years:
+        args.harvest_years_set = {
+            int(x.strip()) for x in args.harvest_years.split(",") if x.strip()
+        }
+    else:
+        args.harvest_years_set = None
+
+    if args.harvest_years_set:
+        if args.year is not None:
+            print(
+                "Note: --harvest-years is set; using multi-year mode (--year ignored)."
+            )
+        args.year = None
 
     if args.interp and args.rc:
         args.rc_str = "IntRC"
@@ -168,28 +193,33 @@ def parse_args():
 
 
 def find_available_years(datapath):
-    """Find all years for which we have imagery data."""
+    """Find all years for which we have imagery data.
+    Accepts integer year dirs (2023) and year-range dirs (2022-2023); range maps to end year.
+    """
     datapath = Path(datapath)
     available_years = []
 
     if not datapath.exists():
         return available_years
 
-    # Check for year subdirectories (e.g., files/yield_dataset/2018, 2019, etc.)
     for item in datapath.iterdir():
-        if item.is_dir():
-            try:
-                year = int(item.name)
-                # Check if directory has any .npy files
-                if any(item.rglob("*.npy")):
-                    available_years.append(year)
-            except ValueError:
-                continue
+        if not item.is_dir():
+            continue
+        if not any(item.rglob("*.npy")):
+            continue
+        if item.name.isdigit():
+            available_years.append(int(item.name))
+        elif "-" in item.name:
+            parts = item.name.split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                available_years.append(
+                    int(parts[1])
+                )  # end year (e.g. 2022-2023 -> 2023)
 
-    return sorted(available_years)
+    return sorted(set(available_years))
 
 
-def compute_target_statistics(yield_csv, datapath):
+def compute_target_statistics(yield_csv, datapath, harvest_years=None):
     """
     Compute mean and std of training targets for normalization.
     Only uses training data from years where we have imagery data.
@@ -198,6 +228,7 @@ def compute_target_statistics(yield_csv, datapath):
     Args:
         yield_csv: Path to yield CSV file
         datapath: Path to dataset directory (to find available years)
+        harvest_years: Optional set of harvest years; intersects with years that have imagery.
     """
 
     print(f"Computing target statistics from {yield_csv}...")
@@ -224,7 +255,16 @@ def compute_target_statistics(yield_csv, datapath):
             f"No available years found in {datapath}. Check that year subdirectories exist."
         )
 
-    print(f"  Found imagery data for years: {available_years}")
+    if harvest_years is not None:
+        hset = set(harvest_years)
+        available_years = sorted(set(available_years) & hset)
+        if not available_years:
+            raise ValueError(
+                f"No overlap between --harvest-years and imagery under {datapath}."
+            )
+        print(f"  Restricted to harvest years (with imagery): {available_years}")
+    else:
+        print(f"  Found imagery data for years: {available_years}")
 
     train_df = yield_df
 
@@ -261,7 +301,9 @@ def compute_target_statistics(yield_csv, datapath):
 
 
 def train(args):
-    target_mean, target_std = compute_target_statistics(args.yield_csv, args.datapath)
+    target_mean, target_std = compute_target_statistics(
+        args.yield_csv, args.datapath, harvest_years=args.harvest_years_set
+    )
 
     print("=> creating dataloader (Polars-optimized)")
     traindataloader, train_meta = get_aggregated_dataloader(
@@ -278,6 +320,7 @@ def train(args):
         sample_ratio=args.sample_ratio,
         target_mean=target_mean,
         target_std=target_std,
+        harvest_years=args.harvest_years_set,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
         args.datapath,
@@ -292,6 +335,7 @@ def train(args):
         mode="valid",
         target_mean=target_mean,
         target_std=target_std,
+        harvest_years=args.harvest_years_set,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
         args.datapath,
@@ -306,6 +350,7 @@ def train(args):
         mode="eval",
         target_mean=target_mean,
         target_std=target_std,
+        harvest_years=args.harvest_years_set,
     )
 
     print("=> creating model")
@@ -394,7 +439,12 @@ def train(args):
             else:
                 print(f"  ⚠️  Warning: No decoder weights found in checkpoint!")
 
-    year_str = "AllYears" if args.year is None else str(args.year)
+    if args.harvest_years_set:
+        year_str = "Hy_" + "_".join(str(y) for y in sorted(args.harvest_years_set))
+    elif args.year is None:
+        year_str = "AllYears"
+    else:
+        year_str = str(args.year)
     if args.suffix:
         model.modelname = f"Yield_{model.modelname}_{args.rc_str}_{year_str}_Seed{args.seed}_{args.suffix}"
     else:
@@ -631,6 +681,7 @@ def get_aggregated_dataloader(
     sample_ratio=1.0,
     target_mean=None,
     target_std=None,
+    harvest_years=None,
 ):
     """Create dataloader for aggregated regression (Polars-optimized)."""
     dataset = USCropsAggregatedNPY(
@@ -646,6 +697,7 @@ def get_aggregated_dataloader(
         preload_ram=False,
         target_mean=target_mean,
         target_std=target_std,
+        harvest_years=harvest_years,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0

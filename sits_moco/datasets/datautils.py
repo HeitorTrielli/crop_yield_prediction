@@ -156,3 +156,20 @@ def getWeight(x):
     weight /= weight.sum()
 
     return weight
+
+
+def getWeight_batch(x):
+    """Vectorized getWeight for batch of pixels. x: (N, T, 10), returns (N, T) normalized per row."""
+    N, T, _ = x.shape
+    score = np.ones((N, T), dtype=np.float64)
+    score = np.minimum(score, (x[:, :, [0, 1, 2]].sum(axis=2) - 0.2) / 0.6)
+    cloud = score * 100 > 20
+    dark = x[:, :, [6, 8, 9]].sum(axis=2) < 0.35
+    ndvi = (x[:, :, 6] - x[:, :, 2]) / (x[:, :, 6] + x[:, :, 2] + 1e-8)
+    ndvi = ndvi.astype(np.float64)
+    ndvi[cloud] = -1
+    ndvi[dark] = -1
+    ndvi = ndvi.clip(-1, 1)
+    weight = np.exp(ndvi)
+    weight /= weight.sum(axis=1, keepdims=True)
+    return weight

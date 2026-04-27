@@ -9,10 +9,15 @@ For each municipality:
 - Extract each pixel's time series (6 months)
 - Combine all tiles and save as single .npy file per municipality
 - No index file needed - municipality code is in the filename
+
+Output .npy shape: [num_pixels, num_timesteps, 11]. The 11th channel (index 10) is DOY:
+season-relative day index with 2022-10-02 = day 1; other days = (date - 2022-10-02).days + 1.
 """
 
+import re
 import time
 from collections import defaultdict
+from datetime import date
 from multiprocessing import Manager, Pool, cpu_count
 from pathlib import Path
 
@@ -25,6 +30,9 @@ from tqdm import tqdm
 TIFF_ROOT_DIR = Path("files")
 OUTPUT_DIR = Path("files/yield_dataset")
 YIELD_CSV = Path("files/yield_data.csv")
+
+# Season start: first day = day 1. DOY = (date - SEASON_START_DATE).days + 1.
+SEASON_START_DATE = date(2022, 10, 2)
 
 # Band names (10 spectral bands)
 BANDNAMES = [
@@ -60,6 +68,34 @@ def parse_filename(filename):
     return municipality_code, int(year), int(month), tile_x, tile_y
 
 
+def season_start_from_year_range(year_range: str) -> date:
+    """
+    From folder label YYYY-YYYY (e.g. 2020-2021), return Oct 1 of the planting year.
+    DOY channel uses (date - that day).days + 1 for daily .npy preprocessing.
+    """
+    s = year_range.strip()
+    m = re.match(r"^(\d{4})-(\d{4})$", s)
+    if not m:
+        raise ValueError(f"Expected year-range like 2020-2021, got {year_range!r}")
+    y1 = int(m.group(1))
+    return date(y1, 10, 1)
+
+
+def date_to_season_doy(d: date, season_start: date | None = None) -> int:
+    """Day index in season: season_start -> 1, next calendar day -> 2. Default start: SEASON_START_DATE (monthly pipeline)."""
+    start = season_start if season_start is not None else SEASON_START_DATE
+    return (d - start).days + 1
+
+
+def month_year_to_season_doy(season_year: int, month: int) -> int:
+    """Map (season_year, month) to season DOY. Oct–Dec use season_year, Jan–Mar use season_year+1."""
+    calendar_year = season_year if month >= 10 else season_year + 1
+    d = date(calendar_year, month, 1)
+    if d < SEASON_START_DATE:
+        d = SEASON_START_DATE
+    return date_to_season_doy(d)
+
+
 def process_tile(args):
     """
     Process a single tile (for parallel processing).
@@ -83,6 +119,7 @@ def process_tile(args):
         progress_counter,
         progress_lock,
         expected_months,
+        year,
     ) = args
 
     muni_dir = output_dir / municipality_code
@@ -100,8 +137,10 @@ def process_tile(args):
         np.save(npy_filename, empty_data)
         return empty_data, 0, str(npy_filename)
 
-    # Map month to approximate day of year
-    month_to_doy = {1: 1, 2: 32, 3: 60, 4: 91, 5: 121, 6: 152}
+    # Season-relative DOY: first day (2022-10-02) = 1
+    # DOY per timestep from (season_year, month) -> first of month -> days since season start + 1
+    def doy_for_month(month: int) -> int:
+        return month_year_to_season_doy(year, month)
 
     # OPTIMIZATION: Load all TIFF files into memory once
     # This avoids opening/closing files for each pixel
@@ -156,7 +195,7 @@ def process_tile(args):
                     pixel_values = np.zeros(10, dtype=np.float32)
 
                 timeseries.append(pixel_values)
-                doys.append(month_to_doy.get(month, month * 30))
+                doys.append(doy_for_month(month))
 
             # Explicitly use float32 for spectral bands (memory optimization)
             timeseries = np.array(timeseries, dtype=np.float32)
@@ -340,6 +379,7 @@ def process_municipality(
             progress_counter,
             progress_lock,
             expected_months,  # Pass expected months to ensure consistent shapes
+            year,  # For season DOY: first day 2022-10-02 = 1
         )
         for info in tile_info
     ]

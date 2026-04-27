@@ -174,3 +174,5 @@ main_bert.py
 files/
 heatmaps/
 *.csv
+*/credentials.json
+*/token.json
