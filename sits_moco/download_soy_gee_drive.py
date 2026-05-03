@@ -6,7 +6,7 @@ Uses MapBiomas year-X soy classification to mask pixels. By default fetches the
 soybean growth cycle Oct (X-1)--Mar (X); optional --start-date/--end-date override.
 Exports to Google Drive, then downloads the exact GEE files to local .../raw/ and deletes them from Drive (no merge).
 To merge raw tiles into .tiff later, use merge_gee_tiles_to_tiff.py (raw files are never deleted locally).
-Output: {resolution}/{municipality}/{year_start}-{year_end}/raw/<exact GEE filename>.
+Output: raw_tiff/{year_start}-{year_end}/{municipality}/raw/<exact GEE filename>.
 Per-municipality download_log.csv (date, status, note) for retries and progress.
 
 No-data convention: masked pixels (no S2 coverage, clouds, non-soy) are written as
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         "--shapefile-dir",
         type=Path,
         dest="shapefile_dir",
-        help="Directory of municipality folders (e.g. municipal_shapefiles/); each subfolder may contain a .shp (one run per shapefile found)",
+        help="Directory of municipality folders (e.g. files/shapefiles/); each subfolder is a municipality code with a .shp (one run per shapefile found)",
     )
     parser.add_argument(
         "--season-year",
@@ -97,14 +97,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("files/gee_soy_daily"),
-        help="Base output directory (default: files/gee_soy_daily)",
+        default=Path("files/raw_tiff"),
+        help="Base output directory (default: files/raw_tiff)",
     )
     parser.add_argument(
         "--raw-dir",
         type=Path,
         default=None,
-        help="Directory to save raw GEE files (default: {output_dir}/{resolution}/{municipality}/{year_range}/raw). Use e.g. files/gee_soy_daily/raw for a single folder.",
+        help="Directory to save raw GEE files (default: {output_dir}/{year_start}-{year_end}/{municipality}/raw).",
     )
     parser.add_argument(
         "--drive-folder",
@@ -191,38 +191,29 @@ def parse_args() -> argparse.Namespace:
 # -----------------------------------------------------------------------------
 def output_path_for_date(
     output_dir: Path,
-    resolution: int,
     municipality_code: str,
     year_start: int,
     year_end: int,
     date_str: str,
 ) -> Path:
-    """Path for one day: {output_dir}/{resolution}/{municipality}/{year_start}-{year_end}/{municipality}_{year}_{month}_{day}.tiff"""
+    """Path for one day: {output_dir}/{year_start}-{year_end}/{municipality}/{municipality}_{year}_{month}_{day}.tiff"""
     y, m, d = date_str.split("-")
     return (
         output_dir
-        / str(resolution)
-        / municipality_code
         / f"{year_start}-{year_end}"
+        / municipality_code
         / f"{municipality_code}_{y}_{m}_{d}.tiff"
     )
 
 
 def raw_dir_for_date(
     output_dir: Path,
-    resolution: int,
     municipality_code: str,
     year_start: int,
     year_end: int,
 ) -> Path:
-    """Directory for raw GEE tiles: {output_dir}/{resolution}/{municipality}/{year_start}-{year_end}/raw/"""
-    return (
-        output_dir
-        / str(resolution)
-        / municipality_code
-        / f"{year_start}-{year_end}"
-        / "raw"
-    )
+    """Directory for raw GEE tiles: {output_dir}/{year_start}-{year_end}/{municipality}/raw/"""
+    return output_dir / f"{year_start}-{year_end}" / municipality_code / "raw"
 
 
 def download_raw_only(
@@ -313,12 +304,7 @@ def run_one_municipality(
 ) -> tuple[list[str], list[dict]]:
     """Run export+download for one municipality. Returns (downloaded_dates, failed_entries)."""
     municipality_code = shapefile.stem
-    output_mun_dir = (
-        args.output_dir
-        / str(args.resolution)
-        / municipality_code
-        / f"{year_start}-{year_end}"
-    )
+    output_mun_dir = args.output_dir / f"{year_start}-{year_end}" / municipality_code
     args.output_dir.mkdir(parents=True, exist_ok=True)
     mapbiomas_year = args.season_year if args.season_year is not None else year_end
 
@@ -335,7 +321,7 @@ def run_one_municipality(
         Path(args.raw_dir).resolve()
         if getattr(args, "raw_dir", None) is not None
         else raw_dir_for_date(
-            args.output_dir, args.resolution, municipality_code, year_start, year_end
+            args.output_dir, municipality_code, year_start, year_end
         )
     )
     if raw_d.exists():
@@ -408,7 +394,6 @@ def run_one_municipality(
                     continue
                 local_path = output_path_for_date(
                     args.output_dir,
-                    args.resolution,
                     municipality_code,
                     year_start,
                     year_end,
@@ -657,12 +642,7 @@ def main() -> None:
 
     for i, shapefile in enumerate(shapefiles):
         mun_code = shapefile.stem
-        out_mun_dir = (
-            args.output_dir
-            / str(args.resolution)
-            / mun_code
-            / f"{year_start}-{year_end}"
-        )
+        out_mun_dir = args.output_dir / f"{year_start}-{year_end}" / mun_code
         raw_dir = (
             Path(args.raw_dir).resolve()
             if getattr(args, "raw_dir", None) is not None

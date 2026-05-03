@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 # Configuration
 TIFF_ROOT_DIR = Path("files")
-OUTPUT_DIR = Path("files/yield_dataset")
+OUTPUT_DIR = Path("files/npy")
 YIELD_CSV = Path("files/yield_data.csv")
 
 # Season start: first day = day 1. DOY = (date - SEASON_START_DATE).days + 1.

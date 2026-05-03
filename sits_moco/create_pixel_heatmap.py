@@ -5,6 +5,7 @@ Maps predictions back to spatial locations using original TIFF files.
 
 import argparse
 from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,6 +13,7 @@ import numpy as np
 import rasterio
 import torch
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import Normalize
 from torch.amp import autocast
 from tqdm import tqdm
 
@@ -33,14 +35,27 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/yield_dataset",
+        default="files/npy",
         help="Path to dataset root directory containing municipality .npy files",
     )
     parser.add_argument(
         "--tiffpath",
         type=str,
-        default="files/gee_images",
-        help="Path to directory containing original TIFF files (for spatial mapping)",
+        default="files/daily_tiff",
+        help="Path to directory containing original TIFF files (for spatial mapping). For daily mode: .../daily_tiff/ (season/municipality subfolders).",
+    )
+    parser.add_argument(
+        "--tiff-mode",
+        type=str,
+        default="daily",
+        choices=["daily", "monthly_tiles"],
+        help="TIFF layout mode. 'daily' expects {tiffpath}/{year-range}/{muni}/{muni}_YYYY_MM_DD.tiff (or legacy .../{muni}/{year-range}/). 'monthly_tiles' expects per-tile monthly TIFFs.",
+    )
+    parser.add_argument(
+        "--year-range",
+        type=str,
+        default=None,
+        help="Season folder name (e.g. 2020-2021). Required for tiff-mode=daily unless --tiffpath already points to {muni}/{year-range}.",
     )
     parser.add_argument(
         "--municipality-code",
@@ -58,8 +73,8 @@ def parse_args():
     parser.add_argument(
         "--sequencelength",
         type=int,
-        default=6,
-        help="Maximum length of time series data (default: 6)",
+        default=45,
+        help="Maximum length of time series data (default: 45). For daily mode, extra days are dropped (earliest by DOY).",
     )
     parser.add_argument(
         "--rc",
@@ -96,12 +111,31 @@ def parse_args():
         default=2023,
         help="Year of the data (default: 2023)",
     )
+    parser.add_argument(
+        "--reference-date",
+        type=str,
+        default=None,
+        help="Date where DOY 1 falls for daily mode, YYYY-MM-DD (e.g. 2020-10-01). If omitted, inferred as Oct 1 of the first year in --year-range.",
+    )
+    parser.add_argument(
+        "--daily-ndvi",
+        action="store_true",
+        help="In tiff-mode=daily, also save one NDVI heatmap PNG per observation date (from daily TIFFs).",
+    )
+    parser.add_argument(
+        "--daily-ndvi-subdir",
+        type=str,
+        default="daily_ndvi",
+        help="Subfolder under --output-dir for per-day NDVI PNGs (default: daily_ndvi).",
+    )
     args = parser.parse_args()
 
     args.datapath = Path(args.datapath)
     args.tiffpath = Path(args.tiffpath)
     args.checkpoint = Path(args.checkpoint)
     args.output_dir = Path(args.output_dir)
+    if args.reference_date is not None:
+        args.reference_date = datetime.strptime(args.reference_date, "%Y-%m-%d").date()
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -121,8 +155,116 @@ def parse_filename(filename):
     return municipality_code, int(year), int(month), tile_x, tile_y
 
 
-def transform_pixel(x, sequencelength, rc, interp, seed=None):
-    """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY."""
+def parse_daily_filename(filename: str):
+    """Parse daily TIFF filename: 4109401_2020_10_04.tiff -> (code, date(2020,10,4))."""
+    stem = Path(filename).stem
+    parts = stem.split("_")
+    if len(parts) < 4:
+        return None, None
+    code = parts[0]
+    try:
+        y, m, d = int(parts[1]), int(parts[2]), int(parts[3])
+        return code, date(y, m, d)
+    except Exception:
+        return None, None
+
+
+def season_start_from_year_range(year_range: str) -> date:
+    """Return Oct 1 of the first year in a 'YYYY-YYYY' season folder."""
+    parts = (year_range or "").split("-")
+    if len(parts) >= 2 and parts[0].isdigit():
+        return date(int(parts[0]), 10, 1)
+    raise ValueError(f"Could not parse --year-range={year_range!r} (expected like 2020-2021)")
+
+
+def date_to_season_doy(d: date, season_start: date) -> int:
+    """1-based day index from season_start."""
+    return (d - season_start).days + 1
+
+
+def doy_to_season_month(doy: int, reference_date: date) -> int:
+    """Map season DOY (1-based, DOY1=reference_date) to season month index 1..6, else 0."""
+    d = reference_date.toordinal() + int(doy) - 1
+    cal_month = date.fromordinal(d).month
+    ref_month = reference_date.month
+    season_cal_months = [(ref_month - 1 + i) % 12 + 1 for i in range(6)]
+    if cal_month not in season_cal_months:
+        return 0
+    return season_cal_months.index(cal_month) + 1
+
+
+def compute_daily_ndvi_stats_from_npy_row(
+    X_row: np.ndarray,
+    # Keep literal defaults here because this function is defined before RED_BAND_IDX/NIR_BAND_IDX
+    red_idx: int = 2,
+    nir_idx: int = 6,
+):
+    """Compute mean/peak (max) NDVI over valid daily timesteps from one .npy pixel row (T, 11).
+
+    Uses raw reflectance (bands * 1e-4). Treats 0 and -9999 as missing.
+    Returns (mean_ndvi, peak_ndvi, ndvi_per_season_month_dict) where peak is max NDVI on valid days.
+    """
+    if X_row.ndim != 2 or X_row.shape[1] < 11:
+        return np.nan, np.nan, {}
+
+    bands = X_row[:, :10].astype(np.float32)
+    doys = X_row[:, 10].astype(np.int32)
+
+    # Missing markers from preprocess_daily_to_npy: 0 or -9999
+    missing = (bands == 0) | (bands == -9999)
+    red = bands[:, red_idx]
+    nir = bands[:, nir_idx]
+    miss_red = missing[:, red_idx]
+    miss_nir = missing[:, nir_idx]
+
+    red = red * 1e-4
+    nir = nir * 1e-4
+
+    denom = nir + red + 1e-8
+    valid = np.isfinite(red) & np.isfinite(nir) & ~miss_red & ~miss_nir & (np.abs(denom) > 1e-8)
+    if not np.any(valid):
+        return np.nan, np.nan, {}
+
+    ndvi = (nir - red) / denom
+    ndvi = np.clip(ndvi, -1.0, 1.0)
+    ndvi_valid = ndvi[valid]
+    mean_ndvi = float(np.nanmean(ndvi_valid)) if len(ndvi_valid) else np.nan
+    peak_ndvi = float(np.nanmax(ndvi_valid)) if len(ndvi_valid) else np.nan
+
+    # Per-season-month mean NDVI
+    per_month = {}
+    for m in range(1, 7):
+        per_month[m] = np.nan
+    return mean_ndvi, peak_ndvi, per_month
+
+
+def resolve_daily_tiff_dir(tiffpath: Path, municipality_code: str, year_range: str | None) -> Path | None:
+    """Return directory containing daily TIFFs for a municipality/season."""
+    if tiffpath.is_dir():
+        # If user already points directly to .../<muni>/<year-range>
+        if year_range is not None and tiffpath.name == year_range and tiffpath.parent.name == municipality_code:
+            return tiffpath
+        # Canonical layout: .../<year-range>/<muni>/
+        if year_range is not None:
+            candidate = tiffpath / year_range / municipality_code
+            if candidate.is_dir():
+                return candidate
+        # Legacy: .../<resolution>/<muni>/<year-range>/
+        if year_range is not None:
+            candidate = tiffpath / municipality_code / year_range
+            if candidate.is_dir():
+                return candidate
+        # Fallback: .../<muni>/ (no season in path)
+        candidate = tiffpath / municipality_code
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def transform_pixel(x, sequencelength, rc, interp, seed=None, deterministic_head=False):
+    """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY.
+    If deterministic_head is True and x has more than sequencelength rows, keeps the earliest sequencelength rows.
+    """
     if seed is not None:
         np.random.seed(seed)
 
@@ -170,13 +312,20 @@ def transform_pixel(x, sequencelength, rc, interp, seed=None):
             weight_pad[:x_length] = weight[:x_length]
             weight_pad /= weight_pad.sum() if weight_pad.sum() > 0 else 1
         else:
-            idxs = np.random.choice(x.shape[0], sequencelength, replace=False)
-            idxs.sort()
-            x_pad = x[idxs]
-            mask = np.ones((sequencelength,), dtype=int)
-            doy_pad = doy[idxs]
-            weight_pad = weight[idxs]
-            weight_pad /= weight_pad.sum()
+            if deterministic_head:
+                x_pad = x[:sequencelength]
+                mask = np.ones((sequencelength,), dtype=int)
+                doy_pad = doy[:sequencelength]
+                weight_pad = weight[:sequencelength]
+                weight_pad /= weight_pad.sum() if weight_pad.sum() > 0 else 1
+            else:
+                idxs = np.random.choice(x.shape[0], sequencelength, replace=False)
+                idxs.sort()
+                x_pad = x[idxs]
+                mask = np.ones((sequencelength,), dtype=int)
+                doy_pad = doy[idxs]
+                weight_pad = weight[idxs]
+                weight_pad /= weight_pad.sum()
 
     return (
         torch.from_numpy(x_pad).type(torch.FloatTensor),
@@ -239,9 +388,121 @@ def get_tile_structure(tiff_dir, municipality_code, year):
     return tiles, tile_height, tile_width
 
 
+def compute_daily_valid_pixel_mask(daily_tiffs: list[Path]):
+    """Match preprocess_daily_to_npy pixel filtering on the original daily TIFFs.
+
+    Returns:
+        keep_mask: (H, W) bool, True for pixels kept in the .npy (row-major order)
+        height, width
+    """
+    if not daily_tiffs:
+        return None, None, None
+
+    # Determine dimensions and nodata from first file
+    with rasterio.open(daily_tiffs[0]) as src0:
+        height, width = src0.height, src0.width
+
+    any_data = np.zeros((height, width), dtype=bool)
+    days_with_data = np.zeros((height, width), dtype=np.uint16)
+
+    for p in daily_tiffs:
+        try:
+            with rasterio.open(p) as src:
+                nodata = src.nodata if src.nodata is not None else -9999
+                data = src.read()[:10].astype(np.float32)  # [10, H, W]
+        except Exception:
+            # Treat missing/unreadable day as no data
+            continue
+
+        # Same cleaning logic as preprocess: nodata -> NaN
+        if nodata is not None:
+            data[data == nodata] = np.nan
+        data[data == -9999] = np.nan
+
+        # A pixel has data on this day if any band is finite and non-zero
+        day_has = np.any(np.isfinite(data) & (data != 0), axis=0)
+        any_data |= day_has
+        days_with_data += day_has.astype(np.uint16)
+
+    keep_mask = any_data & (days_with_data > 2)
+    return keep_mask, height, width
+
+
 # Band indices for NDVI (from preprocess_tiff_to_npy BANDNAMES: red=2, nir=6)
 RED_BAND_IDX = 2
 NIR_BAND_IDX = 6
+
+
+def save_daily_ndvi_heatmaps_from_tiffs(
+    municipality_code,
+    daily_tiffs_sorted,
+    output_parent,
+    height,
+    width,
+    subdir_name="daily_ndvi",
+):
+    """Save one beige→green NDVI heatmap per observation date using daily TIFF rasters."""
+    ndvi_root = output_parent / subdir_name / municipality_code
+    ndvi_root.mkdir(parents=True, exist_ok=True)
+
+    dated_paths = []
+    for p in daily_tiffs_sorted:
+        code, d = parse_daily_filename(p.name)
+        if code == municipality_code and d is not None:
+            dated_paths.append((d, p))
+
+    for date_key, path in tqdm(
+        dated_paths,
+        total=len(dated_paths),
+        desc="  Daily NDVI",
+        unit="day",
+    ):
+        if date_key is None:
+            continue
+        fname = f"{municipality_code}_ndvi_{date_key.strftime('%Y-%m-%d')}.png"
+        out_path = ndvi_root / fname
+
+        try:
+            with rasterio.open(path) as src:
+                nodata = src.nodata if src.nodata is not None else -9999
+                data = src.read()[:10].astype(np.float32)
+        except Exception as e:
+            print(f"  ⚠️  Skip daily NDVI {path.name}: {e}")
+            continue
+
+        if data.shape[1] != height or data.shape[2] != width:
+            print(
+                f"  ⚠️  Skip daily NDVI {path.name}: shape {data.shape} != {(10, height, width)}"
+            )
+            continue
+
+        if nodata is not None:
+            data[data == nodata] = np.nan
+        data[data == -9999] = np.nan
+
+        red = data[RED_BAND_IDX] * 1e-4
+        nir = data[NIR_BAND_IDX] * 1e-4
+        denom = nir + red + 1e-8
+        ndvi_map = np.full((height, width), np.nan, dtype=np.float32)
+        valid = np.isfinite(red) & np.isfinite(nir) & (np.abs(denom) > 1e-8)
+        ndvi_map[valid] = np.clip((nir[valid] - red[valid]) / denom[valid], -1.0, 1.0)
+
+        pred_like = {}
+        for r in range(height):
+            for c in range(width):
+                pred_like[("grid", r, c)] = float(ndvi_map[r, c])
+
+        create_ndvi_heatmap(
+            pred_like,
+            None,
+            height,
+            width,
+            out_path,
+            municipality_code,
+            tiffpath=None,
+            year=None,
+            title_suffix=f"{date_key.strftime('%Y-%m-%d')}",
+        )
 
 
 def compute_ndvi_from_timeseries(
@@ -305,16 +566,140 @@ def reconstruct_spatial_predictions(
     chunk_size,
     device,
     seed=None,
+    tiff_mode="monthly_tiles",
+    year_range=None,
+    reference_date=None,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
     Uses TIFF files to get exact spatial structure and matches pixels to .npy data.
     Returns: prediction_map dict with (tile_x, tile_y, row, col) -> prediction, or None if mapping fails
     """
+    if tiff_mode == "daily":
+        if year_range is None:
+            print("  ⚠️  Warning: --year-range is required for tiff-mode=daily (unless --tiffpath points directly to {muni}/{year-range})")
+            return None, None, None, None, None, None, None
+
+        daily_dir = resolve_daily_tiff_dir(tiffpath, municipality_code, year_range)
+        if daily_dir is None:
+            print(f"  ⚠️  Warning: Could not resolve daily TIFF dir from {tiffpath} for {municipality_code}/{year_range}")
+            return None, None, None, None, None, None, None
+
+        # Collect daily TIFFs and sort by date
+        dated = []
+        for p in sorted(daily_dir.glob("*.tif*")):
+            code, d = parse_daily_filename(p.name)
+            if code == municipality_code and d is not None:
+                dated.append((d, p))
+        dated.sort(key=lambda x: x[0])
+        daily_tiffs = [p for _, p in dated]
+        if not daily_tiffs:
+            print(f"  ⚠️  Warning: No daily TIFF files found in {daily_dir}")
+            return None, None, None, None, None, None, None
+
+        if reference_date is None:
+            season_start = season_start_from_year_range(year_range)
+        else:
+            season_start = reference_date
+
+        # Load .npy file
+        muni_npy_file = datapath / municipality_code / f"{municipality_code}.npy"
+        if not muni_npy_file.exists():
+            print(f"  ⚠️  Warning: {muni_npy_file} does not exist")
+            return None, None, None, None, None, None, None
+
+        try:
+            municipality_data = np.load(muni_npy_file, mmap_mode="r")
+        except Exception as e:
+            print(f"  ⚠️  Warning: Could not load {muni_npy_file}: {e}")
+            return None, None, None, None, None, None, None
+
+        if len(municipality_data) == 0:
+            print(f"  ⚠️  Warning: {municipality_code} has 0 pixels")
+            return None, None, None, None, None, None, None
+
+        # Recompute keep-mask in the exact same way as preprocess_daily_to_npy
+        keep_mask, height, width = compute_daily_valid_pixel_mask(daily_tiffs)
+        if keep_mask is None:
+            return None, None, None, None, None, None, None
+
+        expected_valid = int(keep_mask.sum())
+        if expected_valid != len(municipality_data):
+            print(
+                f"  ⚠️  Warning: keep_mask pixels ({expected_valid}) != .npy pixels ({len(municipality_data)}). "
+                "Heatmap will still be produced, but mapping may be off if inputs differ (nodata handling, reprojection, etc.)."
+            )
+
+        model.eval()
+        prediction_map = {}
+        ndvi_map = {}
+        ndvi_map_median = {}
+        ndvi_map_per_month = defaultdict(dict)
+        npy_pixel_idx = 0
+
+        with torch.no_grad():
+            current_chunk = []
+            chunk_indices = []
+
+            # Iterate pixels in row-major order (same as preprocess_daily_to_npy reshape)
+            for row in tqdm(range(height), desc="  Rows", unit="row"):
+                for col in range(width):
+                    if keep_mask[row, col]:
+                        if npy_pixel_idx >= len(municipality_data):
+                            prediction_map[("grid", row, col)] = np.nan
+                            continue
+                        X = municipality_data[npy_pixel_idx]
+                        # Daily NDVI stats computed from raw (unnormalized) .npy row
+                        try:
+                            mean_ndvi, peak_ndvi, _ = compute_daily_ndvi_stats_from_npy_row(X)
+                        except Exception:
+                            mean_ndvi, peak_ndvi = np.nan, np.nan
+                        ndvi_map[("grid", row, col)] = mean_ndvi
+                        # Reuse the same return slot as the legacy "median" map, but in daily mode it is peak (max) NDVI.
+                        ndvi_map_median[("grid", row, col)] = peak_ndvi
+
+                        X_tuple = transform_pixel(
+                            X, sequencelength, rc, interp, seed=seed, deterministic_head=True
+                        )
+                        current_chunk.append(X_tuple)
+                        chunk_indices.append(("grid", row, col))
+                        npy_pixel_idx += 1
+                    else:
+                        prediction_map[("grid", row, col)] = np.nan
+                        ndvi_map[("grid", row, col)] = np.nan
+                        ndvi_map_median[("grid", row, col)] = np.nan
+
+                    is_last = (row == height - 1 and col == width - 1)
+                    if len(current_chunk) >= chunk_size or (len(current_chunk) >= 2 and is_last):
+                        chunk_x = torch.stack([p[0] for p in current_chunk])
+                        chunk_mask = torch.stack([p[1] for p in current_chunk])
+                        chunk_doy = torch.stack([p[2] for p in current_chunk])
+                        chunk_weight = torch.stack([p[3] for p in current_chunk])
+
+                        municipality_X_chunk = (chunk_x, chunk_mask, chunk_doy, chunk_weight)
+                        municipality_X_chunk = recursive_todevice(municipality_X_chunk, device)
+
+                        with (
+                            autocast("cuda", dtype=torch.bfloat16)
+                            if device.type == "cuda"
+                            else torch.no_grad()
+                        ):
+                            chunk_predictions = model(municipality_X_chunk)
+                            if chunk_predictions.dim() == 1:
+                                chunk_predictions = chunk_predictions.unsqueeze(0)
+
+                        for i, key in enumerate(chunk_indices):
+                            prediction_map[key] = float(chunk_predictions[i].item())
+
+                        current_chunk = []
+                        chunk_indices = []
+
+        # In daily mode: ndvi_map = mean NDVI; ndvi_map_median slot holds peak (max) NDVI over time.
+        return prediction_map, ndvi_map, ndvi_map_median, dict(ndvi_map_per_month), None, height, width
+
+    # monthly_tiles mode (legacy)
     # Get tile structure and load TIFF files
-    tiles, tile_height, tile_width = get_tile_structure(
-        tiffpath, municipality_code, year
-    )
+    tiles, tile_height, tile_width = get_tile_structure(tiffpath, municipality_code, year)
 
     if tiles is None:
         print(f"  ⚠️  Warning: No TIFF files found for municipality {municipality_code}")
@@ -902,11 +1287,25 @@ def create_heatmap(
     # Create visualization
     fig, ax = plt.subplots(figsize=(12, 10))
 
-    # Use a colormap (yellow to red for yield)
-    cmap = plt.cm.YlOrRd
+    # Use a smooth sequential colormap (low=beige, high=green)
+    cmap = LinearSegmentedColormap.from_list("beige_green", ["#f4f1e6", "#2e7d32"])
     cmap.set_bad(color="lightgray", alpha=0.3)  # Color for NaN (no data)
 
-    im = ax.imshow(heatmap, cmap=cmap, interpolation="nearest", aspect="auto")
+    valid_predictions = heatmap[np.isfinite(heatmap)]
+    if len(valid_predictions) > 0:
+        vmin = float(np.nanpercentile(valid_predictions, 2))
+        vmax = float(np.nanpercentile(valid_predictions, 98))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+            vmin = float(np.nanmin(valid_predictions))
+            vmax = float(np.nanmax(valid_predictions))
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+                vmin, vmax = 0.0, 1.0
+    else:
+        vmin, vmax = 0.0, 1.0
+
+    im = ax.imshow(
+        heatmap, cmap=cmap, interpolation="nearest", aspect="auto", vmin=vmin, vmax=vmax
+    )
 
     # Add colorbar
     cbar = plt.colorbar(im, ax=ax)
@@ -985,10 +1384,25 @@ def create_ndvi_heatmap(
         return None
 
     fig, ax = plt.subplots(figsize=(12, 10))
-    cmap = plt.cm.YlOrRd  # Same as prediction heatmap (yellow to orange to red)
+    # Use the same smooth sequential colormap as predictions (low=beige, high=green)
+    cmap = LinearSegmentedColormap.from_list("beige_green", ["#f4f1e6", "#2e7d32"])
     cmap.set_bad(color="lightgray", alpha=0.3)
+
+    valid_ndvi = heatmap[np.isfinite(heatmap)]
+    if len(valid_ndvi) > 0:
+        vmin = float(np.nanpercentile(valid_ndvi, 2))
+        vmax = float(np.nanpercentile(valid_ndvi, 98))
+        vmin = max(vmin, -1.0)
+        vmax = min(vmax, 1.0)
+        if vmin >= vmax:
+            vmin, vmax = -1.0, 1.0
+    else:
+        vmin, vmax = -1.0, 1.0
+
+    norm = Normalize(vmin=vmin, vmax=vmax)
+
     im = ax.imshow(
-        heatmap, cmap=cmap, interpolation="nearest", aspect="auto", vmin=-1, vmax=1
+        heatmap, cmap=cmap, norm=norm, interpolation="nearest", aspect="auto"
     )
 
     cbar = plt.colorbar(im, ax=ax)
@@ -1255,11 +1669,46 @@ def main():
             args.chunk_size,
             device,
             seed=args.seed,
+            tiff_mode=args.tiff_mode,
+            year_range=args.year_range,
+            reference_date=args.reference_date,
         )
 
         if prediction_map is None:
             print(f"  ❌ Failed to generate predictions for {municipality_code}")
             continue
+
+        if (
+            args.daily_ndvi
+            and args.tiff_mode == "daily"
+            and tile_height is not None
+            and tile_width is not None
+            and args.year_range is not None
+        ):
+            daily_dir = resolve_daily_tiff_dir(
+                args.tiffpath, municipality_code, args.year_range
+            )
+            if daily_dir is not None:
+                dated = []
+                for p in sorted(daily_dir.glob("*.tif*")):
+                    code, d = parse_daily_filename(p.name)
+                    if code == municipality_code and d is not None:
+                        dated.append((d, p))
+                dated.sort(key=lambda x: x[0])
+                daily_paths = [p for _, p in dated]
+                if daily_paths:
+                    print(
+                        f"  Saving {len(daily_paths)} daily NDVI heatmaps under "
+                        f"{args.output_dir / args.daily_ndvi_subdir / municipality_code} ..."
+                    )
+                    save_daily_ndvi_heatmaps_from_tiffs(
+                        municipality_code,
+                        daily_paths,
+                        args.output_dir,
+                        tile_height,
+                        tile_width,
+                        subdir_name=args.daily_ndvi_subdir,
+                    )
 
         # Create heatmap array (without saving)
         print(f"  Creating heatmap array for {municipality_code}...")
@@ -1305,6 +1754,9 @@ def main():
             args.chunk_size,
             device,
             seed=args.seed,
+            tiff_mode=args.tiff_mode,
+            year_range=args.year_range,
+            reference_date=args.reference_date,
         )
 
         if prediction_map is not None:
@@ -1351,7 +1803,11 @@ def main():
                     "Prediction (tons)",
                 )
 
-            # Histogram of NDVI (mean over months)
+            # NDVI mean: over time in daily mode; over months in monthly_tiles mode
+            ndvi_map = ndvi_map or {}
+            ndvi_map_median = ndvi_map_median or {}
+            ndvi_map_per_month = ndvi_map_per_month or {}
+
             ndvi_values = [v for v in ndvi_map.values() if np.isfinite(v)]
             if ndvi_values:
                 save_histogram(
@@ -1361,30 +1817,59 @@ def main():
                     "NDVI",
                 )
 
-            # NDVI heatmap and histogram (median over months)
-            ndvi_median_output = (
-                args.output_dir / f"{municipality_code}_ndvi_median_heatmap.png"
-            )
-            print(f"Creating NDVI heatmap (median)...")
-            create_ndvi_heatmap(
-                ndvi_map_median,
-                tiles,
-                tile_height,
-                tile_width,
-                ndvi_median_output,
-                municipality_code,
-                tiffpath=args.tiffpath,
-                year=args.year,
-                title_suffix="Median (6 months)",
-            )
-            ndvi_median_values = [v for v in ndvi_map_median.values() if np.isfinite(v)]
-            if ndvi_median_values:
-                save_histogram(
-                    ndvi_median_values,
-                    args.output_dir / f"{municipality_code}_ndvi_median_histogram.png",
-                    f"NDVI (median, 6 months) - {municipality_name}",
-                    "NDVI",
+            if args.tiff_mode == "daily":
+                ndvi_peak_output = (
+                    args.output_dir / f"{municipality_code}_ndvi_peak_heatmap.png"
                 )
+                print(f"Creating NDVI heatmap (peak = max over time)...")
+                create_ndvi_heatmap(
+                    ndvi_map_median,
+                    tiles,
+                    tile_height,
+                    tile_width,
+                    ndvi_peak_output,
+                    municipality_code,
+                    tiffpath=args.tiffpath,
+                    year=args.year,
+                    title_suffix="Peak (max over time)",
+                )
+                ndvi_peak_values = [v for v in ndvi_map_median.values() if np.isfinite(v)]
+                if ndvi_peak_values:
+                    save_histogram(
+                        ndvi_peak_values,
+                        args.output_dir
+                        / f"{municipality_code}_ndvi_peak_histogram.png",
+                        f"NDVI (peak) - {municipality_name}",
+                        "NDVI",
+                    )
+            else:
+                # NDVI heatmap and histogram (median over months)
+                ndvi_median_output = (
+                    args.output_dir / f"{municipality_code}_ndvi_median_heatmap.png"
+                )
+                print(f"Creating NDVI heatmap (median)...")
+                create_ndvi_heatmap(
+                    ndvi_map_median,
+                    tiles,
+                    tile_height,
+                    tile_width,
+                    ndvi_median_output,
+                    municipality_code,
+                    tiffpath=args.tiffpath,
+                    year=args.year,
+                    title_suffix="Median (6 months)",
+                )
+                ndvi_median_values = [
+                    v for v in ndvi_map_median.values() if np.isfinite(v)
+                ]
+                if ndvi_median_values:
+                    save_histogram(
+                        ndvi_median_values,
+                        args.output_dir
+                        / f"{municipality_code}_ndvi_median_histogram.png",
+                        f"NDVI (median, 6 months) - {municipality_name}",
+                        "NDVI",
+                    )
 
             # Per-month NDVI heatmaps and histograms (one per TIFF month)
             month_names = {
@@ -1429,9 +1914,14 @@ def main():
                         "NDVI",
                     )
 
-            print(
-                f"\n✓ Done! Heatmaps, NDVI (mean + median + per month), and histograms saved to {args.output_dir}"
-            )
+            if args.tiff_mode == "daily":
+                print(
+                    f"\n✓ Done! Heatmaps, NDVI (mean + peak), and histograms saved to {args.output_dir}"
+                )
+            else:
+                print(
+                    f"\n✓ Done! Heatmaps, NDVI (mean + median + per month), and histograms saved to {args.output_dir}"
+                )
         else:
             print(f"\n❌ Failed to create individual heatmap")
     else:

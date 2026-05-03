@@ -2,8 +2,8 @@
 """
 Preprocess daily municipal TIFFs (from clip_tiffs_to_shapefiles) to .npy.
 
-Reads TIFFs under {input_dir}/{resolution}/{municipal_code}/{year_range}/
-(e.g. files/gee_soy_daily/municipalities/30/4100103/2022-2023/*.tiff), parses date
+Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/
+(e.g. files/daily_tiff/2022-2023/4100103/*.tiff), parses date
 from filename (4100103_2022_10_02.tiff), stacks into [num_pixels, num_days, 11]
 (10 spectral bands + DOY). DOY = (date - Oct 1 of first year).days + 1 from --year-range
 (YYYY-YYYY, e.g. 2020-2021 -> 2020-10-01 is day 1). Saves one .npy
@@ -11,7 +11,7 @@ per municipality under {output_dir}/{year_range}/{code}/{code}.npy.
 
 Usage:
   python preprocess_daily_to_npy.py
-  python preprocess_daily_to_npy.py --input-dir files/gee_soy_daily/municipalities --resolution 30 --year-range 2022-2023 --output-dir files/yield_dataset -j 10
+  python preprocess_daily_to_npy.py --input-dir files/daily_tiff --year-range 2022-2023 --output-dir files/npy -j 10
 """
 
 from __future__ import annotations
@@ -79,14 +79,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("files/gee_soy_daily/municipalities"),
-        help="Base dir containing {resolution}/{municipal_code}/{year_range}/ (default: files/gee_soy_daily/municipalities)",
-    )
-    p.add_argument(
-        "--resolution",
-        type=int,
-        default=30,
-        help="Resolution subfolder name (default: 30)",
+        default=Path("files/daily_tiff"),
+        help="Base dir containing {year_range}/{municipal_code}/*.tiff (default: files/daily_tiff)",
     )
     p.add_argument(
         "--year-range",
@@ -98,8 +92,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("files/yield_dataset"),
-        help="Output base dir; saves to {output_dir}/{year_range}/{code}/{code}.npy (default: files/yield_dataset)",
+        default=Path("files/npy"),
+        help="Output base dir; saves to {output_dir}/{year_range}/{code}/{code}.npy (default: files/npy)",
     )
     p.add_argument(
         "-j",
@@ -266,7 +260,6 @@ def _process_municipality_worker(
 def main() -> None:
     args = parse_args()
     base = Path(args.input_dir).resolve()
-    res_dir = str(args.resolution)
     year_range = args.year_range.strip()
     out_base = Path(args.output_dir).resolve()
     try:
@@ -274,22 +267,22 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(str(e)) from e
 
-    # Discover municipalities: subdirs of base/resolution/
-    res_path = base / res_dir
-    if not res_path.is_dir():
-        raise SystemExit(f"Not a directory: {res_path}")
+    # Discover municipalities: subdirs of base/{year_range}/
+    season_path = base / year_range
+    if not season_path.is_dir():
+        raise SystemExit(f"Not a directory: {season_path}")
 
-    muni_codes = sorted([d.name for d in res_path.iterdir() if d.is_dir()])
+    muni_codes = sorted([d.name for d in season_path.iterdir() if d.is_dir()])
     if not muni_codes:
         print("No municipality directories found.")
         return
 
-    # Collect TIFFs per municipality (only those with at least one TIFF in {code}/{year_range}/)
+    # Collect TIFFs per municipality (TIFFs directly under base/{year_range}/{code}/)
     muni_to_paths: dict[str, list[Path]] = {}
     skipped_no_dir: list[str] = []
     skipped_no_tiffs: list[str] = []
     for code in muni_codes:
-        muni_dir = res_path / code / year_range
+        muni_dir = season_path / code
         if not muni_dir.is_dir():
             skipped_no_dir.append(code)
             continue
@@ -300,13 +293,13 @@ def main() -> None:
             skipped_no_tiffs.append(code)
 
     if not muni_to_paths:
-        print(f"No TIFFs found under {res_path}/{{code}}/{year_range}/")
+        print(f"No TIFFs found under {season_path}/{{code}}/")
         return
 
     n_skipped = len(skipped_no_dir) + len(skipped_no_tiffs)
     if n_skipped > 0:
         print(
-            f"Skipped {n_skipped} municipalities (no {year_range}/ dir or no TIFFs): {skipped_no_dir + skipped_no_tiffs}"
+            f"Skipped {n_skipped} municipalities (missing dir or no TIFFs): {skipped_no_dir + skipped_no_tiffs}"
         )
     workers = max(1, int(args.workers))
     print(

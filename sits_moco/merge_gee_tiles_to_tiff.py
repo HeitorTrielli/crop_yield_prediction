@@ -9,8 +9,8 @@ This script groups by date, merges with rasterio, and writes one .tiff per date.
 Raw .tif files are never deleted (kept as archive).
 
 Usage:
-  python merge_gee_tiles_to_tiff.py --dir files/gee_soy_daily/30/state_41/2022-2023/raw
-  (merged .tiff files go to parent dir by default, e.g. .../2022-2023/state_41_YYYY_MM_DD.tiff)
+  python merge_gee_tiles_to_tiff.py --dir files/raw_tiff/2022-2023/parana/raw
+  (merged .tiff files go to parent dir by default, e.g. .../parana/state_41_YYYY_MM_DD.tiff)
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Summarize time dimension in daily municipal .npy files under yield_dataset.
+Summarize time dimension in daily municipal .npy files under files/npy.
 
 Layout: {root}/{season}/{municipality}/{municipality}.npy
 Array shape: [num_pixels, num_days, 11] — num_days is the same for every pixel in
@@ -16,12 +16,12 @@ Use this to choose --sequencelength (≥ max_T over the seasons you train on, or
 subsampling cap).
 
 Usage:
-  python find_max_dates_pixel_npy.py --root files/yield_dataset
-  python find_max_dates_pixel_npy.py --root files/yield_dataset/2022-2023
-  python find_max_dates_pixel_npy.py --root files/yield_dataset --exclude 2020-2021
-  python find_max_dates_pixel_npy.py --root files/yield_dataset --exclude 2020-2021 2021-2022
-  python find_max_dates_pixel_npy.py --root files/yield_dataset --exclude 2020-2021,2021-2022
-  python find_max_dates_pixel_npy.py --root files/yield_dataset --no-progress
+  python find_max_dates_pixel_npy.py --root files/npy
+  python find_max_dates_pixel_npy.py --root files/npy/2022-2023
+  python find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021
+  python find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021 2021-2022
+  python find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021,2021-2022
+  python find_max_dates_pixel_npy.py --root files/npy --no-progress
 """
 from __future__ import annotations
 
@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--root",
         type=Path,
-        default=Path("files/yield_dataset"),
-        help="yield_dataset root (several YYYY-YYYY dirs) or one season folder",
+        default=Path("files/npy"),
+        help="Dataset root (several YYYY-YYYY dirs) or one season folder",
     )
     p.add_argument(
         "--exclude",
@@ -208,7 +208,7 @@ def main() -> None:
     if not seasons:
         raise SystemExit(
             f"No season folders (names like 2020-2021) under {root}. "
-            f"Point --root at files/yield_dataset or at one season folder."
+            f"Point --root at files/npy or at one season folder."
         )
 
     _log(f"Root: {root}")

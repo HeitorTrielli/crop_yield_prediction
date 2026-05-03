@@ -2,17 +2,17 @@
 """
 Clip state-level daily GeoTIFFs to municipality shapefiles (one TIFF per municipality per day).
 
-State TIFFs live in e.g. files/gee_soy_daily/30/state_41/2022-2023. Municipal shapefiles
-are in files/municipal_shapefiles/{municipal_code}_{name}/ with one .shp each. Output:
-files/gee_soy_daily/30/{municipal_code}/2022-2023/{municipal_code}_{Y}_{M}_{D}.tiff.
+State TIFFs live in e.g. files/raw_tiff/2022-2023/parana. Municipal shapefiles are in
+files/shapefiles/{municipal_code}/ (one .shp and sidecars per folder; not season-specific). Output:
+files/daily_tiff/{season}/{municipal_code}/{municipal_code}_{Y}_{M}_{D}.tiff.
 Days with no valid pixels for a municipality are skipped. No-data: 0, -9999, NaN.
 
 CLI usage:
-  # Defaults: tiff-dir=files/gee_soy_daily/30/state_41/2022-2023, shapefile-dir=files/municipal_shapefiles, output-dir=files/gee_soy_daily
+  # Defaults: tiff-dir=files/raw_tiff/2022-2023/parana, shapefile-dir=files/shapefiles, output-dir=files/daily_tiff
   python clip_tiffs_to_shapefiles.py
 
   # Custom paths and 20 parallel workers
-  python clip_tiffs_to_shapefiles.py --tiff-dir files/gee_soy_daily/30/state_41/2022-2023 --shapefile-dir files/municipal_shapefiles --output-dir files/gee_soy_daily -j 20
+  python clip_tiffs_to_shapefiles.py --tiff-dir files/raw_tiff/2022-2023/parana --shapefile-dir files/shapefiles --output-dir files/daily_tiff -j 20
 
   # Single shapefile(s) instead of directory
   python clip_tiffs_to_shapefiles.py --shapefile path/to/4100103.shp --shapefile path/to/4100202.shp -j 20
@@ -56,14 +56,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tiff-dir",
         type=Path,
-        default=Path("files/gee_soy_daily/30/state_41/2022-2023"),
-        help="Directory containing state daily GeoTIFFs (default: files/gee_soy_daily/30/state_41/2022-2023)",
+        default=Path("files/raw_tiff/2022-2023/parana"),
+        help="Directory containing state daily GeoTIFFs (default: files/raw_tiff/2022-2023/parana)",
     )
     p.add_argument(
         "--shapefile-dir",
         type=Path,
-        default=Path("files/municipal_shapefiles"),
-        help="Directory of municipal shapefiles: subfolders {municipal_code}_{name} with one .shp each (default: files/municipal_shapefiles)",
+        default=Path("files/shapefiles"),
+        help="Directory of municipal shapefiles: one subfolder per municipality code with one .shp (default: files/shapefiles)",
     )
     p.add_argument(
         "--shapefile",
@@ -75,15 +75,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("files/gee_soy_daily"),
-        help="Base output directory (default: files/gee_soy_daily). Output: {output_dir}/{resolution}/{municipal_code}/2022-2023/",
+        default=Path("files/daily_tiff"),
+        help="Base output directory (default: files/daily_tiff). Output: {output_dir}/{season}/{municipal_code}/",
     )
     p.add_argument(
         "--resolution",
         type=int,
         default=30,
         metavar="M",
-        help="Resolution folder name under output-dir (default: 30)",
+        help="Unused (kept for backward-compatible CLI). Resolution is not part of output paths.",
     )
     p.add_argument(
         "--all-touched",
@@ -181,7 +181,6 @@ def _process_one_tiff(
     tiff_path: Path,
     municipalities: list[tuple[Path, str, Any]],
     output_dir: Path,
-    res_dir: str,
     year_range: str,
     all_touched: bool,
 ) -> tuple[str, int]:
@@ -197,7 +196,7 @@ def _process_one_tiff(
     with rasterio.open(tiff_path) as src:
         src_crs = src.crs
         for _path, code, geom in municipalities:
-            out_subdir = output_dir / res_dir / code / year_range
+            out_subdir = output_dir / year_range / code
             out_subdir.mkdir(parents=True, exist_ok=True)
             out_file = out_subdir / f"{code}_{y}_{m}_{d}.tiff"
 
@@ -282,7 +281,7 @@ def clip_state_tiffs_to_municipalities(
     tiff_dir: Path | str,
     shapefile_dir: Path | str | None = None,
     shapefiles: list[Path | str] | None = None,
-    output_dir: Path | str = "files/gee_soy_daily",
+    output_dir: Path | str = "files/daily_tiff",
     resolution: int = 30,
     year_range: str | None = None,
     all_touched: bool = True,
@@ -294,7 +293,7 @@ def clip_state_tiffs_to_municipalities(
 
     Reads all .tif/.tiff from tiff_dir (one file per day for the state), clips each by each
     municipality polygon, and writes to:
-      {output_dir}/{resolution}/{municipal_code}/{year_range}/{municipal_code}_{Y}_{M}_{D}.tiff
+      {output_dir}/{year_range}/{municipal_code}/{municipal_code}_{Y}_{M}_{D}.tiff
 
     If a municipality has no pixels for a given day (e.g. outside raster extent), no file
     is written for that day/municipality.
@@ -309,10 +308,10 @@ def clip_state_tiffs_to_municipalities(
     shapefiles : list of paths, optional
         Explicit list of .shp paths. Use either this or shapefile_dir.
     output_dir : path
-        Base output directory (default: files/gee_soy_daily). Output will be
-        {output_dir}/{resolution}/{municipal_code}/2022-2023/ etc.
+        Base output directory (default: files/daily_tiff). Output will be
+        {output_dir}/{season}/{municipal_code}/.
     resolution : int
-        Resolution folder name under output_dir (default: 30).
+        Unused; kept for API compatibility.
     year_range : str, optional
         Subfolder name for year range (e.g. "2022-2023"). If None, inferred from TIFF filenames.
     all_touched : bool
@@ -353,7 +352,6 @@ def clip_state_tiffs_to_municipalities(
         year_range = inferred_year_range
 
     output_dir = Path(output_dir).resolve()
-    res_dir = str(resolution)
 
     if workers <= 1:
         for tiff_path in tiffs:
@@ -366,7 +364,6 @@ def clip_state_tiffs_to_municipalities(
                 tiff_path,
                 municipalities,
                 output_dir,
-                res_dir,
                 year_range,
                 all_touched,
             )
@@ -380,7 +377,6 @@ def clip_state_tiffs_to_municipalities(
                     tiff_path,
                     municipalities,
                     output_dir,
-                    res_dir,
                     year_range,
                     all_touched,
                 ): tiff_path
@@ -397,9 +393,7 @@ def clip_state_tiffs_to_municipalities(
                         _log(f"Failed {tiff_path.name}: {e}")
 
     if verbose:
-        _log(
-            f"Done. Output under {output_dir / res_dir}/{{municipal_code}}/{year_range}/"
-        )
+        _log(f"Done. Output under {output_dir}/{{season}}/{{municipal_code}}/")
 
 
 def main() -> None:

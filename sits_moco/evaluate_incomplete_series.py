@@ -34,8 +34,8 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/yield_dataset/2022-2023",
-        help="Season root: yield_dataset/2022-2023/<municipio>/<municipio>.npy (one folder per municipality, .npy inside)",
+        default="files/npy/2022-2023",
+        help="Season root: npy/2022-2023/<municipio>/<municipio>.npy (one folder per municipality, .npy inside)",
     )
     parser.add_argument(
         "--yield-csv",

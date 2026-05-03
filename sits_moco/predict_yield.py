@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/yield_dataset",
+        default="files/npy",
         help="Path to dataset root directory containing municipality .npy files",
     )
     parser.add_argument(

@@ -35,7 +35,7 @@ from utils_aggregated import (
 )
 
 # Default paths
-DATAPATH = Path(r"files/yield_dataset")
+DATAPATH = Path(r"files/npy")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
 YEARS = [None]
 SEEDS = [6003]
