@@ -18,8 +18,16 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from datasets.datautils import getWeight
+from datasets.feature_layout import (
+    feature_layout_choices,
+    feature_layout_input_dim,
+    normalize_feature_layout,
+)
+from datasets.uscrops_aggregated_npy_polars import scale_xavier_rain_channels
 from models import STNetRegression
 from utils import recursive_todevice
+from run_paths import figures_dir, run_dir_from_path
+from utils_aggregated import stnet_regression_input_dim_from_state_dict
 
 
 def parse_args():
@@ -36,7 +44,10 @@ def parse_args():
         "--datapath",
         type=str,
         default="files/npy",
-        help="Path to dataset root directory containing municipality .npy files",
+        help=(
+            "Dataset root: {datapath}/{muni}/{muni}.npy or "
+            "{datapath}/{year-range}/{muni}/{muni}.npy (use --year-range for daily mode)"
+        ),
     )
     parser.add_argument(
         "--tiffpath",
@@ -67,8 +78,17 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="heatmaps",
-        help="Output directory for heatmap images",
+        default=None,
+        help=(
+            "Output directory for heatmap images (default: {run_dir}/figures/ "
+            "from --checkpoint, optional --figures-subdir)"
+        ),
+    )
+    parser.add_argument(
+        "--figures-subdir",
+        type=str,
+        default=None,
+        help="Optional subfolder under the run figures/ directory (e.g. 2020-2023_train-2021)",
     )
     parser.add_argument(
         "--sequencelength",
@@ -128,12 +148,27 @@ def parse_args():
         default="daily_ndvi",
         help="Subfolder under --output-dir for per-day NDVI PNGs (default: daily_ndvi).",
     )
+    parser.add_argument(
+        "--feature-layout",
+        type=str,
+        default="auto",
+        metavar="NAME",
+        help=(
+            "Optional check vs training: "
+            + ", ".join(feature_layout_choices())
+            + ', or "auto" (default) from checkpoint only.'
+        ),
+    )
     args = parser.parse_args()
+
+    if args.feature_layout != "auto":
+        normalize_feature_layout(args.feature_layout)
 
     args.datapath = Path(args.datapath)
     args.tiffpath = Path(args.tiffpath)
     args.checkpoint = Path(args.checkpoint)
-    args.output_dir = Path(args.output_dir)
+    if args.output_dir is not None:
+        args.output_dir = Path(args.output_dir)
     if args.reference_date is not None:
         args.reference_date = datetime.strptime(args.reference_date, "%Y-%m-%d").date()
 
@@ -238,6 +273,22 @@ def compute_daily_ndvi_stats_from_npy_row(
     return mean_ndvi, peak_ndvi, per_month
 
 
+def resolve_muni_npy(
+    datapath: Path, municipality_code: str, year_range: str | None = None
+) -> Path | None:
+    """Find municipality .npy under datapath (flat or {year-range}/{muni}/ layout)."""
+    candidates = [datapath / municipality_code / f"{municipality_code}.npy"]
+    if year_range is not None:
+        candidates.insert(
+            0, datapath / year_range / municipality_code / f"{municipality_code}.npy"
+        )
+    candidates.append(datapath / f"{municipality_code}.npy")
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
 def resolve_daily_tiff_dir(tiffpath: Path, municipality_code: str, year_range: str | None) -> Path | None:
     """Return directory containing daily TIFFs for a municipality/season."""
     if tiffpath.is_dir():
@@ -261,28 +312,50 @@ def resolve_daily_tiff_dir(tiffpath: Path, municipality_code: str, year_range: s
     return None
 
 
-def transform_pixel(x, sequencelength, rc, interp, seed=None, deterministic_head=False):
+def transform_pixel(
+    x,
+    sequencelength,
+    rc,
+    interp,
+    seed=None,
+    input_dim: int = 10,
+    deterministic_head=False,
+):
     """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY.
     If deterministic_head is True and x has more than sequencelength rows, keeps the earliest sequencelength rows.
+    ``input_dim`` must match the trained model (10 or 12 with Xavier).
     """
     if seed is not None:
         np.random.seed(seed)
 
-    doy = x[:, -1].astype(np.int32)
-    x = x[:, :10] * 1e-4
+    raw = np.asarray(x, dtype=np.float32)
+    t_len, c_in = raw.shape
+    doy_col = 10 if c_in >= 11 else c_in - 1
+    doy = raw[:, doy_col].astype(np.int32)
+    x_spec = raw[:, :10] * 1e-4
 
     mean = np.array(
         [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]]
     )
     std = np.array([0.227, 0.219, 0.222, 0.22, 0.2, 0.193, 0.192, 0.182, 0.123, 0.106])
 
-    weight = getWeight(x)
-    x = (x - mean) / std
+    weight = getWeight(x_spec)
+    x_spec_n = (x_spec - mean) / std
+    if input_dim == 12:
+        if c_in >= 13:
+            rain = scale_xavier_rain_channels(raw[:, 11:13])
+        else:
+            rain = np.zeros((t_len, 2), dtype=np.float32)
+        x = np.concatenate([x_spec_n, rain], axis=-1)
+    else:
+        x = x_spec_n
 
     if interp:
         doy_pad = np.linspace(0, 366, sequencelength).astype("int")
-        x_pad = np.array([np.interp(doy_pad, doy, x[:, i]) for i in range(10)]).T
-        weight_pad = getWeight(x_pad * std + mean)
+        fdim = x.shape[1]
+        x_pad = np.array([np.interp(doy_pad, doy, x[:, i]) for i in range(fdim)]).T
+        spec_denorm = x_pad[:, :10] * std + mean
+        weight_pad = getWeight(spec_denorm)
         mask = np.ones((sequencelength,), dtype=int)
     elif rc:
         replace = False if x.shape[0] >= sequencelength else True
@@ -569,6 +642,7 @@ def reconstruct_spatial_predictions(
     tiff_mode="monthly_tiles",
     year_range=None,
     reference_date=None,
+    input_dim: int = 10,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
@@ -602,10 +676,12 @@ def reconstruct_spatial_predictions(
         else:
             season_start = reference_date
 
-        # Load .npy file
-        muni_npy_file = datapath / municipality_code / f"{municipality_code}.npy"
-        if not muni_npy_file.exists():
-            print(f"  ⚠️  Warning: {muni_npy_file} does not exist")
+        muni_npy_file = resolve_muni_npy(datapath, municipality_code, year_range)
+        if muni_npy_file is None:
+            print(
+                f"  ⚠️  Warning: Could not find {municipality_code}.npy under {datapath}"
+                + (f" (tried year-range {year_range!r})" if year_range else "")
+            )
             return None, None, None, None, None, None, None
 
         try:
@@ -617,6 +693,14 @@ def reconstruct_spatial_predictions(
         if len(municipality_data) == 0:
             print(f"  ⚠️  Warning: {municipality_code} has 0 pixels")
             return None, None, None, None, None, None, None
+
+        print(f"  Loaded {muni_npy_file} shape={municipality_data.shape}")
+        if input_dim == 12 and municipality_data.shape[-1] < 13:
+            print(
+                "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
+                f"{municipality_data.shape[-1]} channels per timestep. "
+                "Run xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
+            )
 
         # Recompute keep-mask in the exact same way as preprocess_daily_to_npy
         keep_mask, height, width = compute_daily_valid_pixel_mask(daily_tiffs)
@@ -659,7 +743,13 @@ def reconstruct_spatial_predictions(
                         ndvi_map_median[("grid", row, col)] = peak_ndvi
 
                         X_tuple = transform_pixel(
-                            X, sequencelength, rc, interp, seed=seed, deterministic_head=True
+                            X,
+                            sequencelength,
+                            rc,
+                            interp,
+                            seed=seed,
+                            input_dim=input_dim,
+                            deterministic_head=True,
                         )
                         current_chunk.append(X_tuple)
                         chunk_indices.append(("grid", row, col))
@@ -705,10 +795,12 @@ def reconstruct_spatial_predictions(
         print(f"  ⚠️  Warning: No TIFF files found for municipality {municipality_code}")
         return None, None, None, None, None, None, None
 
-    # Load .npy file
-    muni_npy_file = datapath / municipality_code / f"{municipality_code}.npy"
-    if not muni_npy_file.exists():
-        print(f"  ⚠️  Warning: {muni_npy_file} does not exist")
+    muni_npy_file = resolve_muni_npy(datapath, municipality_code, year_range)
+    if muni_npy_file is None:
+        print(
+            f"  ⚠️  Warning: Could not find {municipality_code}.npy under {datapath}"
+            + (f" (tried year-range {year_range!r})" if year_range else "")
+        )
         return None, None, None, None, None, None, None
 
     try:
@@ -720,6 +812,14 @@ def reconstruct_spatial_predictions(
     if len(municipality_data) == 0:
         print(f"  ⚠️  Warning: {municipality_code} has 0 pixels")
         return None, None, None, None, None, None, None
+
+    print(f"  Loaded {muni_npy_file} shape={municipality_data.shape}")
+    if input_dim == 12 and municipality_data.shape[-1] < 13:
+        print(
+            "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
+            f"{municipality_data.shape[-1]} channels per timestep. "
+            "Run xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
+        )
 
     # Group TIFF files by month
     # Find directory that starts with municipality_code (e.g., "4100103_Abatiá")
@@ -881,7 +981,12 @@ def reconstruct_spatial_predictions(
                         # Use data from .npy file (it's already processed)
                         X = municipality_data[npy_pixel_idx].copy()
                         X_tuple = transform_pixel(
-                            X, sequencelength, rc, interp, seed=seed
+                            X,
+                            sequencelength,
+                            rc,
+                            interp,
+                            seed=seed,
+                            input_dim=input_dim,
                         )
                         current_chunk.append(X_tuple)
                         chunk_indices.append((tile_x, tile_y, row, col))
@@ -1619,25 +1724,50 @@ def main():
         args.checkpoint, map_location=args.device, weights_only=False
     )
 
+    state_dict = checkpoint["model_state"]
+    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
+    print(f"STNet input_dim from checkpoint: {input_dim}")
+    ck_fl = checkpoint.get("feature_layout")
+    if ck_fl is not None:
+        print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
+    if args.feature_layout != "auto":
+        expected_dim = feature_layout_input_dim(args.feature_layout)
+        if input_dim != expected_dim:
+            raise ValueError(
+                f"Checkpoint has input_dim={input_dim} but --feature-layout {args.feature_layout!r} "
+                f"implies {expected_dim}. Use --feature-layout auto or match training."
+            )
+        if ck_fl is not None and normalize_feature_layout(
+            ck_fl
+        ) != normalize_feature_layout(args.feature_layout):
+            raise ValueError(
+                f"Checkpoint feature_layout={ck_fl!r} does not match --feature-layout {args.feature_layout!r}."
+            )
+
     # Create model
     print("Creating model...")
     device = torch.device(args.device)
     model = STNetRegression(
-        input_dim=10,
+        input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
     ).to(device)
 
     # Load model weights
-    state_dict = checkpoint["model_state"]
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
     else:
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
 
-    # Create output directory
+    # Default figures output next to the checkpoint run
+    if args.output_dir is None:
+        run_dir = run_dir_from_path(args.checkpoint)
+        args.output_dir = figures_dir(run_dir, create=True)
+        if args.figures_subdir:
+            args.output_dir = args.output_dir / args.figures_subdir
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving figures to {args.output_dir}")
 
     municipality_codes = args.municipality_code
 
@@ -1672,6 +1802,7 @@ def main():
             tiff_mode=args.tiff_mode,
             year_range=args.year_range,
             reference_date=args.reference_date,
+            input_dim=input_dim,
         )
 
         if prediction_map is None:
@@ -1757,6 +1888,7 @@ def main():
             tiff_mode=args.tiff_mode,
             year_range=args.year_range,
             reference_date=args.reference_date,
+            input_dim=input_dim,
         )
 
         if prediction_map is not None:

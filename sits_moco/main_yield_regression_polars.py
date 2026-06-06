@@ -6,8 +6,12 @@ Pixel-level predictions are summed per municipality and compared to municipality
 """
 
 import argparse
+import json
+import os
 import random
-from pathlib import Path
+import sys
+from datetime import datetime, timezone
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 import pandas as pd
@@ -17,6 +21,7 @@ import torch.optim
 from torch.utils.data import DataLoader
 
 # Import Polars version of dataset
+from datasets.feature_layout import feature_layout_choices
 from datasets.uscrops_aggregated_npy_polars import USCropsAggregatedNPY
 from models.weight_init import weight_init_regression
 from utils import (
@@ -26,10 +31,12 @@ from utils import (
     recursive_todevice,
     save,
 )
+from run_paths import ensure_run_layout, trainlog_path
 from utils_aggregated import (
     AggregatedMSELoss,
     aggregated_collate_fn,
     regression_metrics,
+    stnet_regression_input_dim_from_state_dict,
     test_epoch_aggregated,
     train_epoch_aggregated,
 )
@@ -38,7 +45,7 @@ from utils_aggregated import (
 DATAPATH = Path(r"files/npy")
 YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
 YEARS = [None]
-SEEDS = [6003]
+SEEDS = [6007]
 
 
 def parse_args():
@@ -151,11 +158,33 @@ def parse_args():
             "Implies multi-year mode; --year is ignored when this is set."
         ),
     )
+    parser.add_argument(
+        "--feature-layout",
+        type=str,
+        default="spectral",
+        choices=feature_layout_choices(),
+        metavar="NAME",
+        help=(
+            "Explicit per-pixel inputs to STNet: "
+            "'spectral' = 10 S2 bands only; "
+            "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy). "
+            "See datasets/feature_layout.py to add layouts (e.g. ET)."
+        ),
+    )
     args = parser.parse_args()
 
     args.dataset = "USCropsAggregatedNPY"
     args.datapath = Path(args.datapath) if args.datapath else DATAPATH
     args.yield_csv = Path(args.yield_csv) if args.yield_csv else YIELD_CSV
+
+    # WSL/Linux convenience: convert Windows absolute paths (e.g. C:\...) to /mnt/c/...
+    # This allows passing the same checkpoint path from Windows into WSL.
+    if args.pretrained and os.name != "nt":
+        p = str(args.pretrained)
+        if len(p) >= 3 and p[1:3] == ":\\":
+            wp = PureWindowsPath(p)
+            drive = (wp.drive or "").rstrip(":").lower()
+            args.pretrained = str(Path("/mnt") / drive / Path(*wp.parts[1:]))
 
     if args.harvest_years:
         args.harvest_years_set = {
@@ -300,6 +329,53 @@ def compute_target_statistics(yield_csv, datapath, harvest_years=None):
     return target_mean, target_std
 
 
+def _json_sanitize(obj):
+    """Make values safe for JSON (paths, sets, numpy scalars)."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, Path):
+        return str(obj.resolve())
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, frozenset):
+        return sorted(obj)
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    return str(obj)
+
+
+def save_training_config_json(logdir: Path, args, extras: dict) -> None:
+    """Persist CLI + computed training metadata at run start (single source of truth per folder)."""
+    cfg = {"cli": {}}
+    for k in sorted(vars(args).keys()):
+        if k.startswith("_"):
+            continue
+        try:
+            cfg["cli"][k] = _json_sanitize(getattr(args, k))
+        except Exception:
+            cfg["cli"][k] = str(getattr(args, k))
+    cfg["computed"] = _json_sanitize(extras)
+    cfg["environment"] = {
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": sys.argv,
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+        "polars": pl.__version__,
+    }
+    out = Path(logdir) / "config.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print(f"Wrote training config to {out}")
+
+
 def train(args):
     target_mean, target_std = compute_target_statistics(
         args.yield_csv, args.datapath, harvest_years=args.harvest_years_set
@@ -321,6 +397,7 @@ def train(args):
         target_mean=target_mean,
         target_std=target_std,
         harvest_years=args.harvest_years_set,
+        feature_layout=args.feature_layout,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
         args.datapath,
@@ -336,6 +413,7 @@ def train(args):
         target_mean=target_mean,
         target_std=target_std,
         harvest_years=args.harvest_years_set,
+        feature_layout=args.feature_layout,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
         args.datapath,
@@ -351,14 +429,20 @@ def train(args):
         target_mean=target_mean,
         target_std=target_std,
         harvest_years=args.harvest_years_set,
+        feature_layout=args.feature_layout,
     )
 
     print("=> creating model")
     device = torch.device(args.device)
     from models import STNetRegression
 
+    input_dim = int(traindataloader.dataset.input_feature_dim)
+    print(
+        f"Model input_dim={input_dim} (--feature-layout {args.feature_layout}; "
+        "see datasets/feature_layout.py)"
+    )
     model = STNetRegression(
-        input_dim=10,
+        input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
     ).to(device)
@@ -466,10 +550,27 @@ def train(args):
             print(f"   Error: {str(e)[:200]}...")
             # Continue with uncompiled model
 
-    logdir = Path(args.logdir) / model.modelname
-    logdir.mkdir(parents=True, exist_ok=True)
-    best_model_path = logdir / "model_best.pth"
-    print(f"Logging results to {logdir}")
+    run_dir = Path(args.logdir) / model.modelname
+    training_dir_path, figures_dir_path, predictions_dir_path = ensure_run_layout(run_dir)
+    best_model_path = training_dir_path / "model_best.pth"
+    print(f"Run directory: {run_dir}")
+    print(f"  training:    {training_dir_path}")
+    print(f"  predictions: {predictions_dir_path}")
+    print(f"  figures:     {figures_dir_path}")
+
+    save_training_config_json(
+        training_dir_path,
+        args,
+        {
+            "model_run_name": model.modelname,
+            "input_dim": int(input_dim),
+            "target_mean": float(target_mean),
+            "target_std": float(target_std),
+            "num_train_municipalities": len(traindataloader.dataset),
+            "num_valid_municipalities": len(valdataloader.dataset),
+            "num_eval_municipalities": len(testdataloader.dataset),
+        },
+    )
 
     # Pass normalization stats for denormalization in evaluation
     criterion = AggregatedMSELoss(
@@ -532,15 +633,20 @@ def train(args):
                 print(f"  ✓ Normalization stats match")
 
         # Load existing training log if it exists
-        trainlog_path = logdir / "trainlog.csv"
-        if trainlog_path.exists():
+        trainlog_file = trainlog_path(run_dir)
+        if trainlog_file.exists():
             try:
-                existing_log_df = pd.read_csv(trainlog_path, index_col="epoch")
-                log = existing_log_df.to_dict("records")
-                # Convert epoch index back to int if it's not "test"
+                existing_log_df = pd.read_csv(trainlog_file, index_col="epoch")
+                # reset_index() so epoch is a column; to_dict("records") drops the index
+                log = existing_log_df.reset_index().to_dict("records")
                 for entry in log:
-                    if isinstance(entry.get("epoch"), str) and entry["epoch"] != "test":
-                        entry["epoch"] = int(entry["epoch"])
+                    ep = entry.get("epoch")
+                    if ep is None or ep == "test":
+                        continue
+                    try:
+                        entry["epoch"] = int(ep)
+                    except (ValueError, TypeError):
+                        pass
                 print(f"  ✓ Loaded existing training log with {len(log)} entries")
             except Exception as e:
                 print(f"  ⚠️  Could not load existing log: {e}, starting fresh")
@@ -599,6 +705,7 @@ def train(args):
                 not_improved_count=not_improved_count,
                 target_mean=target_mean,
                 target_std=target_std,
+                feature_layout=args.feature_layout,
             )
             val_loss_min = val_loss
             print(f"lowest val loss in epoch {epoch + 1}\n")
@@ -611,10 +718,10 @@ def train(args):
         log.append(scores)
 
         log_df = pd.DataFrame(log).set_index("epoch")
-        log_df.to_csv(Path(logdir) / "trainlog.csv")
+        log_df.to_csv(training_dir_path / "trainlog.csv", float_format="%.6g")
 
         if (epoch + 1) % 1 == 0:
-            checkpoint_path = logdir / f"checkpoint_epoch_{epoch + 1}.pth"
+            checkpoint_path = training_dir_path / f"checkpoint_epoch_{epoch + 1}.pth"
             save(
                 model,
                 path=checkpoint_path,
@@ -627,6 +734,7 @@ def train(args):
                 not_improved_count=not_improved_count,
                 target_mean=target_mean,
                 target_std=target_std,
+                feature_layout=args.feature_layout,
             )
             print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
 
@@ -644,7 +752,14 @@ def train(args):
     checkpoint = torch.load(best_model_path, weights_only=False)
     state_dict = {k: v for k, v in checkpoint["model_state"].items()}
     criterion = checkpoint["criterion"]
-    torch.save({"model_state": state_dict, "criterion": criterion}, best_model_path)
+    torch.save(
+        {
+            "model_state": state_dict,
+            "criterion": criterion,
+            "feature_layout": checkpoint.get("feature_layout"),
+        },
+        best_model_path,
+    )
 
     # Handle compiled models - load into underlying model if compiled
     if hasattr(model, "_orig_mod"):
@@ -662,9 +777,9 @@ def train(args):
     scores["testloss"] = test_loss
 
     log_df = pd.DataFrame([scores]).set_index("epoch")
-    log_df.to_csv(logdir / f"testlog.csv")
+    log_df.to_csv(training_dir_path / "testlog.csv")
 
-    return logdir
+    return run_dir
 
 
 def get_aggregated_dataloader(
@@ -682,6 +797,7 @@ def get_aggregated_dataloader(
     target_mean=None,
     target_std=None,
     harvest_years=None,
+    feature_layout: str = "spectral",
 ):
     """Create dataloader for aggregated regression (Polars-optimized)."""
     dataset = USCropsAggregatedNPY(
@@ -698,6 +814,7 @@ def get_aggregated_dataloader(
         target_mean=target_mean,
         target_std=target_std,
         harvest_years=harvest_years,
+        feature_layout=feature_layout,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0
@@ -728,9 +845,11 @@ def get_aggregated_dataloader(
     )
 
     meta = dict(
-        ndims=10,
+        ndims=dataset.input_feature_dim,
         num_outputs=1,
         num_municipalities=len(dataset),
+        use_xavier=dataset.use_xavier,
+        feature_layout=dataset.feature_layout,
     )
 
     return dataloader, meta
@@ -762,7 +881,7 @@ def main():
                 True  # Enable cuDNN benchmarking for faster convolutions
             )
 
-            logdir = train(args)
+            run_dir = train(args)
     else:
         for year in years:
             print(
@@ -785,7 +904,7 @@ def main():
                     True  # Enable cuDNN benchmarking for faster convolutions
                 )
 
-                logdir = train(args)
+                run_dir = train(args)
 
 
 if __name__ == "__main__":

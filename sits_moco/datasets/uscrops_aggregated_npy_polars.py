@@ -16,6 +16,18 @@ import polars as pl
 import torch
 from torch.utils.data import Dataset
 
+from .feature_layout import (
+    feature_layout_choices,
+    normalize_feature_layout,
+    resolve_feature_layout,
+)
+from .pixel_transform import (
+    DOY_CHANNEL,
+    NUM_SPECTRAL_CHANNELS,
+    PixelTransform,
+    scale_xavier_rain_channels,
+)
+
 
 def _doy_to_season_month(doy, reference_date):
     """DOY 1 = reference_date (e.g. 2022-10-01). Use date + timedelta to get calendar month, then map to season 1..6."""
@@ -29,8 +41,8 @@ def _doy_to_season_month(doy, reference_date):
 
 
 def _indices_first_n_months(row, num_periods, reference_date):
-    """Return indices of rows in (T, 11) where season month is in 1..num_periods."""
-    doys = row[:, -1].astype(np.float64)
+    """Return indices of rows in (T, C) where season month is in 1..num_periods (DOY at channel 10)."""
+    doys = row[:, DOY_CHANNEL].astype(np.float64)
     months = np.array([_doy_to_season_month(d, reference_date) for d in doys])
     valid = (months >= 1) & (months <= num_periods)
     return np.nonzero(valid)[0]
@@ -43,6 +55,8 @@ class USCropsAggregatedNPY(Dataset):
 
     Returns pixel metadata (lazy loading) and municipality-level yield target.
     Training code loads pixels in chunks on-demand.
+
+    ``feature_layout`` selects the STNet input stack explicitly; see ``datasets/feature_layout.py``.
     """
 
     def __init__(
@@ -60,11 +74,21 @@ class USCropsAggregatedNPY(Dataset):
         target_mean=None,
         target_std=None,
         harvest_years: Optional[Iterable[int]] = None,
+        feature_layout: str = "spectral",
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
         mode = mode.lower()
         assert mode in ["train", "valid", "eval", "test", "all"]
+
+        self.feature_layout = normalize_feature_layout(feature_layout)
+        _lay = resolve_feature_layout(self.feature_layout)
+        self.input_feature_dim = int(_lay["input_dim"])
+        self._extra_channels_slice: tuple[int, int] | None = _lay[
+            "extra_channels_slice"
+        ]
+        # Backward-compatible flag for logging / meta
+        self.use_xavier = self._extra_channels_slice == (11, 13)
 
         self.root = Path(root)
         self.year = year
@@ -333,16 +357,18 @@ class USCropsAggregatedNPY(Dataset):
         )
         total_pixels = sum(self.municipality_pixel_counts.values())
         print(f"Total pixels: {total_pixels:,}")
-
-        # Transform parameters
-        from .datautils import getWeight_batch
-
-        self.getWeight_batch = getWeight_batch
-        self.mean = np.array(
-            [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]]
+        print(
+            f"Feature layout: {self.feature_layout!r} → STNet input_dim={self.input_feature_dim} "
+            f"(choices: {', '.join(feature_layout_choices())})"
         )
-        self.std = np.array(
-            [0.227, 0.219, 0.222, 0.22, 0.2, 0.193, 0.192, 0.182, 0.123, 0.106]
+        self._validate_npy_channel_requirement()
+
+        self.pixel_transform = PixelTransform(
+            sequencelength,
+            feature_layout=self.feature_layout,
+            randomchoice=randomchoice,
+            interp=interp,
+            seed=seed,
         )
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
@@ -372,117 +398,50 @@ class USCropsAggregatedNPY(Dataset):
                 return candidate
         return None
 
-    def _transform_chunk(self, chunk_arr):
-        """Vectorized transform for a chunk of pixels. chunk_arr: (N, T, 11). Returns list of N 4-tuples (x_pad, mask, doy_pad, weight_pad)."""
-        N, T, _ = chunk_arr.shape
-        doy = chunk_arr[:, :, -1].astype(np.int32)  # (N, T)
-        x = chunk_arr[:, :, :10] * 1e-4  # (N, T, 10)
-
-        weight = self.getWeight_batch(x)  # (N, T)
-        x = (x - self.mean) / self.std
-
-        seq_len = self.sequencelength
-        if self.interp:
-            doy_pad = np.linspace(0, 366, seq_len).astype(np.int32)
-            x_pad = np.zeros((N, seq_len, 10), dtype=np.float32)
-            for n in range(N):
-                x_pad[n] = np.array(
-                    [np.interp(doy_pad, doy[n], x[n, :, i]) for i in range(10)]
-                ).T
-            weight_pad = self.getWeight_batch(x_pad * self.std + self.mean)
-            mask = np.ones((N, seq_len), dtype=np.int32)
-            doy_pad_broadcast = np.tile(doy_pad.astype(np.int64), (N, 1))
-        elif self.rc:
-            replace = T >= seq_len
-            idxs = np.random.choice(T, seq_len, replace=replace)
-            idxs.sort()
-            x_pad = x[:, idxs, :]
-            doy_pad_broadcast = doy[:, idxs]
-            weight_pad = weight[:, idxs]
-            weight_pad /= weight_pad.sum(axis=1, keepdims=True)
-            mask = np.ones((N, seq_len), dtype=np.int32)
-        else:
-            if T == seq_len:
-                x_pad = x
-                doy_pad_broadcast = doy
-                weight_pad = weight
-                weight_pad /= weight_pad.sum(axis=1, keepdims=True)
-                mask = np.ones((N, seq_len), dtype=np.int32)
-            elif T < seq_len:
-                mask = np.zeros((N, seq_len), dtype=np.int32)
-                mask[:, :T] = 1
-                x_pad = np.zeros((N, seq_len, 10), dtype=np.float32)
-                x_pad[:, :T, :] = x
-                doy_pad_broadcast = np.zeros((N, seq_len), dtype=np.int32)
-                doy_pad_broadcast[:, :T] = doy
-                weight_pad = np.zeros((N, seq_len), dtype=np.float64)
-                weight_pad[:, :T] = weight
-                wsum = weight_pad.sum(axis=1, keepdims=True)
-                weight_pad /= np.where(wsum > 0, wsum, 1.0)
+    def _validate_npy_channel_requirement(self) -> None:
+        """Ensure on-disk .npy files have enough channels for the chosen layout."""
+        if self._extra_channels_slice is None:
+            return
+        _, hi = self._extra_channels_slice
+        bad: list[tuple[str, int]] = []
+        checked = 0
+        for key in self.municipality_list:
+            if checked >= 120:
+                break
+            if isinstance(key, tuple):
+                code, year = key
             else:
-                idxs = np.random.choice(T, seq_len, replace=False)
-                idxs.sort()
-                x_pad = x[:, idxs, :]
-                doy_pad_broadcast = doy[:, idxs]
-                weight_pad = weight[:, idxs]
-                weight_pad /= weight_pad.sum(axis=1, keepdims=True)
-                mask = np.ones((N, seq_len), dtype=np.int32)
+                code = key
+                year = self.municipality_years.get(code, self.year)
+            p = self._resolve_npy_path(code, year)
+            if p is None or not p.is_file():
+                continue
+            checked += 1
+            try:
+                data = np.load(p, mmap_mode="r")
+                if data.ndim < 3:
+                    continue
+                c = int(data.shape[2])
+                if c < hi:
+                    bad.append((str(p), c))
+            except OSError:
+                continue
+        if bad:
+            examples = "; ".join(f"{path} (C={c})" for path, c in bad[:5])
+            raise ValueError(
+                f"Feature layout {self.feature_layout!r} requires each .npy to have at least {hi} channels "
+                f"(extra fields at indices {self._extra_channels_slice}). "
+                f"Found files with fewer channels, e.g.: {examples}. "
+                f"Use --feature-layout spectral or rebuild .npy with the extra channels."
+            )
+        if checked == 0 and len(self.municipality_list) > 0:
+            print(
+                f"  ⚠️  Could not read any .npy to verify channel count for layout {self.feature_layout!r}."
+            )
 
-        x_pad = np.ascontiguousarray(x_pad.astype(np.float32))
-        mask_bool = mask == 0  # (N, seq_len) True = padding
-        doy_pad_broadcast = np.ascontiguousarray(doy_pad_broadcast.astype(np.int64))
-        weight_pad = np.ascontiguousarray(weight_pad.astype(np.float32))
-
-        x_t = torch.from_numpy(x_pad)
-        mask_t = torch.from_numpy(mask_bool)
-        doy_t = torch.from_numpy(doy_pad_broadcast)
-        weight_t = torch.from_numpy(weight_pad)
-
-        # Return same interface as before: list of N 4-tuples so training code's torch.stack([p[0] for p in pixel_chunk]) works
-        return [(x_t[i], mask_t[i], doy_t[i], weight_t[i]) for i in range(N)]
-
-    def _transform_chunk_incomplete_eval(self, chunk_arr):
-        """(N, T, 11) with T timesteps already in chronological (DOY) order for each pixel.
-        Pad to sequencelength, or if T > sequencelength keep the earliest sequencelength days.
-        Deterministic: no random subsample, no interp, no randomchoice. Matches incomplete-season eval.
-        """
-        N, T, _ = chunk_arr.shape
-        doy = chunk_arr[:, :, -1].astype(np.int32)
-        x = chunk_arr[:, :, :10] * 1e-4
-        weight = self.getWeight_batch(x)
-        x = (x - self.mean) / self.std
-        seq_len = self.sequencelength
-        if T > seq_len:
-            x = x[:, :seq_len, :]
-            doy = doy[:, :seq_len]
-            weight = weight[:, :seq_len]
-            T = seq_len
-        if T == seq_len:
-            x_pad = x
-            doy_pad_broadcast = doy
-            weight_pad = weight
-            weight_pad = weight_pad / weight_pad.sum(axis=1, keepdims=True)
-            mask = np.ones((N, seq_len), dtype=np.int32)
-        else:
-            mask = np.zeros((N, seq_len), dtype=np.int32)
-            mask[:, :T] = 1
-            x_pad = np.zeros((N, seq_len, 10), dtype=np.float32)
-            x_pad[:, :T, :] = x
-            doy_pad_broadcast = np.zeros((N, seq_len), dtype=np.int32)
-            doy_pad_broadcast[:, :T] = doy
-            weight_pad = np.zeros((N, seq_len), dtype=np.float64)
-            weight_pad[:, :T] = weight
-            wsum = weight_pad.sum(axis=1, keepdims=True)
-            weight_pad /= np.where(wsum > 0, wsum, 1.0)
-        x_pad = np.ascontiguousarray(x_pad.astype(np.float32))
-        mask_bool = mask == 0
-        doy_pad_broadcast = np.ascontiguousarray(doy_pad_broadcast.astype(np.int64))
-        weight_pad = np.ascontiguousarray(weight_pad.astype(np.float32))
-        x_t = torch.from_numpy(x_pad)
-        mask_t = torch.from_numpy(mask_bool)
-        doy_t = torch.from_numpy(doy_pad_broadcast)
-        weight_t = torch.from_numpy(weight_pad)
-        return [(x_t[i], mask_t[i], doy_t[i], weight_t[i]) for i in range(N)]
+    def _transform_chunk(self, chunk_arr):
+        """Vectorized transform (delegates to PixelTransform — same as training)."""
+        return self.pixel_transform.transform_chunk(chunk_arr)
 
     def load_pixels_from_municipality(
         self, municipality_code, year=None, chunk_size=10000
@@ -495,7 +454,10 @@ class USCropsAggregatedNPY(Dataset):
             chunk_size: Number of pixels per chunk
         """
         # Determine which year to use
-        if year is None:
+        if year is None and self._flat_season:
+            # One season folder (e.g. 2020-2021/4100103/4100103.npy); year is only for yield lookup
+            year = self.year if self.year is not None else 2023
+        elif year is None:
             if self.year is not None:
                 year = self.year
             elif self.use_multi_year:
@@ -600,7 +562,7 @@ class USCropsAggregatedNPY(Dataset):
                     filtered.append(None)
                     continue
                 sub = chunk_arr[i, idx, :]
-                doys = sub[:, -1].astype(np.float64)
+                doys = sub[:, DOY_CHANNEL].astype(np.float64)
                 sub = sub[np.argsort(doys, kind="stable"), :]
                 filtered.append(sub)
             by_len = defaultdict(list)
@@ -610,7 +572,7 @@ class USCropsAggregatedNPY(Dataset):
             result = [None] * N
             for k, indices in by_len.items():
                 stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
-                tuples_list = self._transform_chunk_incomplete_eval(stacked)
+                tuples_list = self._transform_chunk(stacked)
                 for j, i in enumerate(indices):
                     result[i] = tuples_list[j]
             yield [r for r in result if r is not None]

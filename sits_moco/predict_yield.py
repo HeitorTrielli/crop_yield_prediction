@@ -9,13 +9,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.amp import autocast
 from tqdm import tqdm
 
-from datasets.datautils import getWeight
+from datasets import USCropsAggregatedNPY
+from datasets.feature_layout import (
+    feature_layout_choices,
+    feature_layout_input_dim,
+    normalize_feature_layout,
+)
 from models import STNetRegression
-from utils import recursive_todevice
-from utils_aggregated import regression_metrics
+from run_paths import predictions_dir, run_dir_from_path
+from utils_aggregated import (
+    regression_metrics,
+    stnet_regression_input_dim_from_state_dict,
+    sum_municipality_from_pixel_chunks,
+)
 
 
 def parse_args():
@@ -51,6 +59,24 @@ def parse_args():
         type=str,
         default=None,
         help="Path to yield CSV file with 'split' column (used with --eval-only, --valid-only, --train-only)",
+    )
+    parser.add_argument(
+        "--yield-year",
+        type=int,
+        default=None,
+        help=(
+            "If the yield CSV has a year/harvest column, restrict merges (actual_yield, metrics) "
+            "to this year only so labels match that season."
+        ),
+    )
+    parser.add_argument(
+        "--restrict-to-yield-year",
+        action="store_true",
+        help=(
+            "Requires --yield-year and --yield-csv (or default yield path). "
+            "Only predict municipalities that appear in the yield CSV for that year and have a "
+            ".npy under --datapath (intersection)."
+        ),
     )
     parser.add_argument(
         "--eval-only",
@@ -102,10 +128,24 @@ def parse_args():
         default=27,
         help="Random seed for reproducibility (default: 27)",
     )
+    parser.add_argument(
+        "--feature-layout",
+        type=str,
+        default="auto",
+        metavar="NAME",
+        help=(
+            "Optional check against training: "
+            + ", ".join(feature_layout_choices())
+            + ', or "auto" (default) to infer input width only from the checkpoint.'
+        ),
+    )
     args = parser.parse_args()
 
     args.datapath = Path(args.datapath)
     args.checkpoint = Path(args.checkpoint)
+
+    if args.feature_layout != "auto":
+        normalize_feature_layout(args.feature_layout)
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -113,179 +153,19 @@ def parse_args():
     return args
 
 
-def transform_pixel(x, sequencelength, rc, interp, seed=None):
-    """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY."""
-    if seed is not None:
-        np.random.seed(seed)
-
-    # Extract DOY (stored as float32, convert to int for indexing)
-    doy = x[:, -1].astype(np.int32)
-    x = x[:, :10] * 1e-4
-
-    # Normalization parameters (same as dataset)
-    mean = np.array(
-        [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]]
-    )
-    std = np.array([0.227, 0.219, 0.222, 0.22, 0.2, 0.193, 0.192, 0.182, 0.123, 0.106])
-
-    weight = getWeight(x)
-    x = (x - mean) / std
-
-    if interp:
-        doy_pad = np.linspace(0, 366, sequencelength).astype("int")
-        x_pad = np.array([np.interp(doy_pad, doy, x[:, i]) for i in range(10)]).T
-        weight_pad = getWeight(x_pad * std + mean)
-        mask = np.ones((sequencelength,), dtype=int)
-    elif rc:
-        replace = False if x.shape[0] >= sequencelength else True
-        idxs = np.random.choice(x.shape[0], sequencelength, replace=replace)
-        idxs.sort()
-        x_pad = x[idxs]
-        mask = np.ones((sequencelength,), dtype=int)
-        doy_pad = doy[idxs]
-        weight_pad = weight[idxs]
-        weight_pad /= weight_pad.sum()
-    else:
-        x_length, c_length = x.shape
-        if x_length == sequencelength:
-            mask = np.ones((sequencelength,), dtype=int)
-            x_pad = x
-            doy_pad = doy
-            weight_pad = weight
-            weight_pad /= weight_pad.sum()
-        elif x_length < sequencelength:
-            mask = np.zeros((sequencelength,), dtype=int)
-            mask[:x_length] = 1
-            x_pad = np.zeros((sequencelength, c_length))
-            x_pad[:x_length, :] = x[:x_length, :]
-            doy_pad = np.zeros((sequencelength,), dtype=int)
-            doy_pad[:x_length] = doy[:x_length]
-            weight_pad = np.zeros((sequencelength,), dtype=float)
-            weight_pad[:x_length] = weight[:x_length]
-            weight_pad /= weight_pad.sum() if weight_pad.sum() > 0 else 1
-        else:
-            idxs = np.random.choice(x.shape[0], sequencelength, replace=False)
-            idxs.sort()
-            x_pad = x[idxs]
-            mask = np.ones((sequencelength,), dtype=int)
-            doy_pad = doy[idxs]
-            weight_pad = weight[idxs]
-            weight_pad /= weight_pad.sum()
-
-    return (
-        torch.from_numpy(x_pad).type(torch.FloatTensor),
-        torch.from_numpy(mask == 0),
-        torch.from_numpy(doy_pad).type(torch.LongTensor),
-        torch.from_numpy(weight_pad).type(torch.FloatTensor),
-    )
-
-
 def predict_municipality(
     model,
     municipality_code,
-    datapath,
-    sequencelength,
-    rc,
-    interp,
+    dataset,
     chunk_size,
     device,
-    seed=None,
+    year=None,
 ):
-    """Predict yield for a single municipality by summing pixel-level predictions."""
-    muni_npy_file = datapath / municipality_code / f"{municipality_code}.npy"
-
-    if not muni_npy_file.exists():
-        print(f"  ⚠️  Warning: {muni_npy_file} does not exist, skipping")
-        return None
-
-    try:
-        municipality_data = np.load(muni_npy_file, mmap_mode="r")
-    except Exception as e:
-        print(f"  ⚠️  Warning: Could not load {muni_npy_file}: {e}")
-        return None
-
-    if len(municipality_data) == 0:
-        print(f"  ⚠️  Warning: {municipality_code} has 0 pixels, skipping")
-        return None
-
-    model.eval()
-    municipality_sum = None
-
-    with torch.no_grad():
-        # Process pixels in chunks
-        current_chunk = []
-        for pixel_index in range(len(municipality_data)):
-            X = municipality_data[pixel_index].copy()
-            X_tuple = transform_pixel(X, sequencelength, rc, interp, seed=seed)
-            current_chunk.append(X_tuple)
-
-            if len(current_chunk) >= chunk_size:
-                # Process chunk
-                chunk_x = torch.stack([p[0] for p in current_chunk])
-                chunk_mask = torch.stack([p[1] for p in current_chunk])
-                chunk_doy = torch.stack([p[2] for p in current_chunk])
-                chunk_weight = torch.stack([p[3] for p in current_chunk])
-
-                municipality_X_chunk = (chunk_x, chunk_mask, chunk_doy, chunk_weight)
-                municipality_X_chunk = recursive_todevice(municipality_X_chunk, device)
-
-                # Use autocast for faster computation
-                with (
-                    autocast("cuda", dtype=torch.bfloat16)
-                    if device == "cuda"
-                    else torch.no_grad()
-                ):
-                    chunk_predictions = model(municipality_X_chunk)
-
-                chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
-
-                if municipality_sum is None:
-                    municipality_sum = chunk_sum
-                else:
-                    municipality_sum = municipality_sum.to(
-                        torch.float32
-                    ) + chunk_sum.to(torch.float32)
-
-                current_chunk = []
-
-        # Process remaining pixels
-        if current_chunk:
-            chunk_x = torch.stack([p[0] for p in current_chunk])
-            chunk_mask = torch.stack([p[1] for p in current_chunk])
-            chunk_doy = torch.stack([p[2] for p in current_chunk])
-            chunk_weight = torch.stack([p[3] for p in current_chunk])
-
-            municipality_X_chunk = (chunk_x, chunk_mask, chunk_doy, chunk_weight)
-            municipality_X_chunk = recursive_todevice(municipality_X_chunk, device)
-
-            with (
-                autocast("cuda", dtype=torch.bfloat16)
-                if device == "cuda"
-                else torch.no_grad()
-            ):
-                chunk_predictions = model(municipality_X_chunk)
-
-            chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
-
-            if municipality_sum is None:
-                municipality_sum = chunk_sum
-            else:
-                municipality_sum = municipality_sum.to(torch.float32) + chunk_sum.to(
-                    torch.float32
-                )
-
-    if municipality_sum is None:
-        return None
-
-    # Return as scalar
-    if municipality_sum.dim() > 0:
-        municipality_sum = municipality_sum.squeeze()
-        if municipality_sum.dim() > 0:
-            municipality_sum = (
-                municipality_sum[0] if len(municipality_sum) > 0 else torch.tensor(0.0)
-            )
-
-    return municipality_sum.item()
+    """Predict yield via USCropsAggregatedNPY (same transform as training)."""
+    chunks = dataset.load_pixels_from_municipality(
+        municipality_code, year=year, chunk_size=chunk_size
+    )
+    return sum_municipality_from_pixel_chunks(model, chunks, device)
 
 
 def main():
@@ -302,6 +182,26 @@ def main():
         args.checkpoint, map_location=args.device, weights_only=False
     )
 
+    state_dict = checkpoint["model_state"]
+    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
+    print(f"STNet input_dim from checkpoint: {input_dim}")
+    ck_fl = checkpoint.get("feature_layout")
+    if ck_fl is not None:
+        print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
+    if args.feature_layout != "auto":
+        expected_dim = feature_layout_input_dim(args.feature_layout)
+        if input_dim != expected_dim:
+            raise ValueError(
+                f"Checkpoint has input_dim={input_dim} but --feature-layout {args.feature_layout!r} "
+                f"implies {expected_dim}. Use --feature-layout auto or match training."
+            )
+        if ck_fl is not None and normalize_feature_layout(
+            ck_fl
+        ) != normalize_feature_layout(args.feature_layout):
+            raise ValueError(
+                f"Checkpoint feature_layout={ck_fl!r} does not match --feature-layout {args.feature_layout!r}."
+            )
+
     # Extract normalization parameters (stored for reference, but model outputs are in original scale)
     target_mean = checkpoint.get("target_mean", 0.0)
     target_std = checkpoint.get("target_std", 1.0)
@@ -314,19 +214,45 @@ def main():
     print("Creating model...")
     device = torch.device(args.device)
     model = STNetRegression(
-        input_dim=10,
+        input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
     ).to(device)
 
     # Load model weights
-    state_dict = checkpoint["model_state"]
     # Handle compiled models
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
     else:
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
+
+    if args.feature_layout == "auto":
+        if ck_fl is not None:
+            feature_layout = normalize_feature_layout(ck_fl)
+        elif input_dim == 12:
+            feature_layout = "spectral_xavier"
+        else:
+            feature_layout = "spectral"
+    else:
+        feature_layout = args.feature_layout
+
+    yield_csv_for_dataset = Path(
+        args.yield_csv
+        if args.yield_csv
+        else "files/municipality_production_with_codes.csv"
+    )
+    dataset = USCropsAggregatedNPY(
+        mode="all",
+        root=args.datapath.resolve(),
+        yield_csv=yield_csv_for_dataset,
+        year=None,
+        sequencelength=args.sequencelength,
+        randomchoice=args.rc,
+        interp=args.interp,
+        seed=args.seed,
+        feature_layout=feature_layout,
+    )
 
     # Get list of municipalities to predict
     municipality_list = None
@@ -340,7 +266,62 @@ def main():
     elif args.train_only:
         split_filter = "train"
 
-    if split_filter:
+    if args.restrict_to_yield_year:
+        if split_filter:
+            raise ValueError(
+                "--restrict-to-yield-year cannot be used with --eval-only / --valid-only / --train-only"
+            )
+        if args.yield_year is None:
+            raise ValueError("--restrict-to-yield-year requires --yield-year")
+        yield_csv_path = Path(
+            args.yield_csv
+            if args.yield_csv
+            else "files/municipality_production_with_codes.csv"
+        )
+        if not yield_csv_path.exists():
+            raise FileNotFoundError(f"Yield CSV not found: {yield_csv_path}")
+        print(
+            f"Restricting list to municipalities with yield year {args.yield_year} "
+            f"(from {yield_csv_path.name}) ∩ .npy under {args.datapath}"
+        )
+        ydf = pd.read_csv(yield_csv_path)
+        muni_code_col = None
+        for col in ["municipality_code", "code", "municipality", "muni_code"]:
+            if col in ydf.columns:
+                muni_code_col = col
+                break
+        if muni_code_col is None:
+            raise ValueError(
+                f"Could not find municipality code column. Available: {list(ydf.columns)}"
+            )
+        year_col = None
+        for c in ("year", "Year", "YEAR"):
+            if c in ydf.columns:
+                year_col = c
+                break
+        if year_col is None:
+            raise ValueError(
+                "Yield CSV has no year/Year/YEAR column; cannot use --restrict-to-yield-year"
+            )
+        ydf = ydf[ydf[year_col].astype(int) == int(args.yield_year)]
+        codes_csv = set(ydf[muni_code_col].astype(str).str.strip())
+        scanned = set()
+        for muni_dir in args.datapath.iterdir():
+            if muni_dir.is_dir():
+                muni_code = muni_dir.name
+                if (muni_dir / f"{muni_code}.npy").is_file():
+                    scanned.add(muni_code)
+        municipality_list = sorted(codes_csv & scanned)
+        print(
+            f"Found {len(municipality_list)} municipalities (CSV year {args.yield_year} ∩ datapath)"
+        )
+        if len(municipality_list) == 0:
+            print(
+                "⚠️  No municipalities matched — check --datapath season folder and yield CSV."
+            )
+            return
+
+    elif split_filter:
         # Filter by split from yield CSV
         if not args.yield_csv:
             # Try to find default yield CSV
@@ -414,12 +395,16 @@ def main():
         municipality_list = sorted(municipality_list)
         print(f"Found {len(municipality_list)} municipalities with .npy files")
 
-    # Determine output CSV filename
+    # Determine output CSV filename (default: {run_dir}/predictions/)
     if args.output_csv is None:
+        run_dir = run_dir_from_path(args.checkpoint)
+        pred_dir = predictions_dir(run_dir, create=True)
         if split_filter:
-            args.output_csv = f"yield_forecasts_{split_filter}.csv"
+            args.output_csv = pred_dir / f"yield_forecasts_{split_filter}.csv"
         else:
-            args.output_csv = "yield_forecasts.csv"
+            args.output_csv = pred_dir / "yield_forecasts.csv"
+    else:
+        args.output_csv = Path(args.output_csv)
 
     # Generate predictions
     print(f"\nGenerating predictions for {len(municipality_list)} municipalities...")
@@ -430,13 +415,9 @@ def main():
         prediction = predict_municipality(
             model,
             municipality_code,
-            args.datapath,
-            args.sequencelength,
-            args.rc,
-            args.interp,
+            dataset,
             args.chunk_size,
             device,
-            seed=args.seed,
         )
 
         if prediction is not None:
@@ -464,7 +445,12 @@ def main():
         print(f"  Forecast mean: {results_df['forecast'].mean():.2f}")
 
         # Compute metrics if yield CSV is available
-        if args.yield_csv or split_filter:
+        if (
+            args.yield_csv
+            or split_filter
+            or args.yield_year is not None
+            or args.restrict_to_yield_year
+        ):
             yield_csv_path = Path(
                 args.yield_csv
                 if args.yield_csv
@@ -476,6 +462,24 @@ def main():
                     f"\nComputing metrics using ground truth from {yield_csv_path}..."
                 )
                 yield_df = pd.read_csv(yield_csv_path)
+
+                if args.yield_year is not None:
+                    year_col_f = None
+                    for c in ("year", "Year", "YEAR"):
+                        if c in yield_df.columns:
+                            year_col_f = c
+                            break
+                    if year_col_f is None:
+                        print(
+                            "  ⚠️  --yield-year ignored: no year/Year/YEAR column in yield CSV"
+                        )
+                    else:
+                        yield_df = yield_df[
+                            yield_df[year_col_f].astype(int) == int(args.yield_year)
+                        ].copy()
+                        print(
+                            f"  Using yield rows for harvest year {args.yield_year} ({len(yield_df)} rows)"
+                        )
 
                 # Find columns
                 muni_code_col = None

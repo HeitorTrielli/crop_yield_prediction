@@ -185,10 +185,13 @@ def train(args):
     if args.suffix:
         model.modelname += f'_{args.suffix}'
 
-    logdir = Path(args.logdir) / model.modelname
-    logdir.mkdir(parents=True, exist_ok=True)
-    best_model_path = logdir / 'model_best.pth'
-    print(f"Logging results to {logdir}")
+    from run_paths import ensure_run_layout
+
+    run_dir = Path(args.logdir) / model.modelname
+    training_dir_path, _, _ = ensure_run_layout(run_dir)
+    best_model_path = training_dir_path / 'model_best.pth'
+    print(f"Run directory: {run_dir}")
+    print(f"  training: {training_dir_path}")
 
     criterion = torch.nn.CrossEntropyLoss(reduction="mean")
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -230,7 +233,7 @@ def train(args):
             log.append(scores)
 
             log_df = pd.DataFrame(log).set_index("epoch")
-            log_df.to_csv(Path(logdir) / "trainlog.csv")
+            log_df.to_csv(training_dir_path / "trainlog.csv")
 
             if not_improved_count >= 10:
                 print("\nValidation performance didn\'t improve for 10 epochs. Training stops.")
@@ -258,11 +261,11 @@ def train(args):
     class_f1 = scores.pop('class_f1')
 
     log_df = pd.DataFrame([scores]).set_index("epoch")
-    log_df.to_csv(logdir / f"testlog.csv")
-    np.save(logdir / f"test_conf_mat.npy", conf_mat)
-    np.save(logdir / f"test_class_f1.npy", class_f1)
+    log_df.to_csv(training_dir_path / f"testlog.csv")
+    np.save(training_dir_path / f"test_conf_mat.npy", conf_mat)
+    np.save(training_dir_path / f"test_class_f1.npy", class_f1)
 
-    return logdir
+    return run_dir
 
 
 def train_epoch(model, optimizer, criterion, dataloader, device, args):

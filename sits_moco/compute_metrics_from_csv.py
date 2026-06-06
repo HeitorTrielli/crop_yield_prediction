@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from run_paths import predictions_dir, run_dir_from_forecasts_csv
 from utils_aggregated import regression_metrics
 
 
@@ -42,6 +43,9 @@ def parse_args():
         help="Output CSV file path for metrics summary (optional)",
     )
     args = parser.parse_args()
+    args.forecasts_csv = Path(args.forecasts_csv)
+    if args.output_csv is not None:
+        args.output_csv = Path(args.output_csv)
 
     return args
 
@@ -142,8 +146,17 @@ def compute_metrics_for_split(forecasts_df, yield_df, split_name=None):
 def main():
     args = parse_args()
 
+    if args.output_csv is None:
+        run_dir = run_dir_from_forecasts_csv(args.forecasts_csv)
+        if run_dir is not None:
+            args.output_csv = (
+                predictions_dir(run_dir, create=True) / "metrics_summary.csv"
+            )
+        else:
+            args.output_csv = args.forecasts_csv.parent / "metrics_summary.csv"
+
     # Load forecasts CSV
-    forecasts_csv = Path(args.forecasts_csv)
+    forecasts_csv = args.forecasts_csv
     if not forecasts_csv.exists():
         raise FileNotFoundError(f"Forecasts CSV not found: {forecasts_csv}")
 

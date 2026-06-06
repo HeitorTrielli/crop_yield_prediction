@@ -12,6 +12,59 @@ import torch.nn as nn
 MAX_PIXEL_BATCH_SIZE = 200
 
 
+def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
+    """Infer STNetRegression MLP input width (10 spectral vs 12 with Xavier) from saved weights."""
+    w = state_dict.get("mlp1.0.lin.weight")
+    if w is not None:
+        return int(w.shape[1])
+    return 10
+
+
+def sum_municipality_from_pixel_chunks(model, pixel_chunks, device) -> float | None:
+    """Run STNet on stacked pixel chunks and return summed municipality prediction (tons)."""
+    from torch.amp import autocast
+
+    from utils import recursive_todevice
+
+    municipality_sum = None
+    model.eval()
+    with torch.no_grad():
+        for pixel_chunk in pixel_chunks:
+            if not pixel_chunk:
+                continue
+            chunk_x = torch.stack([p[0] for p in pixel_chunk])
+            chunk_mask = torch.stack([p[1] for p in pixel_chunk])
+            chunk_doy = torch.stack([p[2] for p in pixel_chunk])
+            chunk_weight = torch.stack([p[3] for p in pixel_chunk])
+            municipality_X_chunk = recursive_todevice(
+                (chunk_x, chunk_mask, chunk_doy, chunk_weight), device
+            )
+            with (
+                autocast("cuda", dtype=torch.bfloat16)
+                if device.type == "cuda"
+                else torch.no_grad()
+            ):
+                chunk_predictions = model(municipality_X_chunk)
+            chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
+            if municipality_sum is None:
+                municipality_sum = chunk_sum
+            else:
+                municipality_sum = municipality_sum.to(torch.float32) + chunk_sum.to(
+                    torch.float32
+                )
+
+    if municipality_sum is None:
+        return None
+    municipality_sum = municipality_sum.squeeze()
+    if municipality_sum.dim() > 0:
+        municipality_sum = (
+            municipality_sum[0]
+            if len(municipality_sum) > 0
+            else torch.tensor(0.0)
+        )
+    return municipality_sum.item()
+
+
 def regression_metrics(y_pred, y_true):
     """Calculate regression metrics: RMSE, MAE, R², MAPE."""
     y_pred = np.array(y_pred).flatten()

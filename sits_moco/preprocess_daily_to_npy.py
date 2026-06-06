@@ -2,16 +2,9 @@
 """
 Preprocess daily municipal TIFFs (from clip_tiffs_to_shapefiles) to .npy.
 
-Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/
-(e.g. files/daily_tiff/2022-2023/4100103/*.tiff), parses date
-from filename (4100103_2022_10_02.tiff), stacks into [num_pixels, num_days, 11]
-(10 spectral bands + DOY). DOY = (date - Oct 1 of first year).days + 1 from --year-range
-(YYYY-YYYY, e.g. 2020-2021 -> 2020-10-01 is day 1). Saves one .npy
-per municipality under {output_dir}/{year_range}/{code}/{code}.npy.
-
-Usage:
-  python preprocess_daily_to_npy.py
-  python preprocess_daily_to_npy.py --input-dir files/daily_tiff --year-range 2022-2023 --output-dir files/npy -j 10
+Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/, stacks to
+[num_pixels, num_days, 11] (10 bands + DOY), or [N, T, 13] with --xavier-pr-nc
+(two Xavier rain channels; see xavier_rain_for_daily_npy.py).
 """
 
 from __future__ import annotations
@@ -20,9 +13,29 @@ import argparse
 import os
 import re
 import time
+import tempfile
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
+
+
+def _ensure_pyproj_proj_data() -> None:
+    """Point PROJ at pyproj's proj.db before rasterio loads GDAL (avoids PostGIS PROJ on Windows)."""
+    pl = os.environ.get("PROJ_LIB", "")
+    if pl and ("postgresql" in pl.lower() or "postgis" in pl.lower()):
+        os.environ.pop("PROJ_LIB", None)
+    try:
+        import pyproj.datadir
+
+        d = pyproj.datadir.get_data_dir()
+        if d and os.path.isdir(d):
+            os.environ["PROJ_DATA"] = d
+    except Exception:
+        pass
+
+
+_ensure_pyproj_proj_data()
 
 import numpy as np
 import rasterio
@@ -103,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Parallel workers for processing municipalities (default: 1). Use e.g. 10 on multi-core machines.",
     )
+    p.add_argument(
+        "--xavier-pr-nc",
+        type=Path,
+        default=None,
+        help="Optional Xavier NetCDF (e.g. xavier_pr.nc). When set, appends 2 rain channels per timestep.",
+    )
     return p.parse_args()
 
 
@@ -170,8 +189,9 @@ def process_municipality(
     year_range: str,
     output_dir: Path,
     season_start: date,
+    xavier_pr_work: Path | None = None,
 ) -> int:
-    """Load daily TIFFs for one municipality, build [num_pixels, num_days, 11], save .npy. Returns pixel count."""
+    """Load daily TIFFs for one municipality, build [num_pixels, num_days, 11|13], save .npy. Returns pixel count."""
     if not tiff_paths:
         return 0
 
@@ -216,11 +236,13 @@ def process_municipality(
     # Filter: drop pixels that are all NaN/zero in every band every day
     valid = ~np.isnan(stack) & (stack != 0) & (stack != NO_DATA_VALUE)
     has_data = np.any(valid, axis=(1, 2))
+    idx_kept = np.flatnonzero(has_data)
     stack = stack[has_data]  # [num_pixels_kept, num_days, 10]
 
     # Require at least 3 days with some valid band (like preprocess "months with data > 2")
     days_with_data = np.any(~np.isnan(stack) & (stack != 0), axis=2)
     enough = np.sum(days_with_data, axis=1) > 2
+    idx_final = idx_kept[enough]
     stack = stack[enough]
 
     if len(stack) == 0:
@@ -229,11 +251,31 @@ def process_municipality(
     # Fill remaining NaN with NO_DATA_VALUE for storage
     stack = np.where(np.isnan(stack), NO_DATA_VALUE, stack)
 
-    # Append DOY: [num_pixels, num_days, 11]
+    n_extra = 2 if xavier_pr_work is not None else 0
+    n_out_ch = 11 + n_extra
+
+    # Append DOY: [num_pixels, num_days, 11..]
     doy_broadcast = np.broadcast_to(doys, (len(stack), num_days))
-    out = np.zeros((len(stack), num_days, 11), dtype=np.float32)
+    out = np.zeros((len(stack), num_days, n_out_ch), dtype=np.float32)
     out[:, :, :nbands] = stack
     out[:, :, 10] = doy_broadcast
+
+    if xavier_pr_work is not None:
+        from xavier_rain_for_daily_npy import compute_rain_block_for_municipality
+
+        rows = (idx_final // width).astype(np.int64)
+        cols = (idx_final % width).astype(np.int64)
+        rain = compute_rain_block_for_municipality(
+            xavier_pr_work,
+            year_range,
+            rows,
+            cols,
+            ref_transform,
+            ref_crs,
+            list(dates),
+        )
+        rain = np.where(np.isfinite(rain), rain, NO_DATA_VALUE)
+        out[:, :, 11:13] = rain
 
     out_dir = output_dir / year_range / code
     out_path = out_dir / f"{code}.npy"
@@ -247,10 +289,17 @@ def _process_municipality_worker(
     year_range: str,
     output_dir: Path,
     season_start: date,
+    xavier_pr_work: str | None,
 ) -> tuple[str, int, str | None]:
     try:
+        xp = Path(xavier_pr_work) if xavier_pr_work else None
         n = process_municipality(
-            code, tiff_paths, year_range, output_dir, season_start
+            code,
+            tiff_paths,
+            year_range,
+            output_dir,
+            season_start,
+            xavier_pr_work=xp,
         )
         return (code, n, None)
     except Exception as e:
@@ -302,56 +351,99 @@ def main() -> None:
             f"Skipped {n_skipped} municipalities (missing dir or no TIFFs): {skipped_no_dir + skipped_no_tiffs}"
         )
     workers = max(1, int(args.workers))
+    xavier_arg = args.xavier_pr_nc
+    if xavier_arg is not None and not Path(xavier_arg).is_file():
+        raise SystemExit(f"--xavier-pr-nc not a file: {xavier_arg}")
+    xavier_str = str(Path(xavier_arg).resolve()) if xavier_arg is not None else None
+    xavier_work_path: Path | None = None
+    if xavier_str:
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+        src = Path(xavier_arg).expanduser().resolve()
+        if not src.is_file():
+            raise SystemExit(f"--xavier-pr-nc not a file: {src}")
+        try:
+            blob = src.read_bytes()
+        except OSError as e:
+            raise SystemExit(f"Could not read --xavier-pr-nc ({src}): {e}") from e
+        tmp = tempfile.NamedTemporaryFile(
+            prefix=f"xavier_pr_{uuid.uuid4().hex}_",
+            suffix=".nc",
+            delete=False,
+        )
+        try:
+            tmp.write(blob)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        finally:
+            tmp.close()
+        xavier_work_path = Path(tmp.name)
+
     print(
         f"Processing {len(muni_to_paths)} municipalities, year-range {year_range}, "
         f"season_start={season_start} (DOY 1), workers={workers}"
+        + (f", xavier_pr_nc={xavier_str}" if xavier_str else "")
+        + (f", xavier_work_copy={xavier_work_path}" if xavier_work_path else "")
     )
     total_pixels = 0
     failed: list[tuple[str, str]] = []
     items = sorted(muni_to_paths.items(), key=lambda x: x[0])
+    xavier_work_str = os.fspath(xavier_work_path) if xavier_work_path else None
 
-    if workers <= 1:
-        for code, paths in tqdm(items, desc="Municipalities", unit="muni"):
-            try:
-                n = process_municipality(
-                    code, paths, year_range, out_base, season_start
-                )
-                total_pixels += n
-            except Exception as e:
-                failed.append((code, str(e)))
-                print(f"[ERROR] {code}: {e}")
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(
-                    _process_municipality_worker,
-                    code,
-                    paths,
-                    year_range,
-                    out_base,
-                    season_start,
-                ): code
-                for code, paths in items
-            }
-            for fut in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Municipalities",
-                unit="muni",
-            ):
-                _code, n, err = fut.result()
-                if err:
-                    failed.append((_code, err))
-                    print(f"[ERROR] {_code}: {err}")
-                else:
+    try:
+        if workers <= 1:
+            for code, paths in tqdm(items, desc="Municipalities", unit="muni"):
+                try:
+                    n = process_municipality(
+                        code,
+                        paths,
+                        year_range,
+                        out_base,
+                        season_start,
+                        xavier_pr_work=xavier_work_path,
+                    )
                     total_pixels += n
+                except Exception as e:
+                    failed.append((code, str(e)))
+                    print(f"[ERROR] {code}: {e}")
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_municipality_worker,
+                        code,
+                        paths,
+                        year_range,
+                        out_base,
+                        season_start,
+                        xavier_work_str,
+                    ): code
+                    for code, paths in items
+                }
+                for fut in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="Municipalities",
+                    unit="muni",
+                ):
+                    _code, n, err = fut.result()
+                    if err:
+                        failed.append((_code, err))
+                        print(f"[ERROR] {_code}: {err}")
+                    else:
+                        total_pixels += n
 
-    print(f"Done. Output: {out_base / year_range}/<code>/<code>.npy")
-    print(f"Total pixels: {total_pixels:,}")
-    if failed:
-        print(
-            f"Failed {len(failed)} municipality/municipalities (re-run after fixing disk/OneDrive): {[c for c, _ in failed]}"
-        )
+        print(f"Done. Output: {out_base / year_range}/<code>/<code>.npy")
+        print(f"Total pixels: {total_pixels:,}")
+        if failed:
+            print(
+                f"Failed {len(failed)} municipality/municipalities (re-run after fixing disk/OneDrive): {[c for c, _ in failed]}"
+            )
+    finally:
+        if xavier_work_path is not None:
+            try:
+                xavier_work_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

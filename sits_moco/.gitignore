@@ -176,3 +176,8 @@ heatmaps/
 *.csv
 */credentials.json
 */token.json
+
+docs/*
+*.png
+presentation/
+benchmark/

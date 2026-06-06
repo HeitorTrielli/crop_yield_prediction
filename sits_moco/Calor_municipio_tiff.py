@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import torch
+from run_paths import figures_dir, run_dir_from_path
 from datautils import getWeight
 from STNetRegression import STNetRegression
 from torch.amp import autocast
@@ -64,8 +65,8 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="heatmaps",
-        help="Output directory for heatmap images",
+        default=None,
+        help="Output directory (default: {run_dir}/figures/ from --checkpoint)",
     )
     parser.add_argument(
         "--sequencelength",
@@ -113,7 +114,8 @@ def parse_args():
 
     args.tiffpath = Path(args.tiffpath)
     args.checkpoint = Path(args.checkpoint)
-    args.output_dir = Path(args.output_dir)
+    if args.output_dir is not None:
+        args.output_dir = Path(args.output_dir)
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -544,6 +546,8 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully.")
 
+    if args.output_dir is None:
+        args.output_dir = figures_dir(run_dir_from_path(args.checkpoint), create=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(

@@ -125,10 +125,13 @@ def train(args):
     if args.suffix:
         model.modelname += f'_{args.suffix}'
 
-    logdir = Path(args.logdir) / model.modelname
-    logdir.mkdir(parents=True, exist_ok=True)
-    best_model_path = logdir / 'model_best.pth'
-    print(f"Logging results to {logdir}")
+    from run_paths import ensure_run_layout, run_dir_from_path, trainlog_path
+
+    run_dir = Path(args.logdir) / model.modelname
+    training_dir_path, _, _ = ensure_run_layout(run_dir)
+    best_model_path = training_dir_path / 'model_best.pth'
+    print(f"Run directory: {run_dir}")
+    print(f"  training: {training_dir_path}")
 
     criterion = nn.CrossEntropyLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -147,7 +150,7 @@ def train(args):
 
         print("=> loaded checkpoint '{}'".format(str(path)))
 
-        log_fn = path.parent / "trainlog.csv"
+        log_fn = trainlog_path(run_dir_from_path(path))
         log = pd.read_csv(log_fn).to_dict('records')[:args.start_epoch]
 
     print(f"Pre-training {args.model}...")
@@ -175,7 +178,7 @@ def train(args):
         log.append(scores)
 
         log_df = pd.DataFrame(log).set_index("epoch")
-        log_df.to_csv(logdir / "trainlog.csv")
+        log_df.to_csv(training_dir_path / "trainlog.csv")
 
         if val_loss < val_loss_min:
             not_improved_count = 0

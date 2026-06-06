@@ -12,13 +12,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.amp import autocast
 from tqdm import tqdm
 
 from datasets import USCropsAggregatedNPY
+from datasets.feature_layout import (
+    feature_layout_choices,
+    feature_layout_input_dim,
+    normalize_feature_layout,
+)
 from models import STNetRegression
-from utils import recursive_todevice
-from utils_aggregated import regression_metrics
+from run_paths import predictions_dir, run_dir_from_path
+from utils_aggregated import (
+    regression_metrics,
+    stnet_regression_input_dim_from_state_dict,
+    sum_municipality_from_pixel_chunks,
+)
 
 
 def parse_args():
@@ -46,8 +54,8 @@ def parse_args():
     parser.add_argument(
         "--output-csv",
         type=str,
-        default="incomplete_series_evaluation.csv",
-        help="Output CSV file path for results",
+        default=None,
+        help="Output CSV path (default: {run_dir}/predictions/incomplete_series_evaluation.csv)",
     )
     parser.add_argument(
         "--sequencelength",
@@ -85,6 +93,14 @@ def parse_args():
         help="Random seed for reproducibility (default: 27)",
     )
     parser.add_argument(
+        "--feature-layout",
+        type=str,
+        default="spectral",
+        choices=feature_layout_choices(),
+        metavar="NAME",
+        help="Must match training: spectral (10 inputs) or spectral_xavier (12).",
+    )
+    parser.add_argument(
         "--reference-date",
         type=str,
         default="2022-10-01",
@@ -111,57 +127,21 @@ def predict_municipality_with_periods(
     device,
     reference_date,
 ):
-    """
-    Predict yield using first num_periods months. reference_date = date where DOY 1 falls (e.g. 2022-10-01).
-    """
-    model.eval()
-    municipality_sum = None
-
-    with torch.no_grad():
-        for pixel_chunk in dataset.load_pixels_from_municipality_with_periods(
-            municipality_code, year, num_periods, chunk_size, reference_date
-        ):
-            if len(pixel_chunk) == 0:
-                continue
-            chunk_x = torch.stack([p[0] for p in pixel_chunk])
-            chunk_mask = torch.stack([p[1] for p in pixel_chunk])
-            chunk_doy = torch.stack([p[2] for p in pixel_chunk])
-            chunk_weight = torch.stack([p[3] for p in pixel_chunk])
-
-            municipality_X_chunk = (chunk_x, chunk_mask, chunk_doy, chunk_weight)
-            municipality_X_chunk = recursive_todevice(municipality_X_chunk, device)
-
-            with (
-                autocast("cuda", dtype=torch.bfloat16)
-                if device.type == "cuda"
-                else torch.no_grad()
-            ):
-                chunk_predictions = model(municipality_X_chunk)
-
-            chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
-
-            if municipality_sum is None:
-                municipality_sum = chunk_sum
-            else:
-                municipality_sum = municipality_sum.to(torch.float32) + chunk_sum.to(
-                    torch.float32
-                )
-
-    if municipality_sum is None:
-        return None
-
-    if municipality_sum.dim() > 0:
-        municipality_sum = municipality_sum.squeeze()
-        if municipality_sum.dim() > 0:
-            municipality_sum = (
-                municipality_sum[0] if len(municipality_sum) > 0 else torch.tensor(0.0)
-            )
-
-    return municipality_sum.item()
+    """Predict yield using first num_periods season months (same PixelTransform as training)."""
+    chunks = dataset.load_pixels_from_municipality_with_periods(
+        municipality_code, year, num_periods, chunk_size, reference_date
+    )
+    return sum_municipality_from_pixel_chunks(model, chunks, device)
 
 
 def main():
     args = parse_args()
+
+    if args.output_csv is None:
+        pred_dir = predictions_dir(run_dir_from_path(args.checkpoint), create=True)
+        args.output_csv = pred_dir / "incomplete_series_evaluation.csv"
+    else:
+        args.output_csv = Path(args.output_csv)
 
     print(f"Data root (year/.npy): {args.datapath}")
     if not args.datapath.exists():
@@ -183,17 +163,35 @@ def main():
         args.checkpoint, map_location=args.device, weights_only=False
     )
 
+    state_dict = checkpoint["model_state"]
+    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
+    print(f"STNet input_dim from checkpoint: {input_dim}")
+    expected_dim = feature_layout_input_dim(args.feature_layout)
+    if input_dim != expected_dim:
+        raise ValueError(
+            f"Checkpoint has input_dim={input_dim} but --feature-layout {args.feature_layout!r} "
+            f"implies {expected_dim}. Use the same --feature-layout as training."
+        )
+    ck_fl = checkpoint.get("feature_layout")
+    if ck_fl is not None:
+        print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
+        if normalize_feature_layout(ck_fl) != normalize_feature_layout(
+            args.feature_layout
+        ):
+            raise ValueError(
+                f"Checkpoint feature_layout={ck_fl!r} does not match --feature-layout {args.feature_layout!r}."
+            )
+
     # Create model
     print("Creating model...")
     device = torch.device(args.device)
     model = STNetRegression(
-        input_dim=10,
+        input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
     ).to(device)
 
     # Load model weights
-    state_dict = checkpoint["model_state"]
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
     else:
@@ -276,6 +274,7 @@ def main():
         randomchoice=args.rc,
         interp=args.interp,
         seed=args.seed,
+        feature_layout=args.feature_layout,
     )
 
     single_season = getattr(dataset, "is_single_season", False) and year_col is not None
