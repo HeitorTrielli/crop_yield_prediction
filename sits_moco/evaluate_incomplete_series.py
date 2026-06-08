@@ -64,16 +64,6 @@ def parse_args():
         help="Model max time steps; match training -seq. Extra days in a window are dropped (earliest 45 by DOY).",
     )
     parser.add_argument(
-        "--rc",
-        action="store_true",
-        help="Ignored for incomplete-period eval (kept for compatibility with dataset init).",
-    )
-    parser.add_argument(
-        "--interp",
-        action="store_true",
-        help="Ignored for incomplete-period eval (kept for compatibility with dataset init).",
-    )
-    parser.add_argument(
         "--chunk-size",
         type=int,
         default=400,
@@ -270,8 +260,8 @@ def main():
         yield_csv=yield_csv_path,
         year=None,
         sequencelength=args.sequencelength,
-        randomchoice=args.rc,
-        interp=args.interp,
+        randomchoice=False,
+        interp=False,
         seed=args.seed,
         feature_layout=args.feature_layout,
     )

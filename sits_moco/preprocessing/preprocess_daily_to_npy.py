@@ -62,27 +62,24 @@ def _save_npy_atomic(out_path: Path, arr: np.ndarray, *, max_retries: int = 4) -
     # Path must end with .npy: np.save appends ".npy" if the filename does not,
     # so the old "x.npy.tmp" became "x.npy.tmp.npy" and os.replace failed.
     tmp = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
-    legacy_double = out_path.parent / f"{out_path.name}.tmp.npy"
     last_err: OSError | None = None
     for attempt in range(max_retries):
         try:
-            for p in (tmp, legacy_double):
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
             np.save(os.fspath(tmp), arr)
             os.replace(os.fspath(tmp), os.fspath(out_path))
             return
         except OSError as e:
             last_err = e
-            for p in (tmp, legacy_double):
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
             time.sleep(0.4 * (attempt + 1))
     assert last_err is not None
     raise last_err

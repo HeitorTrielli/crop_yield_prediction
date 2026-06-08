@@ -465,62 +465,37 @@ def train(args):
         pretrain_state = pretrained_checkpoint["model_state"]
         model_dict = model.state_dict()
 
-        # Handle MoCo checkpoints (encoder_q prefix) - only for MoCo pretraining
-        if "moco" in str(pretrained_path).lower() or any(
-            k.startswith("encoder_q") for k in pretrain_state.keys()
-        ):
-            # For MoCo checkpoints, extract encoder_q weights and map to model
-            state_dict = {}
-            for k in list(pretrain_state.keys()):
-                if (
-                    k.startswith("encoder_q")
-                    and not k.startswith("encoder_q.decoder")
-                    and not k.startswith("encoder_q.classification")
-                    and not k.startswith("encoder_q.position_enc.pe")
-                ):
-                    # Remove encoder_q prefix
-                    state_dict[k[len("encoder_q.") :]] = pretrain_state[k]
-            model_dict.update(state_dict)
-            model.load_state_dict(model_dict, strict=False)
-            # Re-initialize decoder for MoCo -> Regression transfer
-            print("  ✓ Loaded MoCo encoder weights, re-initializing decoder")
-            model.decoder.apply(weight_init_regression)
+        state_dict = {
+            k: v for k, v in pretrain_state.items() if k in model_dict.keys()
+        }
+        missing_keys = set(model_dict.keys()) - set(state_dict.keys())
+        unexpected_keys = set(state_dict.keys()) - set(model_dict.keys())
+
+        if missing_keys:
+            print(
+                f"  ⚠️  Missing keys (will use initialized values): {list(missing_keys)[:5]}..."
+            )
+        if unexpected_keys:
+            print(
+                f"  ⚠️  Unexpected keys (will be ignored): {list(unexpected_keys)[:5]}..."
+            )
+
+        load_result = model.load_state_dict(state_dict, strict=False)
+        if load_result.missing_keys:
+            print(
+                f"  ⚠️  Missing keys after load: {load_result.missing_keys[:5]}..."
+            )
+        if load_result.unexpected_keys:
+            print(
+                f"  ⚠️  Unexpected keys after load: {load_result.unexpected_keys[:5]}..."
+            )
+        print(f"  ✓ Loaded {len(state_dict)}/{len(model_dict)} model parameters")
+
+        decoder_keys = [k for k in state_dict.keys() if "decoder" in k]
+        if decoder_keys:
+            print(f"  ✓ Loaded decoder weights: {len(decoder_keys)} parameters")
         else:
-            # For regression checkpoints, load everything including decoder
-            # Filter to only matching keys to avoid shape mismatches
-            state_dict = {
-                k: v for k, v in pretrain_state.items() if k in model_dict.keys()
-            }
-            missing_keys = set(model_dict.keys()) - set(state_dict.keys())
-            unexpected_keys = set(state_dict.keys()) - set(model_dict.keys())
-
-            if missing_keys:
-                print(
-                    f"  ⚠️  Missing keys (will use initialized values): {list(missing_keys)[:5]}..."
-                )
-            if unexpected_keys:
-                print(
-                    f"  ⚠️  Unexpected keys (will be ignored): {list(unexpected_keys)[:5]}..."
-                )
-
-            # Load state dict - handle compiled models if needed
-            load_result = model.load_state_dict(state_dict, strict=False)
-            if load_result.missing_keys:
-                print(
-                    f"  ⚠️  Missing keys after load: {load_result.missing_keys[:5]}..."
-                )
-            if load_result.unexpected_keys:
-                print(
-                    f"  ⚠️  Unexpected keys after load: {load_result.unexpected_keys[:5]}..."
-                )
-            print(f"  ✓ Loaded {len(state_dict)}/{len(model_dict)} model parameters")
-
-            # Verify decoder weights were loaded
-            decoder_keys = [k for k in state_dict.keys() if "decoder" in k]
-            if decoder_keys:
-                print(f"  ✓ Loaded decoder weights: {len(decoder_keys)} parameters")
-            else:
-                print(f"  ⚠️  Warning: No decoder weights found in checkpoint!")
+            print("  ⚠️  Warning: No decoder weights found in checkpoint!")
 
     if args.harvest_years_set:
         year_str = "Hy_" + "_".join(str(y) for y in sorted(args.harvest_years_set))

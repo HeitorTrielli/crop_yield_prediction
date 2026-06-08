@@ -79,13 +79,6 @@ def parse_args() -> argparse.Namespace:
         help="Base output directory (default: files/daily_tiff). Output: {output_dir}/{season}/{municipal_code}/",
     )
     p.add_argument(
-        "--resolution",
-        type=int,
-        default=30,
-        metavar="M",
-        help="Unused (kept for backward-compatible CLI). Resolution is not part of output paths.",
-    )
-    p.add_argument(
         "--all-touched",
         action="store_true",
         default=True,
@@ -282,7 +275,6 @@ def clip_state_tiffs_to_municipalities(
     shapefile_dir: Path | str | None = None,
     shapefiles: list[Path | str] | None = None,
     output_dir: Path | str = "files/daily_tiff",
-    resolution: int = 30,
     year_range: str | None = None,
     all_touched: bool = True,
     verbose: bool = True,
@@ -310,8 +302,6 @@ def clip_state_tiffs_to_municipalities(
     output_dir : path
         Base output directory (default: files/daily_tiff). Output will be
         {output_dir}/{season}/{municipal_code}/.
-    resolution : int
-        Unused; kept for API compatibility.
     year_range : str, optional
         Subfolder name for year range (e.g. "2022-2023"). If None, inferred from TIFF filenames.
     all_touched : bool
@@ -405,7 +395,6 @@ def main() -> None:
             shapefile_dir=args.shapefile_dir,
             shapefiles=args.shapefiles or [],
             output_dir=args.output_dir,
-            resolution=args.resolution,
             year_range=getattr(args, "year_range", None),
             all_touched=args.all_touched,
             verbose=True,

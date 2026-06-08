@@ -17,10 +17,8 @@ Polygons: benchmark/talhoes_baseline.geojson (or .gpkg). Output CSV defaults to
 {run_dir}/predictions/talhoes_forecasts.csv with columns forecast (t), baseline_tons, error (t),
 and optional forecast_t_ha / baseline_t_ha for productivity comparison.
 
-By default only pixels inside talhão polygons are sent through the model (much faster than
-predicting the full municipality). Valid-pixel alignment with the .npy uses a fast direct-TIFF
-mask with optional cache at {muni}/{muni}.keep_mask.npy. Use --full-municipality-predict for
-the legacy behaviour.
+Only pixels inside talhão polygons are sent through the model. Valid-pixel alignment with the
+.npy uses a fast direct-TIFF mask with optional cache at {muni}/{muni}.keep_mask.npy.
 """
 
 from __future__ import annotations
@@ -390,14 +388,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional IBGE filter; default = every talhão in --talhoes-gpkg / baseline GeoJSON",
     )
     p.add_argument(
-        "--full-municipality-predict",
-        action="store_true",
-        help=(
-            "Run the model on every valid municipal pixel (legacy, slow). "
-            "Default: infer only pixels inside talhão polygons."
-        ),
-    )
-    p.add_argument(
         "--reproject-tiffs",
         action="store_true",
         help="Warp each daily TIFF when building the valid-pixel mask (slow; use if fast mask misaligns).",
@@ -720,10 +710,7 @@ def main() -> None:
         args.checkpoint, device, args.sequencelength, args.feature_layout
     )
     print(f"Model loaded (input_dim={input_dim})")
-    if args.full_municipality_predict:
-        print("Mode: full municipality (legacy — infer all valid pixels)")
-    else:
-        print("Mode: talhão-only (infer pixels inside plot polygons only)")
+    print("Mode: talhão-only (infer pixels inside plot polygons only)")
     if args.reproject_tiffs:
         print("Valid-pixel mask: reproject each daily TIFF (slow)")
     else:
@@ -776,13 +763,11 @@ def main() -> None:
             continue
 
         sub = group.to_crs(ref_crs) if group.crs != ref_crs else group
-        talhao_union = None
-        if not args.full_municipality_predict:
-            talhao_union = build_talhao_union_mask(
-                sub.geometry.tolist(),
-                ref_transform,
-                (height, width),
-            )
+        talhao_union = build_talhao_union_mask(
+            sub.geometry.tolist(),
+            ref_transform,
+            (height, width),
+        )
 
         grid_out = predict_pixel_grid_daily(
             model,
@@ -793,7 +778,7 @@ def main() -> None:
             chunk_size=args.chunk_size,
             device=device,
             talhao_mask=talhao_union,
-            talhao_only=not args.full_municipality_predict,
+            talhao_only=True,
             reproject_tiffs=args.reproject_tiffs,
             use_mask_cache=not args.no_mask_cache,
         )

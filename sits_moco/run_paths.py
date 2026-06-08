@@ -10,7 +10,6 @@ Layout::
             intramunicipal_heatmap/   pixel-level yield / NDVI heatmaps
             municipal_heatmaps/       state/municipality choropleth maps
 
-Legacy runs (artifacts directly under the run folder) are still supported for loading.
 """
 
 from __future__ import annotations
@@ -92,19 +91,13 @@ def ensure_run_layout(run_dir: Path | str) -> tuple[Path, Path, Path]:
 
 
 def model_best_in_run(run_dir: Path | str) -> Path:
-    """Path to model_best.pth (new layout first, then legacy at run root)."""
+    """Path to model_best.pth under training/."""
     run_dir = Path(run_dir)
-    new = run_dir / TRAINING_SUBDIR / "model_best.pth"
-    if new.is_file():
-        return new
-    legacy = run_dir / "model_best.pth"
-    if legacy.is_file():
-        return legacy
-    return new
+    return run_dir / TRAINING_SUBDIR / "model_best.pth"
 
 
 def resolve_checkpoint_path(path: Path | str) -> Path:
-    """Resolve model_best.pth from a file path, run directory, or legacy folder name."""
+    """Resolve model_best.pth from a .pth file or a run directory."""
     p = Path(path)
     if p.is_file():
         return p.resolve()
@@ -112,39 +105,20 @@ def resolve_checkpoint_path(path: Path | str) -> Path:
     if p.is_dir():
         if p.name == TRAINING_SUBDIR:
             candidate = p / "model_best.pth"
-            if candidate.is_file():
-                return candidate.resolve()
-            run_dir = p.parent
-        elif p.name == "model_best.pth":
-            run_dir = p.parent
         else:
-            run_dir = p
-
-        for candidate in (
-            run_dir / TRAINING_SUBDIR / "model_best.pth",
-            run_dir / "model_best.pth",
-        ):
-            if candidate.is_file():
-                return candidate.resolve()
-
-        nested = p / "model_best.pth"
-        if nested.is_file():
-            return nested.resolve()
+            candidate = p / TRAINING_SUBDIR / "model_best.pth"
+        if candidate.is_file():
+            return candidate.resolve()
 
     raise FileNotFoundError(
         f"Checkpoint not found at {path!r}. "
-        f"Pass a .pth file or a run directory (tried "
-        f"{{run}}/training/model_best.pth)."
+        f"Pass a .pth file or a run directory with training/model_best.pth."
     )
 
 
 def trainlog_path(run_dir: Path | str) -> Path:
-    """Path to trainlog.csv (prefers training/ subfolder)."""
-    run_dir = Path(run_dir)
-    p = run_dir / TRAINING_SUBDIR / "trainlog.csv"
-    if p.is_file():
-        return p
-    return run_dir / "trainlog.csv"
+    """Path to trainlog.csv under training/."""
+    return Path(run_dir) / TRAINING_SUBDIR / "trainlog.csv"
 
 
 def run_dir_from_forecasts_csv(csv_path: Path | str) -> Path | None:

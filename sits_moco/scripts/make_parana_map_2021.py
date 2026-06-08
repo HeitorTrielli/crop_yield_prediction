@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         default=None,
-        help="model_best.pth (default: Seed6003 run under results/, new or legacy layout)",
+        help="model_best.pth (default: Seed6003 run under results/training/)",
     )
     p.add_argument(
         "--output-csv",

@@ -113,11 +113,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip harvest seasons whose output CSV already exists",
     )
     p.add_argument(
-        "--full-municipality-predict",
-        action="store_true",
-        help="Infer every valid municipal pixel (legacy, slow)",
-    )
-    p.add_argument(
         "--reproject-tiffs",
         action="store_true",
         help="Slow valid-pixel mask (warp each daily TIFF)",
@@ -142,7 +137,6 @@ def run_one(
     output_csv: Path,
     municipalities: list[str] | None,
     device: str | None,
-    full_municipality_predict: bool,
     reproject_tiffs: bool,
     no_mask_cache: bool,
 ) -> None:
@@ -171,8 +165,6 @@ def run_one(
         cmd.extend(["--device", device])
     if municipalities:
         cmd.extend(["--municipalities", *municipalities])
-    if full_municipality_predict:
-        cmd.append("--full-municipality-predict")
     if reproject_tiffs:
         cmd.append("--reproject-tiffs")
     if no_mask_cache:
@@ -235,7 +227,6 @@ def main() -> None:
             output_csv=output_csv,
             municipalities=args.municipalities,
             device=args.device,
-            full_municipality_predict=args.full_municipality_predict,
             reproject_tiffs=args.reproject_tiffs,
             no_mask_cache=args.no_mask_cache,
         )
