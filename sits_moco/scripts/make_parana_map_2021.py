@@ -11,7 +11,7 @@ Training alignment:
 Requires local data:
   - --datapath must be the season directory whose .npy files correspond to harvest 2021
     (often named like 2020-2021 with folders per municipality).
-  - files/municipality_production_with_codes.csv with year column and production.
+  - files/pam_soy_pr_2019_2025.csv with year column and production_t.
 
 Dependencies for the map step: pip install geopandas geobr matplotlib
 
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--yield-csv",
         type=Path,
         default=None,
-        help="Defaults to files/municipality_production_with_codes.csv under repo root",
+        help="Defaults to files/pam_soy_pr_2019_2025.csv under repo root",
     )
     p.add_argument(
         "--checkpoint",
@@ -89,7 +89,7 @@ def main() -> None:
     yield_csv = (
         Path(args.yield_csv)
         if args.yield_csv
-        else root / "files/municipality_production_with_codes.csv"
+        else root / "files/pam_soy_pr_2019_2025.csv"
     )
 
     if args.checkpoint is None:

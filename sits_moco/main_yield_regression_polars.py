@@ -43,7 +43,7 @@ from utils_aggregated import (
 
 # Default paths
 DATAPATH = Path(r"files/npy")
-YIELD_CSV = Path(r"files/municipality_production_with_codes.csv")
+YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
 YEARS = [None]
 SEEDS = [6007]
 
@@ -267,9 +267,8 @@ def compute_target_statistics(yield_csv, datapath, harvest_years=None):
         infer_schema_length=10000,
     )
 
-    # Find yield column
     yield_col = None
-    for col in ["production", "yield", "yield_tons", "tons"]:
+    for col in ("production", "production_t", "yield", "yield_tons", "tons"):
         if col in yield_df.columns:
             yield_col = col
             break

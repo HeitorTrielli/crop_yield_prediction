@@ -240,7 +240,7 @@ def main():
     yield_csv_for_dataset = Path(
         args.yield_csv
         if args.yield_csv
-        else "files/municipality_production_with_codes.csv"
+        else "files/pam_soy_pr_2019_2025.csv"
     )
     dataset = USCropsAggregatedNPY(
         mode="all",
@@ -276,7 +276,7 @@ def main():
         yield_csv_path = Path(
             args.yield_csv
             if args.yield_csv
-            else "files/municipality_production_with_codes.csv"
+            else "files/pam_soy_pr_2019_2025.csv"
         )
         if not yield_csv_path.exists():
             raise FileNotFoundError(f"Yield CSV not found: {yield_csv_path}")
@@ -325,7 +325,7 @@ def main():
         # Filter by split from yield CSV
         if not args.yield_csv:
             # Try to find default yield CSV
-            default_yield_csv = Path("files/municipality_production_with_codes.csv")
+            default_yield_csv = Path("files/pam_soy_pr_2019_2025.csv")
             if default_yield_csv.exists():
                 args.yield_csv = str(default_yield_csv)
                 print(f"Using default yield CSV: {args.yield_csv}")
@@ -454,7 +454,7 @@ def main():
             yield_csv_path = Path(
                 args.yield_csv
                 if args.yield_csv
-                else "files/municipality_production_with_codes.csv"
+                else "files/pam_soy_pr_2019_2025.csv"
             )
 
             if yield_csv_path.exists():
@@ -489,7 +489,7 @@ def main():
                         break
 
                 yield_col = None
-                for col in ["production", "yield", "yield_tons", "tons"]:
+                for col in ("production", "production_t", "yield", "yield_tons", "tons"):
                     if col in yield_df.columns:
                         yield_col = col
                         break

@@ -49,7 +49,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help="Path to yield CSV file with 'split' column (default: files/municipality_production_with_codes.csv)",
+        help="Path to yield CSV file with 'split' column (default: files/pam_soy_pr_2019_2025.csv)",
     )
     parser.add_argument(
         "--output-csv",
@@ -202,7 +202,7 @@ def main():
     yield_csv_path = Path(
         args.yield_csv
         if args.yield_csv
-        else "files/municipality_production_with_codes.csv"
+        else "files/pam_soy_pr_2019_2025.csv"
     )
 
     if not yield_csv_path.exists():
@@ -226,11 +226,10 @@ def main():
         )
 
     yield_col = None
-    for col in ["production", "yield", "yield_tons", "tons"]:
+    for col in ("production", "production_t", "yield", "yield_tons", "tons"):
         if col in yield_df.columns:
             yield_col = col
             break
-
     if yield_col is None:
         raise ValueError(
             f"Could not find yield column. Available: {list(yield_df.columns)}"

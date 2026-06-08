@@ -3,7 +3,7 @@
 
 Usage:
   python data_download/download_pam_soy_sidra.py
-  python data_download/download_pam_soy_sidra.py --years 2019-2024 --output files/pam_soy_pr.csv
+  python add_train_valid_test_split.py   # adds split column (default test year: 2021)
 """
 
 from __future__ import annotations
@@ -128,6 +128,8 @@ def main() -> None:
         print(f"Years available: {years[0]}–{years[-1]}")
     if args.years.endswith("2025") and (not years or years[-1] < 2025):
         print("Note: PAM 2025 is not published yet in SIDRA; only released years are included.")
+    if "split" not in df.columns:
+        print("Run add_train_valid_test_split.py before training (adds train/valid/test split).")
 
 
 if __name__ == "__main__":

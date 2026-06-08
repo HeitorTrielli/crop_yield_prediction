@@ -11,8 +11,6 @@ import pandas as pd
 
 from run_paths import predictions_dir, run_dir_from_forecasts_csv
 from utils_aggregated import regression_metrics
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Compcomute metrics from forecasts CSV file."
@@ -27,7 +25,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help="Path to yield CSV file with ground truth (default: files/municipality_production_with_codes.csv)",
+        help="Path to yield CSV file with ground truth (default: files/pam_soy_pr_2019_2025.csv)",
     )
     parser.add_argument(
         "--split",
@@ -59,10 +57,12 @@ def find_columns(df):
             break
 
     yield_col = None
-    for col in ["production", "yield", "yield_tons", "tons", "actual_yield"]:
+    for col in ("production", "production_t", "yield", "yield_tons", "tons"):
         if col in df.columns:
             yield_col = col
             break
+    if yield_col is None and "actual_yield" in df.columns:
+        yield_col = "actual_yield"
 
     return muni_code_col, yield_col
 
@@ -173,7 +173,7 @@ def main():
     yield_csv_path = Path(
         args.yield_csv
         if args.yield_csv
-        else "files/municipality_production_with_codes.csv"
+        else "files/pam_soy_pr_2019_2025.csv"
     )
 
     if not yield_csv_path.exists():

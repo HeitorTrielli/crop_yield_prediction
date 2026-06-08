@@ -123,7 +123,7 @@ class USCropsAggregatedNPY(Dataset):
             )
 
         yield_col = None
-        for col in ["production", "yield", "yield_tons", "tons"]:
+        for col in ("production", "production_t", "yield", "yield_tons", "tons"):
             if col in yield_df.columns:
                 yield_col = col
                 break

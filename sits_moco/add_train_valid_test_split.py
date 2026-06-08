@@ -14,7 +14,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
 def add_split_to_csv(
     yield_csv,
     test_years=None,
@@ -214,14 +213,14 @@ def main():
         "--yield-csv",
         type=str,
         default=None,
-        help="Path to yield CSV file. Default: files/municipality_production_with_codes.csv",
+        help="Path to yield CSV file. Default: files/pam_soy_pr_2019_2025.csv",
     )
     parser.add_argument(
         "--test-years",
         type=int,
         nargs="+",
-        default=None,
-        help="Years to use for testing (e.g., --test-years 2023 2024). All observations from these years will be marked as 'test'.",
+        default=[2021],
+        help="Years to use for testing (default: 2021). All observations from these years will be marked as 'test'.",
     )
     parser.add_argument(
         "--train-ratio",
@@ -252,7 +251,7 @@ def main():
     if args.yield_csv:
         yield_csv = Path(args.yield_csv)
     else:
-        yield_csv = Path("files/municipality_production_with_codes.csv")
+        yield_csv = Path("files/pam_soy_pr_2019_2025.csv")
         if not yield_csv.exists():
             raise FileNotFoundError(
                 f"Could not find yield CSV. Expected {yield_csv} or specify --yield-csv"
