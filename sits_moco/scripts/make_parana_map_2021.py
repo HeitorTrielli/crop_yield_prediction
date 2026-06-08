@@ -30,7 +30,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from run_paths import figures_dir, model_best_in_run, predictions_dir, run_dir_from_path
+from run_paths import model_best_in_run, municipal_heatmaps_dir, predictions_dir, run_dir_from_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         "--output-map",
         type=Path,
         default=None,
-        help="Map PNG (default: {run_dir}/figures/map_pr_error_2021.png)",
+        help="Map PNG (default: {run_dir}/figures/municipal_heatmaps/map_pr_error_2021.png)",
     )
     p.add_argument("--sequencelength", type=int, default=45)
     p.add_argument("--seed", type=int, default=6003, help="Match training seed for run name parity")
@@ -95,7 +95,9 @@ def main() -> None:
     if args.output_csv is None:
         args.output_csv = predictions_dir(run_dir, create=True) / "yield_forecasts_2021_pr.csv"
     if args.output_map is None:
-        args.output_map = figures_dir(run_dir, create=True) / "map_pr_error_2021.png"
+        args.output_map = (
+            municipal_heatmaps_dir(run_dir, create=True) / "map_pr_error_2021.png"
+        )
 
     if not args.checkpoint.is_file():
         raise SystemExit(f"Checkpoint not found: {args.checkpoint}")

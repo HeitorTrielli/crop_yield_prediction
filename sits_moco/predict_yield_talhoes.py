@@ -14,7 +14,13 @@ Or call directly (no --municipalities = all talhões in the GPKG/GeoJSON):
   python predict_yield_talhoes.py --checkpoint results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_Seed6007/model_best.pth --datapath files/npy --tiffpath files/daily_tiff --year-range 2020-2021 --sequencelength 45
 
 Polygons: benchmark/talhoes_baseline.geojson (or .gpkg). Output CSV defaults to
-{run_dir}/predictions/talhoes_forecasts.csv with columns forecast, n_pixels, baseline_prod_max, error.
+{run_dir}/predictions/talhoes_forecasts.csv with columns forecast (t), baseline_tons, error (t),
+and optional forecast_t_ha / baseline_t_ha for productivity comparison.
+
+By default only pixels inside talhão polygons are sent through the model (much faster than
+predicting the full municipality). Valid-pixel alignment with the .npy uses a fast direct-TIFF
+mask with optional cache at {muni}/{muni}.keep_mask.npy. Use --full-municipality-predict for
+the legacy behaviour.
 """
 
 from __future__ import annotations
@@ -103,29 +109,159 @@ def _read_bands_on_reference_grid(
     return out
 
 
-def compute_daily_valid_pixel_mask(daily_tiffs: list[Path]):
-    """(keep_mask, height, width) — same logic as preprocess_daily_to_npy / create_pixel_heatmap."""
-    if not daily_tiffs:
-        return None, None, None
+def _reference_grid_from_first_tiff(daily_tiffs: list[Path]):
+    """(transform, crs, height, width) from the first daily TIFF."""
     with rasterio.open(daily_tiffs[0]) as src0:
-        height, width = src0.height, src0.width
-        ref_transform = src0.transform
-        ref_crs = src0.crs
-        if ref_crs is None:
-            return None, None, None
+        if src0.crs is None:
+            return None, None, None, None
+        return src0.transform, src0.crs, src0.height, src0.width
+
+
+def _accumulate_valid_pixel_mask_from_day(
+    data: np.ndarray,
+    *,
+    any_data: np.ndarray,
+    days_with_data: np.ndarray,
+) -> None:
+    day_has = np.any(np.isfinite(data) & (data != 0), axis=0)
+    any_data |= day_has
+    days_with_data += day_has.astype(np.uint16)
+
+
+def _read_day_bands_for_mask(
+    path: Path,
+    ref_transform,
+    ref_crs,
+    height: int,
+    width: int,
+    *,
+    force_reproject: bool = False,
+) -> np.ndarray | None:
+    """Read spectral bands for one day; warp onto the reference grid when shapes differ."""
+    if not force_reproject:
+        try:
+            with rasterio.open(path) as src:
+                if src.height == height and src.width == width:
+                    nodata = src.nodata if src.nodata is not None else NO_DATA_VALUE
+                    data = src.read()[:NUM_SPECTRAL_BANDS].astype(np.float32)
+                    data[data == nodata] = np.nan
+                    data[data == NO_DATA_VALUE] = np.nan
+                    return data
+        except OSError:
+            pass
+    try:
+        return _read_bands_on_reference_grid(
+            path, ref_transform, ref_crs, height, width
+        )
+    except OSError:
+        return None
+
+
+def _compute_daily_valid_pixel_mask(
+    daily_tiffs: list[Path],
+    *,
+    force_reproject: bool = False,
+) -> np.ndarray | None:
+    """Valid-pixel mask; warps days that do not share the first TIFF grid."""
+    if not daily_tiffs:
+        return None
+    ref_transform, ref_crs, height, width = _reference_grid_from_first_tiff(daily_tiffs)
+    if ref_transform is None:
+        return None
     any_data = np.zeros((height, width), dtype=bool)
     days_with_data = np.zeros((height, width), dtype=np.uint16)
     for p in daily_tiffs:
-        try:
-            data = _read_bands_on_reference_grid(
-                p, ref_transform, ref_crs, height, width
-            )
-        except OSError:
+        data = _read_day_bands_for_mask(
+            p,
+            ref_transform,
+            ref_crs,
+            height,
+            width,
+            force_reproject=force_reproject,
+        )
+        if data is None:
             continue
-        day_has = np.any(np.isfinite(data) & (data != 0), axis=0)
-        any_data |= day_has
-        days_with_data += day_has.astype(np.uint16)
-    return any_data & (days_with_data > 2), height, width
+        _accumulate_valid_pixel_mask_from_day(
+            data, any_data=any_data, days_with_data=days_with_data
+        )
+    return any_data & (days_with_data > 2)
+
+
+def compute_daily_valid_pixel_mask_fast(daily_tiffs: list[Path]) -> np.ndarray | None:
+    """Valid-pixel mask: direct read when grids match, else warp that day."""
+    return _compute_daily_valid_pixel_mask(daily_tiffs, force_reproject=False)
+
+
+def compute_daily_valid_pixel_mask_reproject(daily_tiffs: list[Path]) -> np.ndarray | None:
+    """Valid-pixel mask with every day warped onto the first TIFF grid."""
+    return _compute_daily_valid_pixel_mask(daily_tiffs, force_reproject=True)
+
+
+def keep_mask_cache_path(npy_path: Path) -> Path:
+    return npy_path.parent / f"{npy_path.stem}.keep_mask.npy"
+
+
+def resolve_keep_mask(
+    daily_tiffs: list[Path],
+    npy_path: Path,
+    *,
+    reproject: bool,
+    use_cache: bool,
+) -> np.ndarray | None:
+    """Load cached keep_mask or compute it; verify row count matches .npy."""
+    if not daily_tiffs:
+        return None
+
+    cache = keep_mask_cache_path(npy_path)
+    if use_cache and cache.is_file():
+        keep_mask = np.load(cache)
+        try:
+            npy_rows = len(np.load(npy_path, mmap_mode="r"))
+        except OSError:
+            npy_rows = None
+        if npy_rows is not None and int(keep_mask.sum()) == npy_rows:
+            return keep_mask
+
+    if reproject:
+        keep_mask = compute_daily_valid_pixel_mask_reproject(daily_tiffs)
+    else:
+        keep_mask = compute_daily_valid_pixel_mask_fast(daily_tiffs)
+
+    if keep_mask is None:
+        return None
+
+    try:
+        npy_rows = len(np.load(npy_path, mmap_mode="r"))
+    except OSError:
+        npy_rows = None
+    if npy_rows is not None and int(keep_mask.sum()) != npy_rows:
+        raise ValueError(
+            f"keep_mask True count ({int(keep_mask.sum())}) != .npy rows ({npy_rows}) "
+            f"for {npy_path}. Try --reproject-tiffs or delete {cache}."
+        )
+
+    if use_cache:
+        np.save(cache, keep_mask)
+    return keep_mask
+
+
+def build_talhao_union_mask(
+    geometries,
+    transform,
+    out_shape: tuple[int, int],
+) -> np.ndarray:
+    """True where pixel centers fall inside any talhão polygon."""
+    if not len(geometries):
+        return np.zeros(out_shape, dtype=bool)
+    geoms = [g for g in geometries if g is not None and not g.is_empty]
+    if not geoms:
+        return np.zeros(out_shape, dtype=bool)
+    return features.geometry_mask(
+        geoms,
+        out_shape=out_shape,
+        transform=transform,
+        invert=True,
+    )
 
 
 def parse_daily_filename(filename: str):
@@ -242,6 +378,24 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Optional IBGE filter; default = every talhão in --talhoes-gpkg / baseline GeoJSON",
+    )
+    p.add_argument(
+        "--full-municipality-predict",
+        action="store_true",
+        help=(
+            "Run the model on every valid municipal pixel (legacy, slow). "
+            "Default: infer only pixels inside talhão polygons."
+        ),
+    )
+    p.add_argument(
+        "--reproject-tiffs",
+        action="store_true",
+        help="Warp each daily TIFF when building the valid-pixel mask (slow; use if fast mask misaligns).",
+    )
+    p.add_argument(
+        "--no-mask-cache",
+        action="store_true",
+        help="Do not read/write {muni}.keep_mask.npy next to the municipal .npy",
     )
     args = p.parse_args()
 
@@ -367,14 +521,42 @@ def predict_pixel_grid_daily(
     pixel_transform: PixelTransform,
     chunk_size: int,
     device: torch.device,
+    talhao_mask: np.ndarray | None = None,
+    talhao_only: bool = True,
+    reproject_tiffs: bool = False,
+    use_mask_cache: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, object, object] | None:
     """
     Returns (pred_grid, keep_mask, transform, crs).
-    pred_grid shape (H, W): sum-ready per-pixel prediction; NaN outside valid pixels.
+    pred_grid shape (H, W): per-pixel prediction; NaN outside inferred pixels.
+
+    When talhao_only=True (default), the model runs only on keep_mask pixels that
+    also fall inside talhao_mask. .npy row order is preserved by advancing the index
+    for every keep_mask pixel.
     """
-    keep_mask, height, width = compute_daily_valid_pixel_mask(daily_tiffs)
+    keep_mask = resolve_keep_mask(
+        daily_tiffs,
+        npy_path,
+        reproject=reproject_tiffs,
+        use_cache=use_mask_cache,
+    )
     if keep_mask is None:
         return None
+
+    ref_transform, ref_crs, height, width = _reference_grid_from_first_tiff(daily_tiffs)
+    if ref_transform is None:
+        return None
+
+    if talhao_only and talhao_mask is not None:
+        infer_mask = keep_mask & talhao_mask
+        n_infer = int(infer_mask.sum())
+        n_keep = int(keep_mask.sum())
+        print(
+            f"  {municipality_code}: infer {n_infer:,} / {n_keep:,} valid pixels "
+            f"({100.0 * n_infer / max(n_keep, 1):.1f}% of municipality)"
+        )
+    else:
+        infer_mask = keep_mask
 
     try:
         municipality_data = np.load(npy_path, mmap_mode="r")
@@ -383,9 +565,8 @@ def predict_pixel_grid_daily(
     if len(municipality_data) == 0:
         return None
 
-    with rasterio.open(daily_tiffs[0]) as src0:
-        transform = src0.transform
-        crs = src0.crs
+    transform = ref_transform
+    crs = ref_crs
 
     pred_grid = np.full((height, width), np.nan, dtype=np.float64)
     model.eval()
@@ -416,13 +597,14 @@ def predict_pixel_grid_daily(
                     continue
                 if npy_pixel_idx >= len(municipality_data):
                     break
-                X = municipality_data[npy_pixel_idx]
-                tup = transform_pixel(X, pixel_transform)
-                current_chunk.append(tup)
-                chunk_rc.append((row, col))
+                if infer_mask[row, col]:
+                    X = municipality_data[npy_pixel_idx]
+                    tup = transform_pixel(X, pixel_transform)
+                    current_chunk.append(tup)
+                    chunk_rc.append((row, col))
+                    if len(current_chunk) >= chunk_size:
+                        flush_chunk()
                 npy_pixel_idx += 1
-                if len(current_chunk) >= chunk_size:
-                    flush_chunk()
             if npy_pixel_idx >= len(municipality_data):
                 break
         flush_chunk()
@@ -517,6 +699,14 @@ def main() -> None:
         args.checkpoint, device, args.sequencelength, args.feature_layout
     )
     print(f"Model loaded (input_dim={input_dim})")
+    if args.full_municipality_predict:
+        print("Mode: full municipality (legacy — infer all valid pixels)")
+    else:
+        print("Mode: talhão-only (infer pixels inside plot polygons only)")
+    if args.reproject_tiffs:
+        print("Valid-pixel mask: reproject each daily TIFF (slow)")
+    else:
+        print("Valid-pixel mask: direct read when grids match, else warp + .keep_mask.npy cache")
     pixel_transform = PixelTransform(
         args.sequencelength,
         feature_layout,
@@ -554,6 +744,21 @@ def main() -> None:
                 failed.append(str(row["talhao_key"]))
             continue
 
+        ref_transform, ref_crs, height, width = _reference_grid_from_first_tiff(daily_tiffs)
+        if ref_transform is None:
+            for _, row in group.iterrows():
+                failed.append(str(row["talhao_key"]))
+            continue
+
+        sub = group.to_crs(ref_crs) if group.crs != ref_crs else group
+        talhao_union = None
+        if not args.full_municipality_predict:
+            talhao_union = build_talhao_union_mask(
+                sub.geometry.tolist(),
+                ref_transform,
+                (height, width),
+            )
+
         grid_out = predict_pixel_grid_daily(
             model,
             geo_cod,
@@ -562,6 +767,10 @@ def main() -> None:
             pixel_transform=pixel_transform,
             chunk_size=args.chunk_size,
             device=device,
+            talhao_mask=talhao_union,
+            talhao_only=not args.full_municipality_predict,
+            reproject_tiffs=args.reproject_tiffs,
+            use_mask_cache=not args.no_mask_cache,
         )
         if grid_out is None:
             for _, row in group.iterrows():
@@ -569,7 +778,6 @@ def main() -> None:
             continue
 
         pred_grid, keep_mask, transform, crs = grid_out
-        sub = group.to_crs(crs) if group.crs != crs else group
 
         for _, row in sub.iterrows():
             forecast, n_pixels = forecast_for_talhao(
@@ -600,8 +808,24 @@ def main() -> None:
         out = out.merge(baseline_agg[merge_cols + extra], on=merge_cols, how="left")
 
     if "baseline_prod_max" in out.columns:
-        out["error"] = out["forecast"] - out["baseline_prod_max"]
+        area = out["area_ha"]
+        valid_area = area.notna() & (area > 0)
+        has_fc = out["forecast"].notna()
+        out["baseline_tons"] = np.where(
+            valid_area & out["baseline_prod_max"].notna(),
+            out["baseline_prod_max"] * area / 1000.0,
+            np.nan,
+        )
+        out["forecast_t_ha"] = np.where(
+            valid_area & has_fc,
+            out["forecast"] / area,
+            np.nan,
+        )
+        out["baseline_t_ha"] = out["baseline_prod_max"] / 1000.0
+        out["error"] = out["forecast"] - out["baseline_tons"]
         out["abs_error"] = out["error"].abs()
+        out["error_t_ha"] = out["forecast_t_ha"] - out["baseline_t_ha"]
+        out["abs_error_t_ha"] = out["error_t_ha"].abs()
 
     out = out.sort_values(["geo_cod", "talhao_id"])
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -614,16 +838,33 @@ def main() -> None:
     )
 
     if "baseline_prod_max" in out.columns:
-        m = out["forecast"].notna() & out["baseline_prod_max"].notna()
+        m = (
+            out["forecast"].notna()
+            & out["baseline_tons"].notna()
+            & (out["n_pixels"] > 0)
+        )
         if m.any():
-            metrics = regression_metrics(
-                out.loc[m, "forecast"].values,
-                out.loc[m, "baseline_prod_max"].values,
+            sub = out.loc[m]
+            metrics_t = regression_metrics(
+                sub["forecast"].values,
+                sub["baseline_tons"].values,
             )
-            print(f"\nMetrics vs baseline_prod_max ({m.sum()} talhões):")
-            print(f"  RMSE: {metrics['rmse']:.2f}")
-            print(f"  MAE:  {metrics['mae']:.2f}")
-            print(f"  R²:   {metrics['r2']:.4f}")
+            print(f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):")
+            print(f"  RMSE: {metrics_t['rmse']:.2f}")
+            print(f"  MAE:  {metrics_t['mae']:.2f}")
+            print(f"  R²:   {metrics_t['r2']:.4f}")
+
+            m_ha = m & out["forecast_t_ha"].notna() & out["baseline_t_ha"].notna()
+            if m_ha.any():
+                sub_ha = out.loc[m_ha]
+                metrics_ha = regression_metrics(
+                    sub_ha["forecast_t_ha"].values,
+                    sub_ha["baseline_t_ha"].values,
+                )
+                print(f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):")
+                print(f"  RMSE: {metrics_ha['rmse']:.2f}")
+                print(f"  MAE:  {metrics_ha['mae']:.2f}")
+                print(f"  R²:   {metrics_ha['r2']:.4f}")
 
     if failed:
         print(f"\nFailed/skipped {len(failed)} talhões (missing .npy or TIFFs)")

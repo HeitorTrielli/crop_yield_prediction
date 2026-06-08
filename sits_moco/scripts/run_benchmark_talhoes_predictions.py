@@ -112,6 +112,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip harvest seasons whose output CSV already exists",
     )
+    p.add_argument(
+        "--full-municipality-predict",
+        action="store_true",
+        help="Infer every valid municipal pixel (legacy, slow)",
+    )
+    p.add_argument(
+        "--reproject-tiffs",
+        action="store_true",
+        help="Slow valid-pixel mask (warp each daily TIFF)",
+    )
+    p.add_argument(
+        "--no-mask-cache",
+        action="store_true",
+        help="Do not read/write {muni}.keep_mask.npy",
+    )
     return p.parse_args()
 
 
@@ -127,6 +142,9 @@ def run_one(
     output_csv: Path,
     municipalities: list[str] | None,
     device: str | None,
+    full_municipality_predict: bool,
+    reproject_tiffs: bool,
+    no_mask_cache: bool,
 ) -> None:
     predict_py = _ROOT / "predict_yield_talhoes.py"
     cmd = [
@@ -153,6 +171,12 @@ def run_one(
         cmd.extend(["--device", device])
     if municipalities:
         cmd.extend(["--municipalities", *municipalities])
+    if full_municipality_predict:
+        cmd.append("--full-municipality-predict")
+    if reproject_tiffs:
+        cmd.append("--reproject-tiffs")
+    if no_mask_cache:
+        cmd.append("--no-mask-cache")
 
     print("Running:", " ".join(cmd))
     subprocess.check_call(cmd, cwd=_ROOT)
@@ -209,6 +233,9 @@ def main() -> None:
             output_csv=output_csv,
             municipalities=args.municipalities,
             device=args.device,
+            full_municipality_predict=args.full_municipality_predict,
+            reproject_tiffs=args.reproject_tiffs,
+            no_mask_cache=args.no_mask_cache,
         )
         outputs.append(output_csv)
 

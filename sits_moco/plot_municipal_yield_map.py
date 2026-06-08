@@ -47,12 +47,13 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib import gridspec
 import numpy as np
 import pandas as pd
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 
-from run_paths import figures_dir, run_dir_from_forecasts_csv, run_dir_from_path
+from run_paths import municipal_heatmaps_dir, run_dir_from_forecasts_csv, run_dir_from_path
 
 try:
     import geopandas as gpd
@@ -131,10 +132,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--composite-cmap",
         type=str,
-        default="YlGnBu",
+        default="YlOrRd",
         help=(
-            "Matplotlib colormap for --composite-forecast-actual (default: YlGnBu). "
-            "Alternatives: GnBu, copper, gist_earth, cubehelix, terrain."
+            "Matplotlib colormap for --composite-forecast-actual (default: YlOrRd). "
+            "Alternatives: Reds, OrRd, YlGnBu, viridis."
         ),
     )
     p.add_argument(
@@ -149,8 +150,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Output PNG path (stem used for --all-maps suffixes). "
-            "Default: {run_dir}/figures/municipal_yield_map.png from --checkpoint "
-            "or forecasts CSV under predictions/"
+            "Default: {run_dir}/figures/municipal_heatmaps/municipal_yield_map.png "
+            "from --checkpoint or forecasts CSV under predictions/"
         ),
     )
     p.add_argument("--title", type=str, default=None, help="Figure title")
@@ -172,6 +173,29 @@ def parse_args() -> argparse.Namespace:
         dest="simplified",
         help="Use full-resolution polygons",
     )
+    p.add_argument(
+        "--compare-forecasts-csv",
+        type=Path,
+        default=None,
+        help="Second model forecasts CSV (com chuva) for --report-yield-maps.",
+    )
+    p.add_argument(
+        "--report-yield-maps",
+        action="store_true",
+        help=(
+            "Write one PNG with three yield panels (sem/com chuva + PAM) and a "
+            "shared colorbar below. Requires --compare-forecasts-csv."
+        ),
+    )
+    p.add_argument(
+        "--report-error-maps",
+        action="store_true",
+        help=(
+            "Write one PNG (3×3) comparing sem/com chuva on abs error (t), "
+            "relative error (%%) and symmetric sMAPE (%%), plus a delta column "
+            "(com − sem); one colorbar per row. Requires --compare-forecasts-csv."
+        ),
+    )
     return p.parse_args()
 
 
@@ -192,23 +216,26 @@ def _ensure_derived_columns(
             out["error"] = fc - ac
         if "abs_error" not in out.columns:
             out["abs_error"] = (fc - ac).abs()
+        acv = ac.to_numpy(dtype=float)
+        fcv = fc.to_numpy(dtype=float)
         # Percent vs actual: 100 * (forecast - actual) / actual; NaN where |actual| ~ 0
         if "pct_error" not in out.columns:
-            acv = ac.to_numpy(dtype=float)
-            fcv = fc.to_numpy(dtype=float)
             with np.errstate(divide="ignore", invalid="ignore"):
                 pct = np.where(np.abs(acv) > 1e-9, 100.0 * (fcv - acv) / acv, np.nan)
             out["pct_error"] = pct
         if "abs_pct_error" not in out.columns:
             out["abs_pct_error"] = pd.to_numeric(out["pct_error"], errors="coerce").abs()
-        # |forecast - actual| / max(|actual|, floor) as percent — scales absolute error by municipality "size" (observed tons)
+        # |forecast - actual| / max(|actual|, floor) as percent
         ft = max(float(relative_error_floor_tons), 1e-9)
-        acv = np.abs(ac.to_numpy(dtype=float))
-        fcv = fc.to_numpy(dtype=float)
-        denom = np.maximum(acv, ft)
+        denom = np.maximum(np.abs(acv), ft)
         with np.errstate(divide="ignore", invalid="ignore"):
             rel_abs_pct = 100.0 * np.abs(fcv - acv) / denom
         out["rel_abs_err_pct"] = rel_abs_pct
+        if "smape_pct" not in out.columns:
+            sden = np.abs(fcv) + np.abs(acv)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                smape = np.where(sden > 1e-9, 100.0 * np.abs(fcv - acv) / sden, np.nan)
+            out["smape_pct"] = smape
     return out
 
 
@@ -219,7 +246,14 @@ def _cmap_and_limits(column: str, vmin: float, vmax: float) -> tuple[str, float,
             m = max(abs(vmin), abs(vmax))
             vmin, vmax = -m, m
         return cmap, vmin, vmax
-    if column in ("abs_error", "abs_pct_error", "rel_abs_err_pct"):
+    if column in (
+        "forecast",
+        "actual_yield",
+        "abs_error",
+        "abs_pct_error",
+        "rel_abs_err_pct",
+        "smape_pct",
+    ):
         return "YlOrRd", vmin, vmax
     return "viridis", vmin, vmax
 
@@ -355,6 +389,313 @@ def plot_composite_forecast_actual(
     print(f"  cmap={cmap!r}, shared scale [{vmin:.1f}, {vmax:.1f}] t, {len(gdf)} municipalities")
 
 
+def _gdf_for_column(
+    df: pd.DataFrame, mun: gpd.GeoDataFrame, column: str
+) -> gpd.GeoDataFrame:
+    plot_df = df.copy()
+    plot_df["muni_key"] = _normalize_muni_code(plot_df["municipality_code"])
+    values = pd.to_numeric(plot_df[column], errors="coerce")
+    df_plot = plot_df.assign(_plot_value=values)[["muni_key", "_plot_value"]].drop_duplicates(
+        subset=["muni_key"]
+    )
+    gdf = mun.merge(df_plot, on="muni_key", how="inner")
+    if len(gdf) == 0:
+        raise SystemExit(
+            f"No municipalities matched for column '{column}'. "
+            "Check municipality_code uses IBGE 7-digit codes for this state."
+        )
+    return gdf
+
+
+def plot_composite_yield_trio(
+    df_sem: pd.DataFrame,
+    df_com: pd.DataFrame,
+    mun: gpd.GeoDataFrame,
+    output_path: Path,
+    *,
+    title: str | None,
+    dpi: int,
+    cmap: str = "YlOrRd",
+) -> None:
+    """Three-panel yield comparison with one shared horizontal colorbar below."""
+    vmin, vmax = _yield_scale_from_dfs([df_sem, df_com])
+    panels: list[tuple[pd.DataFrame, str, str]] = [
+        (df_sem, "forecast", "Sem dados de chuva"),
+        (df_com, "forecast", "Com dados de chuva"),
+        (df_sem, "actual_yield", "Observado (PAM)"),
+    ]
+    gdfs = [_gdf_for_column(frame, mun, col) for frame, col, _ in panels]
+
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+
+    rc = {
+        "font.family": "sans-serif",
+        "font.sans-serif": [
+            "Segoe UI",
+            "Helvetica Neue",
+            "Arial",
+            "DejaVu Sans",
+            "sans-serif",
+        ],
+        "axes.titleweight": "600",
+        "axes.titlepad": 10,
+        "figure.titleweight": "650",
+    }
+
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(1, 3, figsize=(20, 7.5), constrained_layout=False)
+        fig.subplots_adjust(left=0.03, right=0.97, top=0.90, bottom=0.16, wspace=0.05)
+
+        for ax, gdf, (_, _, subt) in zip(axes, gdfs, panels, strict=True):
+            gdf.plot(
+                column="_plot_value",
+                ax=ax,
+                cmap=cmap,
+                legend=False,
+                vmin=vmin,
+                vmax=vmax,
+                edgecolor="#2d2d2d",
+                linewidth=0.12,
+                missing_kwds={"color": "#d9d9d9"},
+            )
+            ax.set_axis_off()
+            ax.set_title(subt, fontsize=13, pad=8)
+
+        if title:
+            fig.suptitle(title, fontsize=15, y=0.98)
+
+        cbar = fig.colorbar(
+            sm,
+            ax=list(axes),
+            orientation="horizontal",
+            fraction=0.07,
+            pad=0.06,
+            aspect=50,
+            shrink=0.95,
+        )
+        cbar.set_label("Produção municipal (t)", fontsize=12, labelpad=8)
+        cbar.ax.tick_params(labelsize=10)
+        tons_fmt = mticker.FuncFormatter(
+            lambda x, _: f"{x:,.0f}".replace(",", " ")
+        )
+        cbar.ax.xaxis.set_major_formatter(tons_fmt)
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"Saved composite yield trio: {out}")
+    print(
+        f"  cmap={cmap!r}, shared scale [{vmin:.1f}, {vmax:.1f}] t, "
+        f"{len(gdfs[0])} municipalities"
+    )
+
+
+def _scale_from_dfs_column(
+    dfs: list[pd.DataFrame], column: str
+) -> tuple[float, float]:
+    return _yield_scale_from_dfs(dfs, columns=(column,))
+
+
+def _error_delta_frame(
+    df_sem: pd.DataFrame, df_com: pd.DataFrame, column: str
+) -> pd.DataFrame:
+    """Per-municipality delta (com − sem) for one error metric."""
+    key = "municipality_code"
+    merged = df_sem[[key, column]].merge(
+        df_com[[key, column]], on=key, suffixes=("_sem", "_com")
+    )
+    delta = merged[key].to_frame()
+    delta[column] = merged[f"{column}_com"] - merged[f"{column}_sem"]
+    return delta
+
+
+def _symmetric_scale(vals: np.ndarray) -> tuple[float, float]:
+    finite = vals[np.isfinite(vals)]
+    if finite.size == 0:
+        return -1.0, 1.0
+    m = float(np.max(np.abs(finite)))
+    if m <= 0:
+        m = 1.0
+    return -m, m
+
+
+def plot_composite_error_grid(
+    df_sem: pd.DataFrame,
+    df_com: pd.DataFrame,
+    mun: gpd.GeoDataFrame,
+    output_path: Path,
+    *,
+    title: str | None,
+    dpi: int,
+    relative_error_floor_tons: float,
+    cmap: str = "YlOrRd",
+) -> None:
+    """3×3 error comparison: abs (t), relative %, sMAPE % — sem, com, delta (com − sem)."""
+    df_sem = _ensure_derived_columns(
+        df_sem, relative_error_floor_tons=relative_error_floor_tons
+    )
+    df_com = _ensure_derived_columns(
+        df_com, relative_error_floor_tons=relative_error_floor_tons
+    )
+    panels: list[tuple[str, str, str, str]] = [
+        ("abs_error", "Erro absoluto", "Erro absoluto (t)", "Δ erro absoluto (t)"),
+        ("abs_pct_error", "Erro relativo", "|erro| / observado (%)", "Δ erro relativo (p.p.)"),
+        ("smape_pct", "sMAPE (simétrico)", "sMAPE (%)", "Δ sMAPE (p.p.)"),
+    ]
+
+    rc = {
+        "font.family": "sans-serif",
+        "font.sans-serif": [
+            "Segoe UI",
+            "Helvetica Neue",
+            "Arial",
+            "DejaVu Sans",
+            "sans-serif",
+        ],
+        "axes.titleweight": "600",
+        "axes.titlepad": 8,
+        "figure.titleweight": "650",
+    }
+
+    with plt.rc_context(rc):
+        fig = plt.figure(figsize=(14.2, 12.5))
+        outer = gridspec.GridSpec(
+            3,
+            1,
+            figure=fig,
+            left=0.03,
+            right=0.97,
+            top=0.90,
+            bottom=0.04,
+            hspace=0.20,
+        )
+        if title:
+            fig.suptitle(title, fontsize=14, y=0.97)
+        fig.text(0.18, 0.915, "Sem dados de chuva", ha="center", fontsize=11, fontweight="600")
+        fig.text(0.50, 0.915, "Com dados de chuva", ha="center", fontsize=11, fontweight="600")
+        fig.text(
+            0.82,
+            0.915,
+            "Δ (com − sem)",
+            ha="center",
+            fontsize=11,
+            fontweight="600",
+        )
+
+        tons_fmt = mticker.FuncFormatter(
+            lambda x, _: f"{x:,.0f}".replace(",", "\u202f")
+        )
+        pct_fmt = mticker.FuncFormatter(lambda x, _: f"{x:.0f}")
+
+        for row, (column, row_label, cbar_label, delta_cbar_label) in enumerate(panels):
+            inner = gridspec.GridSpecFromSubplotSpec(
+                2,
+                3,
+                subplot_spec=outer[row],
+                height_ratios=[1.0, 0.07],
+                width_ratios=[1.0, 1.0, 1.0],
+                hspace=0.06,
+                wspace=0.04,
+            )
+            vmin, vmax = _scale_from_dfs_column([df_sem, df_com], column)
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            sm = ScalarMappable(norm=norm, cmap=cmap)
+            sm.set_array([])
+
+            df_delta = _error_delta_frame(df_sem, df_com, column)
+            delta_vals = pd.to_numeric(df_delta[column], errors="coerce").to_numpy(
+                dtype=float
+            )
+            dmin, dmax = _symmetric_scale(delta_vals)
+            delta_norm = Normalize(vmin=dmin, vmax=dmax)
+            delta_sm = ScalarMappable(norm=delta_norm, cmap="RdBu_r")
+            delta_sm.set_array([])
+
+            row_frames = (df_sem, df_com, df_delta)
+            row_vmins = (vmin, vmin, dmin)
+            row_vmaxs = (vmax, vmax, dmax)
+            row_cmaps = (cmap, cmap, "RdBu_r")
+
+            for col_idx, frame in enumerate(row_frames):
+                ax = fig.add_subplot(inner[0, col_idx])
+                gdf = _gdf_for_column(frame, mun, column)
+                gdf.plot(
+                    column="_plot_value",
+                    ax=ax,
+                    cmap=row_cmaps[col_idx],
+                    legend=False,
+                    vmin=row_vmins[col_idx],
+                    vmax=row_vmaxs[col_idx],
+                    edgecolor="#2d2d2d",
+                    linewidth=0.10,
+                    missing_kwds={"color": "#d9d9d9"},
+                )
+                ax.set_axis_off()
+                if col_idx == 0:
+                    ax.text(
+                        0.02,
+                        0.98,
+                        row_label,
+                        transform=ax.transAxes,
+                        fontsize=10,
+                        fontweight="600",
+                        va="top",
+                        ha="left",
+                        bbox=dict(
+                            boxstyle="round,pad=0.2", facecolor="white", alpha=0.88
+                        ),
+                    )
+
+            cax_sem_com = fig.add_subplot(inner[1, 0:2])
+            cbar = fig.colorbar(sm, cax=cax_sem_com, orientation="horizontal")
+            cax_sem_com.set_xlabel(cbar_label, fontsize=9, labelpad=2)
+            cax_sem_com.tick_params(labelsize=8, pad=1)
+            fmt = tons_fmt if column == "abs_error" else pct_fmt
+            cax_sem_com.xaxis.set_major_formatter(fmt)
+
+            cax_delta = fig.add_subplot(inner[1, 2])
+            delta_cbar = fig.colorbar(delta_sm, cax=cax_delta, orientation="horizontal")
+            cax_delta.set_xlabel(delta_cbar_label, fontsize=9, labelpad=2)
+            cax_delta.tick_params(labelsize=8, pad=1)
+            cax_delta.xaxis.set_major_formatter(fmt)
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    print(f"Saved composite error grid: {out}")
+    print(
+        f"  metrics: abs_error, abs_pct_error, smape_pct + delta (com-sem); "
+        f"cmap={cmap!r}, delta=RdBu_r"
+    )
+
+
+def _yield_scale_from_dfs(
+    dfs: list[pd.DataFrame], columns: tuple[str, ...] = ("forecast", "actual_yield")
+) -> tuple[float, float]:
+    """Shared vmin/vmax (tons) for comparable production choropleths."""
+    chunks: list[np.ndarray] = []
+    for frame in dfs:
+        for col in columns:
+            if col not in frame.columns:
+                continue
+            vals = pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                chunks.append(vals)
+    if not chunks:
+        return 0.0, 1.0
+    pool = np.concatenate(chunks)
+    vmin = float(np.min(pool))
+    vmax = float(np.max(pool))
+    if vmin >= vmax:
+        vmax = vmin + 1.0
+    return vmin, vmax
+
+
 def _bundle_output_paths(base: Path) -> tuple[Path, Path, Path, Path]:
     base = Path(base)
     stem = base.stem
@@ -379,6 +720,9 @@ def plot_choropleth_column(
     title: str | None,
     dpi: int,
     legend_label: str | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    cmap: str | None = None,
 ) -> int:
     """Merge CSV values on municipalities and save one PNG. Returns number of painted polygons."""
     if column not in df.columns:
@@ -405,12 +749,20 @@ def plot_choropleth_column(
     col = "_plot_value"
     arr = gdf[col].to_numpy(dtype=float)
     finite = np.isfinite(arr)
-    if finite.any():
-        vmin = float(np.nanmin(arr))
-        vmax = float(np.nanmax(arr))
-    else:
-        vmin, vmax = 0.0, 1.0
-    cmap, vmin, vmax = _cmap_and_limits(column, vmin, vmax)
+    if vmin is None or vmax is None:
+        if finite.any():
+            vmin = float(np.nanmin(arr)) if vmin is None else vmin
+            vmax = float(np.nanmax(arr)) if vmax is None else vmax
+        else:
+            vmin = 0.0 if vmin is None else vmin
+            vmax = 1.0 if vmax is None else vmax
+    if cmap is None:
+        cmap, vmin, vmax = _cmap_and_limits(column, vmin, vmax)
+    elif column in ("error", "pct_error") and vmin < 0 < vmax:
+        m = max(abs(vmin), abs(vmax))
+        vmin, vmax = -m, m
+    if vmin >= vmax:
+        vmax = vmin + 1.0
 
     fig, ax = plt.subplots(figsize=(11, 11))
     leg = legend_label if legend_label is not None else column
@@ -452,7 +804,9 @@ def main() -> None:
         else:
             run_dir = run_dir_from_forecasts_csv(csv_path)
         if run_dir is not None:
-            args.output = figures_dir(run_dir, create=True) / "municipal_yield_map.png"
+            args.output = (
+                municipal_heatmaps_dir(run_dir, create=True) / "municipal_yield_map.png"
+            )
         else:
             args.output = Path("municipal_yield_map.png")
     else:
@@ -539,6 +893,47 @@ def main() -> None:
     mun = mun.copy()
     mun["muni_key"] = mun["code_muni"].astype(int).astype(str).str.zfill(7)
 
+    if args.report_yield_maps or args.report_error_maps:
+        if args.compare_forecasts_csv is None:
+            need = "--report-yield-maps" if args.report_yield_maps else "--report-error-maps"
+            raise SystemExit(f"{need} requires --compare-forecasts-csv")
+        csv_com = Path(args.compare_forecasts_csv).resolve()
+        if not csv_com.is_file():
+            raise SystemExit(f"Compare CSV not found: {csv_com}")
+        df_com = pd.read_csv(csv_com)
+        if "municipality_code" not in df_com.columns:
+            raise SystemExit("Compare CSV must contain column 'municipality_code'")
+        for frame in (df, df_com):
+            if "forecast" not in frame.columns or "actual_yield" not in frame.columns:
+                raise SystemExit(
+                    "Report maps require forecast and actual_yield in both CSVs."
+                )
+        title_base = args.title or "Paraná — safra 2021"
+        if args.report_yield_maps:
+            plot_composite_yield_trio(
+                df,
+                df_com,
+                mun,
+                args.output,
+                title=title_base,
+                dpi=args.dpi,
+                cmap="YlOrRd",
+            )
+        if args.report_error_maps:
+            plot_composite_error_grid(
+                df,
+                df_com,
+                mun,
+                args.output,
+                title=title_base,
+                dpi=args.dpi,
+                relative_error_floor_tons=max(
+                    float(args.relative_error_floor_tons), 1e-9
+                ),
+                cmap="YlOrRd",
+            )
+        return
+
     if args.composite_forecast_actual:
         plot_composite_forecast_actual(
             df,
@@ -555,6 +950,8 @@ def main() -> None:
 
     if args.all_maps:
         p_forecast, p_actual, p_abs, p_pct = _bundle_output_paths(args.output)
+        yield_vmin, yield_vmax = _yield_scale_from_dfs([df])
+        yield_cmap = "YlOrRd"
         bundle = (
             (
                 "forecast",
@@ -564,7 +961,10 @@ def main() -> None:
                     if args.title
                     else f"Municipal forecast ({args.state}) — {csv_path.name}"
                 ),
-                None,
+                "Produção (t)",
+                yield_vmin,
+                yield_vmax,
+                yield_cmap,
             ),
             (
                 "actual_yield",
@@ -574,7 +974,10 @@ def main() -> None:
                     if args.title
                     else f"Municipal actual_yield ({args.state}) — {csv_path.name}"
                 ),
-                None,
+                "Produção (t)",
+                yield_vmin,
+                yield_vmax,
+                yield_cmap,
             ),
             (
                 "abs_error",
@@ -584,6 +987,9 @@ def main() -> None:
                     if args.title
                     else f"Municipal abs_error ({args.state}) — {csv_path.name}"
                 ),
+                None,
+                None,
+                None,
                 None,
             ),
             (
@@ -595,9 +1001,12 @@ def main() -> None:
                     else f"Municipal rel_abs_err_pct ({args.state}) — {csv_path.name}"
                 ),
                 "|forecast−actual| / max(observed, floor) (%)",
+                None,
+                None,
+                None,
             ),
         )
-        for col, outp, tit, leg in bundle:
+        for col, outp, tit, leg, vmin, vmax, cmap in bundle:
             plot_choropleth_column(
                 df,
                 mun,
@@ -608,6 +1017,9 @@ def main() -> None:
                 title=tit,
                 dpi=args.dpi,
                 legend_label=leg,
+                vmin=vmin,
+                vmax=vmax,
+                cmap=cmap,
             )
         return
 

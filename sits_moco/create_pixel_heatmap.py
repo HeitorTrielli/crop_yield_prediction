@@ -5,13 +5,15 @@ Maps predictions back to spatial locations using original TIFF files.
 
 import argparse
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import torch
+from matplotlib.cm import ScalarMappable
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.colors import Normalize
 from torch.amp import autocast
@@ -23,10 +25,22 @@ from datasets.feature_layout import (
     feature_layout_input_dim,
     normalize_feature_layout,
 )
-from datasets.uscrops_aggregated_npy_polars import scale_xavier_rain_channels
+from datasets.pixel_transform import DOY_CHANNEL
+from datasets.uscrops_aggregated_npy_polars import (
+    _indices_first_n_months,
+    scale_xavier_rain_channels,
+)
 from models import STNetRegression
 from utils import recursive_todevice
-from run_paths import figures_dir, run_dir_from_path
+from municipality_labels import (
+    municipality_output_stem,
+    resolve_municipality_display_name,
+)
+from run_paths import (
+    intramunicipal_heatmap_dir,
+    resolve_checkpoint_path,
+    run_dir_from_path,
+)
 from utils_aggregated import stnet_regression_input_dim_from_state_dict
 
 
@@ -38,7 +52,7 @@ def parse_args():
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to model_best.pth checkpoint file",
+        help="Path to model_best.pth, or run directory (uses training/model_best.pth)",
     )
     parser.add_argument(
         "--datapath",
@@ -80,15 +94,18 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "Output directory for heatmap images (default: {run_dir}/figures/ "
-            "from --checkpoint, optional --figures-subdir)"
+            "Output directory for heatmap images (default: "
+            "{run_dir}/figures/intramunicipal_heatmap/ from --checkpoint)"
         ),
     )
     parser.add_argument(
         "--figures-subdir",
         type=str,
         default=None,
-        help="Optional subfolder under the run figures/ directory (e.g. 2020-2023_train-2021)",
+        help=(
+            "Optional tag subfolder under figures/intramunicipal_heatmap/ "
+            "(e.g. 2020-2021 for harvest season)"
+        ),
     )
     parser.add_argument(
         "--sequencelength",
@@ -159,6 +176,47 @@ def parse_args():
             + ', or "auto" (default) from checkpoint only.'
         ),
     )
+    parser.add_argument(
+        "--report-panel",
+        action="store_true",
+        help=(
+            "Write one 2×2 PNG (yield sem/com + NDVI mean/peak) for the report. "
+            "Requires exactly one --municipality-code and --compare-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--compare-checkpoint",
+        type=str,
+        default=None,
+        help="Second model checkpoint (e.g. com chuva) for --report-panel.",
+    )
+    parser.add_argument(
+        "--panel-output",
+        type=str,
+        default=None,
+        help="Output path for --report-panel (default: {output-dir}/{muni_stem}_panel.png).",
+    )
+    parser.add_argument(
+        "--num-periods",
+        type=int,
+        nargs="+",
+        metavar="K",
+        help=(
+            "Use only the first K season months (1–6), as in evaluate_incomplete_series.py. "
+            "Pass one or more values, e.g. --num-periods 1 3 6. Saves yield heatmaps only."
+        ),
+    )
+    parser.add_argument(
+        "--incomplete-series",
+        action="store_true",
+        help="Shortcut for --num-periods 1 2 3 4 5 6 (one yield heatmap per K).",
+    )
+    parser.add_argument(
+        "--panel-dpi",
+        type=int,
+        default=160,
+        help="DPI for --report-panel (default: 160).",
+    )
     args = parser.parse_args()
 
     if args.feature_layout != "auto":
@@ -166,9 +224,13 @@ def parse_args():
 
     args.datapath = Path(args.datapath)
     args.tiffpath = Path(args.tiffpath)
-    args.checkpoint = Path(args.checkpoint)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
+    if args.compare_checkpoint is not None:
+        args.compare_checkpoint = resolve_checkpoint_path(args.compare_checkpoint)
     if args.output_dir is not None:
         args.output_dir = Path(args.output_dir)
+    if args.panel_output is not None:
+        args.panel_output = Path(args.panel_output)
     if args.reference_date is not None:
         args.reference_date = datetime.strptime(args.reference_date, "%Y-%m-%d").date()
 
@@ -212,6 +274,16 @@ def season_start_from_year_range(year_range: str) -> date:
     raise ValueError(f"Could not parse --year-range={year_range!r} (expected like 2020-2021)")
 
 
+def harvest_year_from_year_range(year_range: str | None) -> int | None:
+    """Calendar year of harvest (second year in a 'YYYY-YYYY' season folder)."""
+    parts = (year_range or "").strip().split("-")
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1])
+    if parts and parts[0].isdigit():
+        return int(parts[0])
+    return None
+
+
 def date_to_season_doy(d: date, season_start: date) -> int:
     """1-based day index from season_start."""
     return (d - season_start).days + 1
@@ -228,16 +300,42 @@ def doy_to_season_month(doy: int, reference_date: date) -> int:
     return season_cal_months.index(cal_month) + 1
 
 
+def ndvi_mean_timestep_mask(
+    doys: np.ndarray,
+    valid: np.ndarray,
+    *,
+    season_start: date,
+    harvest_year: int,
+    skip_season_months: int = 3,
+) -> np.ndarray:
+    """Timesteps used for mean NDVI: after the first *skip* season months, in *harvest_year*."""
+    mask = np.zeros(len(doys), dtype=bool)
+    for i in np.flatnonzero(valid):
+        doy = int(doys[i])
+        if doy_to_season_month(doy, season_start) <= skip_season_months:
+            continue
+        if (season_start + timedelta(days=doy - 1)).year != harvest_year:
+            continue
+        mask[i] = True
+    return mask
+
+
 def compute_daily_ndvi_stats_from_npy_row(
     X_row: np.ndarray,
     # Keep literal defaults here because this function is defined before RED_BAND_IDX/NIR_BAND_IDX
     red_idx: int = 2,
     nir_idx: int = 6,
+    *,
+    season_start: date | None = None,
+    harvest_year: int | None = None,
+    skip_season_months: int = 3,
 ):
     """Compute mean/peak (max) NDVI over valid daily timesteps from one .npy pixel row (T, 11).
 
     Uses raw reflectance (bands * 1e-4). Treats 0 and -9999 as missing.
-    Returns (mean_ndvi, peak_ndvi, ndvi_per_season_month_dict) where peak is max NDVI on valid days.
+    Mean NDVI optionally restricts to the harvest calendar year after skipping the first
+    *skip_season_months* season months (default 3: Oct--Dec). Peak is max NDVI on all valid days.
+    Returns (mean_ndvi, peak_ndvi, ndvi_per_season_month_dict).
     """
     if X_row.ndim != 2 or X_row.shape[1] < 11:
         return np.nan, np.nan, {}
@@ -262,9 +360,27 @@ def compute_daily_ndvi_stats_from_npy_row(
 
     ndvi = (nir - red) / denom
     ndvi = np.clip(ndvi, -1.0, 1.0)
-    ndvi_valid = ndvi[valid]
-    mean_ndvi = float(np.nanmean(ndvi_valid)) if len(ndvi_valid) else np.nan
-    peak_ndvi = float(np.nanmax(ndvi_valid)) if len(ndvi_valid) else np.nan
+    peak_ndvi = float(np.nanmax(ndvi[valid])) if np.any(valid) else np.nan
+
+    mean_mask = valid
+    if season_start is not None and harvest_year is not None:
+        mean_mask = ndvi_mean_timestep_mask(
+            doys,
+            valid,
+            season_start=season_start,
+            harvest_year=harvest_year,
+            skip_season_months=skip_season_months,
+        )
+    elif season_start is not None and skip_season_months > 0:
+        mean_mask = valid & np.array(
+            [
+                doy_to_season_month(int(d), season_start) > skip_season_months
+                for d in doys
+            ],
+            dtype=bool,
+        )
+
+    mean_ndvi = float(np.nanmean(ndvi[mean_mask])) if np.any(mean_mask) else np.nan
 
     # Per-season-month mean NDVI
     per_month = {}
@@ -310,6 +426,23 @@ def resolve_daily_tiff_dir(tiffpath: Path, municipality_code: str, year_range: s
         if candidate.is_dir():
             return candidate
     return None
+
+
+def filter_timeseries_for_periods(x, num_periods, reference_date):
+    """Keep daily rows in season months 1..num_periods (sorted by DOY). None = full series."""
+    if num_periods is None:
+        return np.asarray(x, dtype=np.float32)
+    if reference_date is None:
+        raise ValueError("reference_date is required when num_periods is set")
+    if isinstance(reference_date, str):
+        reference_date = datetime.strptime(reference_date, "%Y-%m-%d").date()
+    raw = np.asarray(x, dtype=np.float32)
+    idx = _indices_first_n_months(raw, num_periods, reference_date)
+    if len(idx) == 0:
+        return None
+    sub = raw[idx]
+    doys = sub[:, DOY_CHANNEL].astype(np.float64)
+    return sub[np.argsort(doys, kind="stable")]
 
 
 def transform_pixel(
@@ -409,14 +542,10 @@ def transform_pixel(
 
 
 def get_municipality_name(tiff_dir, municipality_code):
-    """Extract municipality name from directory name (e.g., '4100103_Abatiá' -> 'Abatiá')."""
-    for dir_path in tiff_dir.iterdir():
-        if dir_path.is_dir() and dir_path.name.startswith(municipality_code + "_"):
-            # Extract name after the code and underscore
-            name = dir_path.name[len(municipality_code) + 1 :]
-            return name
-    # Fallback: return code if name not found
-    return municipality_code
+    """Human-readable municipality name for plots (yield CSV, then TIFF folder)."""
+    return resolve_municipality_display_name(
+        municipality_code, tiff_root=tiff_dir
+    )
 
 
 def get_tile_structure(tiff_dir, municipality_code, year):
@@ -643,6 +772,7 @@ def reconstruct_spatial_predictions(
     year_range=None,
     reference_date=None,
     input_dim: int = 10,
+    num_periods=None,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
@@ -675,6 +805,7 @@ def reconstruct_spatial_predictions(
             season_start = season_start_from_year_range(year_range)
         else:
             season_start = reference_date
+        harvest_year = harvest_year_from_year_range(year_range)
 
         muni_npy_file = resolve_muni_npy(datapath, municipality_code, year_range)
         if muni_npy_file is None:
@@ -735,15 +866,27 @@ def reconstruct_spatial_predictions(
                         X = municipality_data[npy_pixel_idx]
                         # Daily NDVI stats computed from raw (unnormalized) .npy row
                         try:
-                            mean_ndvi, peak_ndvi, _ = compute_daily_ndvi_stats_from_npy_row(X)
+                            mean_ndvi, peak_ndvi, _ = compute_daily_ndvi_stats_from_npy_row(
+                                X,
+                                season_start=season_start,
+                                harvest_year=harvest_year,
+                            )
                         except Exception:
                             mean_ndvi, peak_ndvi = np.nan, np.nan
                         ndvi_map[("grid", row, col)] = mean_ndvi
                         # Reuse the same return slot as the legacy "median" map, but in daily mode it is peak (max) NDVI.
                         ndvi_map_median[("grid", row, col)] = peak_ndvi
 
+                        X_filtered = filter_timeseries_for_periods(
+                            X, num_periods, season_start
+                        )
+                        if X_filtered is None:
+                            prediction_map[("grid", row, col)] = np.nan
+                            npy_pixel_idx += 1
+                            continue
+
                         X_tuple = transform_pixel(
-                            X,
+                            X_filtered,
                             sequencelength,
                             rc,
                             interp,
@@ -980,8 +1123,18 @@ def reconstruct_spatial_predictions(
 
                         # Use data from .npy file (it's already processed)
                         X = municipality_data[npy_pixel_idx].copy()
+                        ref = reference_date
+                        if ref is None and year_range is not None:
+                            ref = season_start_from_year_range(year_range)
+                        X_filtered = filter_timeseries_for_periods(
+                            X, num_periods, ref
+                        )
+                        if X_filtered is None:
+                            prediction_map[(tile_x, tile_y, row, col)] = np.nan
+                            npy_pixel_idx += 1
+                            continue
                         X_tuple = transform_pixel(
-                            X,
+                            X_filtered,
                             sequencelength,
                             rc,
                             interp,
@@ -1369,6 +1522,7 @@ def create_heatmap(
     municipality_code,
     tiffpath=None,
     year=None,
+    title=None,
 ):
     """Create heatmap visualization from spatial predictions using geographic coordinates."""
     if not prediction_map:
@@ -1416,17 +1570,11 @@ def create_heatmap(
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label("Yield Prediction (tons)", rotation=270, labelpad=20)
 
-    # Get municipality name from TIFF directory
-    if tiffpath:
-        municipality_name = get_municipality_name(tiffpath, municipality_code)
-    else:
-        municipality_name = municipality_code
+    municipality_name = get_municipality_name(tiffpath, municipality_code)
+    if title is None:
+        title = f"Yield Prediction Heatmap — {municipality_name}"
 
-    ax.set_title(
-        f"Yield Prediction Heatmap - {municipality_name} ({municipality_code})",
-        fontsize=14,
-        fontweight="bold",
-    )
+    ax.set_title(title, fontsize=14, fontweight="bold")
     ax.set_xlabel("Pixel Column")
     ax.set_ylabel("Pixel Row")
 
@@ -1513,12 +1661,9 @@ def create_ndvi_heatmap(
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label("NDVI", rotation=270, labelpad=20)
 
-    if tiffpath:
-        municipality_name = get_municipality_name(tiffpath, municipality_code)
-    else:
-        municipality_name = municipality_code
+    municipality_name = get_municipality_name(tiffpath, municipality_code)
 
-    title = f"NDVI Heatmap - {municipality_name} ({municipality_code})"
+    title = f"NDVI Heatmap — {municipality_name}"
     if title_suffix:
         title += f" - {title_suffix}"
     ax.set_title(
@@ -1553,6 +1698,431 @@ def create_ndvi_heatmap(
 
     print(f"  ✓ Saved NDVI heatmap to {output_path}")
     return heatmap
+
+
+BEIGE_GREEN_CMAP = LinearSegmentedColormap.from_list(
+    "beige_green", ["#f4f1e6", "#2e7d32"]
+)
+BEIGE_GREEN_CMAP.set_bad(color="#d9d9d9", alpha=1.0)
+
+REPORT_PANEL_CMAP = LinearSegmentedColormap.from_list(
+    "beige_green_report", ["#f4f1e6", "#2e7d32"]
+)
+REPORT_PANEL_CMAP.set_bad(color="#ffffff", alpha=1.0)
+
+
+def _concat_finite(*arrays: np.ndarray | None) -> np.ndarray:
+    chunks: list[np.ndarray] = []
+    for arr in arrays:
+        if arr is None:
+            continue
+        vals = np.asarray(arr, dtype=float).ravel()
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            chunks.append(vals)
+    if not chunks:
+        return np.array([], dtype=float)
+    return np.concatenate(chunks)
+
+
+def _shared_yield_limits(*arrays: np.ndarray | None) -> tuple[float, float]:
+    vals = _concat_finite(*arrays)
+    if vals.size == 0:
+        return 0.0, 1.0
+    vmin = float(np.nanpercentile(vals, 2))
+    vmax = float(np.nanpercentile(vals, 98))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+        vmin = float(np.nanmin(vals))
+        vmax = float(np.nanmax(vals))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+        return 0.0, 1.0
+    return vmin, vmax
+
+
+def _shared_ndvi_limits(*arrays: np.ndarray | None) -> tuple[float, float]:
+    vals = _concat_finite(*arrays)
+    if vals.size == 0:
+        return -1.0, 1.0
+    vmin = float(np.nanpercentile(vals, 2))
+    vmax = float(np.nanpercentile(vals, 98))
+    vmin = max(vmin, -1.0)
+    vmax = min(vmax, 1.0)
+    if vmin >= vmax:
+        return -1.0, 1.0
+    return vmin, vmax
+
+
+def _shared_finite_bounds(
+    *arrays: np.ndarray | None,
+    pad: int = 2,
+) -> tuple[slice, slice] | None:
+    """Bounding box (rows, cols) covering finite pixels in any of the arrays."""
+    combined: np.ndarray | None = None
+    for arr in arrays:
+        if arr is None:
+            continue
+        a = np.asarray(arr, dtype=float)
+        if a.ndim != 2 or a.size == 0:
+            continue
+        finite = np.isfinite(a)
+        if not finite.any():
+            continue
+        combined = finite if combined is None else (combined | finite)
+    if combined is None:
+        return None
+    rows, cols = np.where(combined)
+    h, w = combined.shape
+    r0 = max(0, int(rows.min()) - pad)
+    r1 = min(h, int(rows.max()) + 1 + pad)
+    c0 = max(0, int(cols.min()) - pad)
+    c1 = min(w, int(cols.max()) + 1 + pad)
+    return slice(r0, r1), slice(c0, c1)
+
+
+def _crop_heatmap(heatmap: np.ndarray, bounds: tuple[slice, slice]) -> np.ndarray:
+    rs, cs = bounds
+    return np.asarray(heatmap, dtype=float)[rs, cs]
+
+
+def _draw_heatmap_panel(
+    ax,
+    heatmap: np.ndarray,
+    *,
+    vmin: float,
+    vmax: float,
+    cmap=REPORT_PANEL_CMAP,
+) -> None:
+    ax.set_facecolor("white")
+    ax.imshow(
+        heatmap,
+        cmap=cmap,
+        interpolation="nearest",
+        aspect="equal",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.set_axis_off()
+
+
+def create_intramunicipal_report_panel(
+    yield_sem: np.ndarray,
+    yield_com: np.ndarray,
+    ndvi_mean: np.ndarray,
+    ndvi_peak: np.ndarray,
+    output_path: Path,
+    *,
+    municipality_name: str,
+    title: str | None = None,
+    dpi: int = 160,
+) -> None:
+    """2×2 report panel: shared tons scale (top row), shared NDVI scale (bottom row)."""
+    crop = _shared_finite_bounds(yield_sem, yield_com, ndvi_mean, ndvi_peak)
+    if crop is not None:
+        yield_sem = _crop_heatmap(yield_sem, crop)
+        yield_com = _crop_heatmap(yield_com, crop)
+        ndvi_mean = _crop_heatmap(ndvi_mean, crop)
+        ndvi_peak = _crop_heatmap(ndvi_peak, crop)
+
+    yield_vmin, yield_vmax = _shared_yield_limits(yield_sem, yield_com)
+    ndvi_vmin, ndvi_vmax = _shared_ndvi_limits(ndvi_mean, ndvi_peak)
+
+    rows: list[
+        tuple[str, str, str, np.ndarray, np.ndarray, float, float, str]
+    ] = [
+        (
+            "Sem dados de chuva",
+            "Com dados de chuva",
+            "Previsão (t)",
+            yield_sem,
+            yield_com,
+            yield_vmin,
+            yield_vmax,
+            "Produção prevista (t)",
+        ),
+        (
+            "NDVI médio (ano colheita)",
+            "Pico de NDVI na safra",
+            "NDVI",
+            ndvi_mean,
+            ndvi_peak,
+            ndvi_vmin,
+            ndvi_vmax,
+            "NDVI",
+        ),
+    ]
+
+    rc = {
+        "font.family": "sans-serif",
+        "font.sans-serif": [
+            "Segoe UI",
+            "Helvetica Neue",
+            "Arial",
+            "DejaVu Sans",
+            "sans-serif",
+        ],
+        "figure.titleweight": "650",
+    }
+
+    with plt.rc_context(rc):
+        fig = plt.figure(figsize=(10.2, 9.2), facecolor="white")
+        outer = gridspec.GridSpec(
+            2,
+            1,
+            figure=fig,
+            left=0.04,
+            right=0.96,
+            top=0.90,
+            bottom=0.05,
+            hspace=0.28,
+        )
+        suptitle = title or municipality_name
+        fig.suptitle(suptitle, fontsize=14, y=0.97)
+
+        for row_idx, (
+            left_hdr,
+            right_hdr,
+            row_label,
+            left_arr,
+            right_arr,
+            vmin,
+            vmax,
+            cbar_label,
+        ) in enumerate(rows):
+            panel_hdrs = (left_hdr, right_hdr)
+            inner = gridspec.GridSpecFromSubplotSpec(
+                2,
+                2,
+                subplot_spec=outer[row_idx],
+                height_ratios=[1.0, 0.08],
+                width_ratios=[1.0, 1.0],
+                hspace=0.08,
+                wspace=0.04,
+            )
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            sm = ScalarMappable(norm=norm, cmap=REPORT_PANEL_CMAP)
+            sm.set_array([])
+
+            for col_idx, arr in enumerate((left_arr, right_arr)):
+                ax = fig.add_subplot(inner[0, col_idx])
+                _draw_heatmap_panel(ax, arr, vmin=vmin, vmax=vmax)
+                ax.text(
+                    0.5,
+                    1.02,
+                    panel_hdrs[col_idx],
+                    transform=ax.transAxes,
+                    fontsize=10,
+                    fontweight="600",
+                    ha="center",
+                    va="bottom",
+                )
+                if col_idx == 0:
+                    ax.text(
+                        0.02,
+                        0.98,
+                        row_label,
+                        transform=ax.transAxes,
+                        fontsize=9.5,
+                        fontweight="600",
+                        va="top",
+                        ha="left",
+                        color="#1a1a1a",
+                    )
+
+            cax = fig.add_subplot(inner[1, :])
+            cax.set_facecolor("white")
+            cbar = fig.colorbar(sm, cax=cax, orientation="horizontal")
+            cax.set_xlabel(cbar_label, fontsize=9, labelpad=2)
+            cax.tick_params(labelsize=8, pad=1)
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=dpi, bbox_inches="tight", facecolor="white", edgecolor="none")
+    plt.close(fig)
+    print(f"  ✓ Saved intramunicipal report panel to {out}")
+    print(
+        f"    yield scale: {yield_vmin:.2f}–{yield_vmax:.2f} t; "
+        f"NDVI scale: {ndvi_vmin:.3f}–{ndvi_vmax:.3f}"
+    )
+
+
+def load_stnet_from_checkpoint(
+    checkpoint_path: Path,
+    device: torch.device,
+    sequencelength: int,
+    feature_layout: str = "auto",
+) -> tuple[STNetRegression, int]:
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
+    state_dict = checkpoint["model_state"]
+    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
+    ck_fl = checkpoint.get("feature_layout")
+    if feature_layout != "auto":
+        expected_dim = feature_layout_input_dim(feature_layout)
+        if input_dim != expected_dim:
+            raise ValueError(
+                f"Checkpoint {checkpoint_path} has input_dim={input_dim} but "
+                f"--feature-layout {feature_layout!r} implies {expected_dim}."
+            )
+        if ck_fl is not None and normalize_feature_layout(
+            ck_fl
+        ) != normalize_feature_layout(feature_layout):
+            raise ValueError(
+                f"Checkpoint feature_layout={ck_fl!r} does not match "
+                f"--feature-layout {feature_layout!r}."
+            )
+
+    model = STNetRegression(
+        input_dim=input_dim,
+        num_outputs=1,
+        max_seq_len=sequencelength,
+    ).to(device)
+    if hasattr(model, "_orig_mod"):
+        model._orig_mod.load_state_dict(state_dict, strict=False)
+    else:
+        model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model, input_dim
+
+
+def map_bundle_to_arrays(
+    bundle: dict,
+    municipality_code: str,
+    *,
+    tiffpath,
+    year,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Yield, NDVI mean, NDVI peak arrays from a reconstruction bundle."""
+    common = dict(
+        tiles=bundle["tiles"],
+        tile_height=bundle["tile_height"],
+        tile_width=bundle["tile_width"],
+        municipality_code=municipality_code,
+        tiffpath=tiffpath,
+        year=year,
+    )
+    yield_arr = create_heatmap_array(bundle["prediction_map"], **common)
+    ndvi_mean = create_heatmap_array(bundle["ndvi_map"], **common)
+    ndvi_peak = create_heatmap_array(bundle["ndvi_map_median"], **common)
+    if yield_arr is None or ndvi_mean is None or ndvi_peak is None:
+        raise RuntimeError(f"Could not build heatmap arrays for {municipality_code}")
+    return yield_arr, ndvi_mean, ndvi_peak
+
+
+def run_municipality_inference(
+    model: STNetRegression,
+    input_dim: int,
+    municipality_code: str,
+    args,
+    device: torch.device,
+) -> dict | None:
+    (
+        prediction_map,
+        ndvi_map,
+        ndvi_map_median,
+        ndvi_map_per_month,
+        tiles,
+        tile_height,
+        tile_width,
+    ) = reconstruct_spatial_predictions(
+        model,
+        municipality_code,
+        args.datapath,
+        args.tiffpath,
+        args.year,
+        args.sequencelength,
+        args.rc,
+        args.interp,
+        args.chunk_size,
+        device,
+        seed=args.seed,
+        tiff_mode=args.tiff_mode,
+        year_range=args.year_range,
+        reference_date=args.reference_date,
+        input_dim=input_dim,
+    )
+    if prediction_map is None:
+        return None
+    return {
+        "prediction_map": prediction_map,
+        "ndvi_map": ndvi_map,
+        "ndvi_map_median": ndvi_map_median,
+        "ndvi_map_per_month": ndvi_map_per_month,
+        "tiles": tiles,
+        "tile_height": tile_height,
+        "tile_width": tile_width,
+    }
+
+
+def run_report_panel(args) -> None:
+    if args.compare_checkpoint is None:
+        raise SystemExit("--report-panel requires --compare-checkpoint")
+    if len(args.municipality_code) != 1:
+        raise SystemExit("--report-panel requires exactly one --municipality-code")
+
+    municipality_code = args.municipality_code[0]
+    device = torch.device(args.device)
+
+    if args.output_dir is None:
+        run_dir = run_dir_from_path(args.checkpoint)
+        args.output_dir = intramunicipal_heatmap_dir(run_dir, create=True)
+        if args.figures_subdir:
+            args.output_dir = args.output_dir / args.figures_subdir
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    file_stem = municipality_output_stem(
+        municipality_code, tiff_root=args.tiffpath
+    )
+    display_name = get_municipality_name(args.tiffpath, municipality_code)
+    panel_output = args.panel_output or (args.output_dir / f"{file_stem}_panel.png")
+
+    print(f"Loading sem-chuva checkpoint: {args.checkpoint}")
+    model_sem, dim_sem = load_stnet_from_checkpoint(
+        args.checkpoint, device, args.sequencelength, args.feature_layout
+    )
+    print(f"  input_dim={dim_sem}")
+
+    print(f"Loading com-chuva checkpoint: {args.compare_checkpoint}")
+    model_com, dim_com = load_stnet_from_checkpoint(
+        args.compare_checkpoint, device, args.sequencelength, args.feature_layout
+    )
+    print(f"  input_dim={dim_com}")
+
+    print(f"\nInference (sem chuva) for {display_name} ({municipality_code})...")
+    bundle_sem = run_municipality_inference(
+        model_sem, dim_sem, municipality_code, args, device
+    )
+    if bundle_sem is None:
+        raise SystemExit(f"Failed sem-chuva inference for {municipality_code}")
+
+    print(f"Inference (com chuva) for {display_name} ({municipality_code})...")
+    bundle_com = run_municipality_inference(
+        model_com, dim_com, municipality_code, args, device
+    )
+    if bundle_com is None:
+        raise SystemExit(f"Failed com-chuva inference for {municipality_code}")
+
+    common_kw = dict(
+        municipality_code=municipality_code,
+        tiffpath=args.tiffpath,
+        year=args.year,
+    )
+    yield_sem, ndvi_mean, ndvi_peak = map_bundle_to_arrays(bundle_sem, **common_kw)
+    yield_com, _, _ = map_bundle_to_arrays(bundle_com, **common_kw)
+
+    harvest = args.year_range or str(args.year)
+    title = f"{display_name} — safra {harvest.split('-')[-1] if '-' in str(harvest) else harvest}"
+
+    create_intramunicipal_report_panel(
+        yield_sem,
+        yield_com,
+        ndvi_mean,
+        ndvi_peak,
+        panel_output,
+        municipality_name=display_name,
+        title=title,
+        dpi=args.panel_dpi,
+    )
 
 
 def save_histogram(values, output_path, title, xlabel, bins=50):
@@ -1624,7 +2194,7 @@ def create_combined_heatmap(
     for municipality_code in municipality_codes:
         if tiffpath:
             name = get_municipality_name(tiffpath, municipality_code)
-            municipality_names.append(f"{name} ({municipality_code})")
+            municipality_names.append(name)
         else:
             municipality_names.append(municipality_code)
 
@@ -1710,8 +2280,226 @@ def create_combined_heatmap(
     print(f"  ✓ Saved combined heatmap to {output_path}")
 
 
+def save_yield_heatmap_only(
+    municipality_code,
+    prediction_map,
+    tiles,
+    tile_height,
+    tile_width,
+    output_dir: Path,
+    *,
+    tiffpath,
+    year,
+    suffix: str = "",
+    title_suffix: str = "",
+) -> bool:
+    """Save a single yield prediction heatmap (used for incomplete-series k=1..6)."""
+    if prediction_map is None:
+        return False
+    municipality_name = get_municipality_name(tiffpath, municipality_code)
+    file_stem = municipality_output_stem(municipality_code, tiff_root=tiffpath)
+    output_path = output_dir / f"{file_stem}_heatmap{suffix}.png"
+    plot_title = f"Yield Prediction Heatmap — {municipality_name}"
+    if title_suffix:
+        plot_title = f"{plot_title} ({title_suffix})"
+    print(f"Creating yield heatmap for {municipality_name} ({municipality_code})...")
+    create_heatmap(
+        prediction_map,
+        tiles,
+        tile_height,
+        tile_width,
+        output_path,
+        municipality_code,
+        tiffpath=tiffpath,
+        year=year,
+        title=plot_title,
+    )
+    return True
+
+
+def save_individual_municipality_figures(
+    municipality_code: str,
+    prediction_map,
+    ndvi_map,
+    ndvi_map_median,
+    ndvi_map_per_month,
+    tiles,
+    tile_height,
+    tile_width,
+    output_dir: Path,
+    *,
+    tiffpath,
+    year,
+    tiff_mode: str,
+) -> bool:
+    """Write yield / NDVI heatmaps and histograms for one municipality (no model inference)."""
+    if prediction_map is None:
+        return False
+
+    municipality_name = get_municipality_name(tiffpath, municipality_code)
+    file_stem = municipality_output_stem(municipality_code, tiff_root=tiffpath)
+
+    output_path = output_dir / f"{file_stem}_heatmap.png"
+    print(f"Creating heatmap visualization for {municipality_name} ({municipality_code})...")
+    create_heatmap(
+        prediction_map,
+        tiles,
+        tile_height,
+        tile_width,
+        output_path,
+        municipality_code,
+        tiffpath=tiffpath,
+        year=year,
+    )
+
+    ndvi_mean_suffix = (
+        "Mean (harvest year, after month 3)" if tiff_mode == "daily" else ""
+    )
+    ndvi_output = output_dir / f"{file_stem}_ndvi_heatmap.png"
+    print(f"Creating NDVI heatmap (mean) for {municipality_name}...")
+    create_ndvi_heatmap(
+        ndvi_map,
+        tiles,
+        tile_height,
+        tile_width,
+        ndvi_output,
+        municipality_code,
+        tiffpath=tiffpath,
+        year=year,
+        title_suffix=ndvi_mean_suffix,
+    )
+
+    pred_values = [v for v in prediction_map.values() if np.isfinite(v)]
+    if pred_values:
+        save_histogram(
+            pred_values,
+            output_dir / f"{file_stem}_predictions_histogram.png",
+            f"Yield predictions - {municipality_name}",
+            "Prediction (tons)",
+        )
+
+    ndvi_map = ndvi_map or {}
+    ndvi_map_median = ndvi_map_median or {}
+    ndvi_map_per_month = ndvi_map_per_month or {}
+
+    ndvi_values = [v for v in ndvi_map.values() if np.isfinite(v)]
+    if ndvi_values:
+        save_histogram(
+            ndvi_values,
+            output_dir / f"{file_stem}_ndvi_histogram.png",
+            f"NDVI (mean) - {municipality_name}",
+            "NDVI",
+        )
+
+    if tiff_mode == "daily":
+        ndvi_peak_output = output_dir / f"{file_stem}_ndvi_peak_heatmap.png"
+        print(f"Creating NDVI heatmap (peak = max over time) for {municipality_name}...")
+        create_ndvi_heatmap(
+            ndvi_map_median,
+            tiles,
+            tile_height,
+            tile_width,
+            ndvi_peak_output,
+            municipality_code,
+            tiffpath=tiffpath,
+            year=year,
+            title_suffix="Peak (max over time)",
+        )
+        ndvi_peak_values = [v for v in ndvi_map_median.values() if np.isfinite(v)]
+        if ndvi_peak_values:
+            save_histogram(
+                ndvi_peak_values,
+                output_dir / f"{file_stem}_ndvi_peak_histogram.png",
+                f"NDVI (peak) - {municipality_name}",
+                "NDVI",
+            )
+    else:
+        ndvi_median_output = output_dir / f"{file_stem}_ndvi_median_heatmap.png"
+        print(f"Creating NDVI heatmap (median) for {municipality_name}...")
+        create_ndvi_heatmap(
+            ndvi_map_median,
+            tiles,
+            tile_height,
+            tile_width,
+            ndvi_median_output,
+            municipality_code,
+            tiffpath=tiffpath,
+            year=year,
+            title_suffix="Median (6 months)",
+        )
+        ndvi_median_values = [v for v in ndvi_map_median.values() if np.isfinite(v)]
+        if ndvi_median_values:
+            save_histogram(
+                ndvi_median_values,
+                output_dir / f"{file_stem}_ndvi_median_histogram.png",
+                f"NDVI (median, 6 months) - {municipality_name}",
+                "NDVI",
+            )
+
+    month_names = {
+        1: "Jan",
+        2: "Feb",
+        3: "Mar",
+        4: "Apr",
+        5: "May",
+        6: "Jun",
+        7: "Jul",
+        8: "Aug",
+        9: "Sep",
+        10: "Oct",
+        11: "Nov",
+        12: "Dec",
+    }
+    for month in sorted(ndvi_map_per_month.keys()):
+        month_label = month_names.get(month, f"Month {month}")
+        month_suffix = f"Month {month:02d} ({month_label})"
+        print(f"  Creating NDVI heatmap for {month_suffix} ({municipality_name})...")
+        create_ndvi_heatmap(
+            ndvi_map_per_month[month],
+            tiles,
+            tile_height,
+            tile_width,
+            output_dir / f"{file_stem}_ndvi_heatmap_month_{month:02d}.png",
+            municipality_code,
+            tiffpath=tiffpath,
+            year=year,
+            title_suffix=month_suffix,
+        )
+        m_vals = [v for v in ndvi_map_per_month[month].values() if np.isfinite(v)]
+        if m_vals:
+            save_histogram(
+                m_vals,
+                output_dir / f"{file_stem}_ndvi_histogram_month_{month:02d}.png",
+                f"NDVI - {municipality_name} ({month_suffix})",
+                "NDVI",
+            )
+
+    if tiff_mode == "daily":
+        print(
+            f"\n✓ Done! Heatmaps, NDVI (mean + peak), and histograms saved to {output_dir}"
+        )
+    else:
+        print(
+            f"\n✓ Done! Heatmaps, NDVI (mean + median + per month), and histograms saved to {output_dir}"
+        )
+    return True
+
+
 def main():
     args = parse_args()
+
+    if args.incomplete_series:
+        if args.num_periods:
+            raise SystemExit("Use either --incomplete-series or --num-periods, not both.")
+        args.num_periods = list(range(1, 7))
+
+    if args.report_panel:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        run_report_panel(args)
+        return
 
     # Set random seed
     np.random.seed(args.seed)
@@ -1763,307 +2551,176 @@ def main():
     # Default figures output next to the checkpoint run
     if args.output_dir is None:
         run_dir = run_dir_from_path(args.checkpoint)
-        args.output_dir = figures_dir(run_dir, create=True)
+        args.output_dir = intramunicipal_heatmap_dir(run_dir, create=True)
         if args.figures_subdir:
             args.output_dir = args.output_dir / args.figures_subdir
+    if args.num_periods:
+        args.output_dir = args.output_dir / "incomplete_series"
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving figures to {args.output_dir}")
 
     municipality_codes = args.municipality_code
+    period_list = args.num_periods if args.num_periods else [None]
+    incomplete_mode = args.num_periods is not None
 
-    # Process each municipality
     heatmaps_data = []
 
     for municipality_code in municipality_codes:
-        # Generate spatial predictions
-        print(
-            f"\nGenerating pixel-level predictions for municipality {municipality_code}..."
-        )
-        (
-            prediction_map,
-            ndvi_map,
-            ndvi_map_median,
-            ndvi_map_per_month,
-            tiles,
-            tile_height,
-            tile_width,
-        ) = reconstruct_spatial_predictions(
-            model,
-            municipality_code,
-            args.datapath,
-            args.tiffpath,
-            args.year,
-            args.sequencelength,
-            args.rc,
-            args.interp,
-            args.chunk_size,
-            device,
-            seed=args.seed,
-            tiff_mode=args.tiff_mode,
-            year_range=args.year_range,
-            reference_date=args.reference_date,
-            input_dim=input_dim,
-        )
-
-        if prediction_map is None:
-            print(f"  ❌ Failed to generate predictions for {municipality_code}")
-            continue
-
-        if (
-            args.daily_ndvi
-            and args.tiff_mode == "daily"
-            and tile_height is not None
-            and tile_width is not None
-            and args.year_range is not None
-        ):
-            daily_dir = resolve_daily_tiff_dir(
-                args.tiffpath, municipality_code, args.year_range
+        for num_periods in period_list:
+            k_label = (
+                f" (first {num_periods} season month{'s' if num_periods != 1 else ''})"
+                if num_periods is not None
+                else ""
             )
-            if daily_dir is not None:
-                dated = []
-                for p in sorted(daily_dir.glob("*.tif*")):
-                    code, d = parse_daily_filename(p.name)
-                    if code == municipality_code and d is not None:
-                        dated.append((d, p))
-                dated.sort(key=lambda x: x[0])
-                daily_paths = [p for _, p in dated]
-                if daily_paths:
-                    print(
-                        f"  Saving {len(daily_paths)} daily NDVI heatmaps under "
-                        f"{args.output_dir / args.daily_ndvi_subdir / municipality_code} ..."
-                    )
-                    save_daily_ndvi_heatmaps_from_tiffs(
-                        municipality_code,
-                        daily_paths,
-                        args.output_dir,
-                        tile_height,
-                        tile_width,
-                        subdir_name=args.daily_ndvi_subdir,
-                    )
+            print(
+                f"\nGenerating pixel-level predictions for municipality "
+                f"{municipality_code}{k_label}..."
+            )
+            (
+                prediction_map,
+                ndvi_map,
+                ndvi_map_median,
+                ndvi_map_per_month,
+                tiles,
+                tile_height,
+                tile_width,
+            ) = reconstruct_spatial_predictions(
+                model,
+                municipality_code,
+                args.datapath,
+                args.tiffpath,
+                args.year,
+                args.sequencelength,
+                args.rc,
+                args.interp,
+                args.chunk_size,
+                device,
+                seed=args.seed,
+                tiff_mode=args.tiff_mode,
+                year_range=args.year_range,
+                reference_date=args.reference_date,
+                input_dim=input_dim,
+                num_periods=num_periods,
+            )
 
-        # Create heatmap array (without saving)
-        print(f"  Creating heatmap array for {municipality_code}...")
-        heatmap = create_heatmap_array(
-            prediction_map,
-            tiles,
-            tile_height,
-            tile_width,
-            municipality_code,
-            tiffpath=args.tiffpath,
-            year=args.year,
-        )
+            if prediction_map is None:
+                print(f"  ❌ Failed to generate predictions for {municipality_code}{k_label}")
+                continue
 
-        if heatmap is not None:
-            heatmaps_data.append((heatmap, tiles, municipality_code, ndvi_map))
+            if incomplete_mode:
+                suffix = f"_k{num_periods}"
+                save_yield_heatmap_only(
+                    municipality_code,
+                    prediction_map,
+                    tiles,
+                    tile_height,
+                    tile_width,
+                    args.output_dir,
+                    tiffpath=args.tiffpath,
+                    year=args.year,
+                    suffix=suffix,
+                    title_suffix=(
+                        f"first {num_periods} season month"
+                        + ("s" if num_periods != 1 else "")
+                    ),
+                )
+                continue
+
+            if (
+                args.daily_ndvi
+                and args.tiff_mode == "daily"
+                and tile_height is not None
+                and tile_width is not None
+                and args.year_range is not None
+            ):
+                daily_dir = resolve_daily_tiff_dir(
+                    args.tiffpath, municipality_code, args.year_range
+                )
+                if daily_dir is not None:
+                    dated = []
+                    for p in sorted(daily_dir.glob("*.tif*")):
+                        code, d = parse_daily_filename(p.name)
+                        if code == municipality_code and d is not None:
+                            dated.append((d, p))
+                    dated.sort(key=lambda x: x[0])
+                    daily_paths = [p for _, p in dated]
+                    if daily_paths:
+                        print(
+                            f"  Saving {len(daily_paths)} daily NDVI heatmaps under "
+                            f"{args.output_dir / args.daily_ndvi_subdir / municipality_code} ..."
+                        )
+                        save_daily_ndvi_heatmaps_from_tiffs(
+                            municipality_code,
+                            daily_paths,
+                            args.output_dir,
+                            tile_height,
+                            tile_width,
+                            subdir_name=args.daily_ndvi_subdir,
+                        )
+
+            print(f"  Creating heatmap array for {municipality_code}...")
+            heatmap = create_heatmap_array(
+                prediction_map,
+                tiles,
+                tile_height,
+                tile_width,
+                municipality_code,
+                tiffpath=args.tiffpath,
+                year=args.year,
+            )
+
+            if heatmap is None:
+                continue
+
+            heatmaps_data.append(
+                {
+                    "municipality_code": municipality_code,
+                    "prediction_map": prediction_map,
+                    "ndvi_map": ndvi_map,
+                    "ndvi_map_median": ndvi_map_median,
+                    "ndvi_map_per_month": ndvi_map_per_month,
+                    "tiles": tiles,
+                    "tile_height": tile_height,
+                    "tile_width": tile_width,
+                    "heatmap": heatmap,
+                }
+            )
+
+    if incomplete_mode:
+        print(f"\n✓ Done! Incomplete-series yield heatmaps saved to {args.output_dir}")
+        return
 
     if len(heatmaps_data) == 0:
         print("\n❌ No heatmaps were successfully created")
         return
 
-    # Create visualization(s)
     if len(heatmaps_data) == 1:
-        # Single municipality - recreate prediction_map and create individual heatmap
-        municipality_code = municipality_codes[0]
-        print(f"\nRecreating predictions for individual heatmap...")
-        (
-            prediction_map,
-            ndvi_map,
-            ndvi_map_median,
-            ndvi_map_per_month,
-            tiles,
-            tile_height,
-            tile_width,
-        ) = reconstruct_spatial_predictions(
-            model,
-            municipality_code,
-            args.datapath,
-            args.tiffpath,
-            args.year,
-            args.sequencelength,
-            args.rc,
-            args.interp,
-            args.chunk_size,
-            device,
-            seed=args.seed,
+        bundle = heatmaps_data[0]
+        if not save_individual_municipality_figures(
+            bundle["municipality_code"],
+            bundle["prediction_map"],
+            bundle["ndvi_map"],
+            bundle["ndvi_map_median"],
+            bundle["ndvi_map_per_month"],
+            bundle["tiles"],
+            bundle["tile_height"],
+            bundle["tile_width"],
+            args.output_dir,
+            tiffpath=args.tiffpath,
+            year=args.year,
             tiff_mode=args.tiff_mode,
-            year_range=args.year_range,
-            reference_date=args.reference_date,
-            input_dim=input_dim,
-        )
-
-        if prediction_map is not None:
-            municipality_name = (
-                get_municipality_name(args.tiffpath, municipality_code)
-                if args.tiffpath
-                else municipality_code
-            )
-
-            output_path = args.output_dir / f"{municipality_code}_heatmap.png"
-            print(f"Creating heatmap visualization...")
-            create_heatmap(
-                prediction_map,
-                tiles,
-                tile_height,
-                tile_width,
-                output_path,
-                municipality_code,
-                tiffpath=args.tiffpath,
-                year=args.year,
-            )
-
-            # NDVI heatmap (mean over months)
-            ndvi_output = args.output_dir / f"{municipality_code}_ndvi_heatmap.png"
-            print(f"Creating NDVI heatmap (mean)...")
-            create_ndvi_heatmap(
-                ndvi_map,
-                tiles,
-                tile_height,
-                tile_width,
-                ndvi_output,
-                municipality_code,
-                tiffpath=args.tiffpath,
-                year=args.year,
-            )
-
-            # Histogram of yield predictions
-            pred_values = [v for v in prediction_map.values() if np.isfinite(v)]
-            if pred_values:
-                save_histogram(
-                    pred_values,
-                    args.output_dir / f"{municipality_code}_predictions_histogram.png",
-                    f"Yield predictions - {municipality_name}",
-                    "Prediction (tons)",
-                )
-
-            # NDVI mean: over time in daily mode; over months in monthly_tiles mode
-            ndvi_map = ndvi_map or {}
-            ndvi_map_median = ndvi_map_median or {}
-            ndvi_map_per_month = ndvi_map_per_month or {}
-
-            ndvi_values = [v for v in ndvi_map.values() if np.isfinite(v)]
-            if ndvi_values:
-                save_histogram(
-                    ndvi_values,
-                    args.output_dir / f"{municipality_code}_ndvi_histogram.png",
-                    f"NDVI (mean) - {municipality_name}",
-                    "NDVI",
-                )
-
-            if args.tiff_mode == "daily":
-                ndvi_peak_output = (
-                    args.output_dir / f"{municipality_code}_ndvi_peak_heatmap.png"
-                )
-                print(f"Creating NDVI heatmap (peak = max over time)...")
-                create_ndvi_heatmap(
-                    ndvi_map_median,
-                    tiles,
-                    tile_height,
-                    tile_width,
-                    ndvi_peak_output,
-                    municipality_code,
-                    tiffpath=args.tiffpath,
-                    year=args.year,
-                    title_suffix="Peak (max over time)",
-                )
-                ndvi_peak_values = [v for v in ndvi_map_median.values() if np.isfinite(v)]
-                if ndvi_peak_values:
-                    save_histogram(
-                        ndvi_peak_values,
-                        args.output_dir
-                        / f"{municipality_code}_ndvi_peak_histogram.png",
-                        f"NDVI (peak) - {municipality_name}",
-                        "NDVI",
-                    )
-            else:
-                # NDVI heatmap and histogram (median over months)
-                ndvi_median_output = (
-                    args.output_dir / f"{municipality_code}_ndvi_median_heatmap.png"
-                )
-                print(f"Creating NDVI heatmap (median)...")
-                create_ndvi_heatmap(
-                    ndvi_map_median,
-                    tiles,
-                    tile_height,
-                    tile_width,
-                    ndvi_median_output,
-                    municipality_code,
-                    tiffpath=args.tiffpath,
-                    year=args.year,
-                    title_suffix="Median (6 months)",
-                )
-                ndvi_median_values = [
-                    v for v in ndvi_map_median.values() if np.isfinite(v)
-                ]
-                if ndvi_median_values:
-                    save_histogram(
-                        ndvi_median_values,
-                        args.output_dir
-                        / f"{municipality_code}_ndvi_median_histogram.png",
-                        f"NDVI (median, 6 months) - {municipality_name}",
-                        "NDVI",
-                    )
-
-            # Per-month NDVI heatmaps and histograms (one per TIFF month)
-            month_names = {
-                1: "Jan",
-                2: "Feb",
-                3: "Mar",
-                4: "Apr",
-                5: "May",
-                6: "Jun",
-                7: "Jul",
-                8: "Aug",
-                9: "Sep",
-                10: "Oct",
-                11: "Nov",
-                12: "Dec",
-            }
-            for month in sorted(ndvi_map_per_month.keys()):
-                month_label = month_names.get(month, f"Month {month}")
-                month_suffix = f"Month {month:02d} ({month_label})"
-                print(f"  Creating NDVI heatmap for {month_suffix}...")
-                create_ndvi_heatmap(
-                    ndvi_map_per_month[month],
-                    tiles,
-                    tile_height,
-                    tile_width,
-                    args.output_dir
-                    / f"{municipality_code}_ndvi_heatmap_month_{month:02d}.png",
-                    municipality_code,
-                    tiffpath=args.tiffpath,
-                    year=args.year,
-                    title_suffix=month_suffix,
-                )
-                m_vals = [
-                    v for v in ndvi_map_per_month[month].values() if np.isfinite(v)
-                ]
-                if m_vals:
-                    save_histogram(
-                        m_vals,
-                        args.output_dir
-                        / f"{municipality_code}_ndvi_histogram_month_{month:02d}.png",
-                        f"NDVI - {municipality_name} ({month_suffix})",
-                        "NDVI",
-                    )
-
-            if args.tiff_mode == "daily":
-                print(
-                    f"\n✓ Done! Heatmaps, NDVI (mean + peak), and histograms saved to {args.output_dir}"
-                )
-            else:
-                print(
-                    f"\n✓ Done! Heatmaps, NDVI (mean + median + per month), and histograms saved to {args.output_dir}"
-                )
-        else:
-            print(f"\n❌ Failed to create individual heatmap")
+        ):
+            print("\n❌ Failed to create individual heatmap")
     else:
-        # Multiple municipalities - create combined heatmap
         output_path = (
             args.output_dir / f"{'_'.join(municipality_codes)}_combined_heatmap.png"
         )
         print(f"\nCreating combined heatmap visualization...")
         create_combined_heatmap(
-            heatmaps_data,
+            [
+                (b["heatmap"], b["tiles"], b["municipality_code"], b["ndvi_map"])
+                for b in heatmaps_data
+            ],
             output_path,
             municipality_codes,
             tiffpath=args.tiffpath,
