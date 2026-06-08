@@ -33,7 +33,6 @@ from typing import Any, Optional
 
 import ee
 import geopandas as gpd
-
 from drive_api import (
     build_drive_service,
     delete_file_from_drive,
@@ -320,9 +319,7 @@ def run_one_municipality(
     raw_d = (
         Path(args.raw_dir).resolve()
         if getattr(args, "raw_dir", None) is not None
-        else raw_dir_for_date(
-            args.output_dir, municipality_code, year_start, year_end
-        )
+        else raw_dir_for_date(args.output_dir, municipality_code, year_start, year_end)
     )
     if raw_d.exists():
         existing_dates = set()
