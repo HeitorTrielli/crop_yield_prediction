@@ -9,13 +9,13 @@ Days with no valid pixels for a municipality are skipped. No-data: 0, -9999, NaN
 
 CLI usage:
   # Defaults: tiff-dir=files/raw_tiff/2022-2023/parana, shapefile-dir=files/shapefiles, output-dir=files/daily_tiff
-  python clip_tiffs_to_shapefiles.py
+  python preprocessing/clip_tiffs_to_shapefiles.py
 
   # Custom paths and 20 parallel workers
-  python clip_tiffs_to_shapefiles.py --tiff-dir files/raw_tiff/2022-2023/parana --shapefile-dir files/shapefiles --output-dir files/daily_tiff -j 20
+  python preprocessing/clip_tiffs_to_shapefiles.py --tiff-dir files/raw_tiff/2022-2023/parana --shapefile-dir files/shapefiles --output-dir files/daily_tiff -j 20
 
   # Single shapefile(s) instead of directory
-  python clip_tiffs_to_shapefiles.py --shapefile path/to/4100103.shp --shapefile path/to/4100202.shp -j 20
+  python preprocessing/clip_tiffs_to_shapefiles.py --shapefile path/to/4100103.shp --shapefile path/to/4100202.shp -j 20
 """
 
 from __future__ import annotations

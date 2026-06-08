@@ -322,7 +322,7 @@ def parse_args() -> argparse.Namespace:
         "--tiffpath",
         type=Path,
         default=Path("files/daily_tiff"),
-        help="Daily TIFF root (see create_pixel_heatmap / clip_tiffs_to_shapefiles layout)",
+        help="Daily TIFF root (see create_pixel_heatmap / preprocessing/clip_tiffs_to_shapefiles layout)",
     )
     p.add_argument(
         "--year-range",

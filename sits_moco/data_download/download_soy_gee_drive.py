@@ -5,7 +5,7 @@ Download Brazilian soybean Sentinel-2 daily imagery from Google Earth Engine.
 Uses MapBiomas year-X soy classification to mask pixels. By default fetches the
 soybean growth cycle Oct (X-1)--Mar (X); optional --start-date/--end-date override.
 Exports to Google Drive, then downloads the exact GEE files to local .../raw/ and deletes them from Drive (no merge).
-To merge raw tiles into .tiff later, use data_download/merge_gee_tiles_to_tiff.py (raw files are never deleted locally).
+To merge raw tiles into .tiff later, use preprocessing/merge_gee_tiles_to_tiff.py (raw files are never deleted locally).
 Output: raw_tiff/{year_start}-{year_end}/{municipality}/raw/<exact GEE filename>.
 Per-municipality download_log.csv (date, status, note) for retries and progress.
 

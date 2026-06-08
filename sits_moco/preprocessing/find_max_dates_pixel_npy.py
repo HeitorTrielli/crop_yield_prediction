@@ -16,12 +16,12 @@ Use this to choose --sequencelength (≥ max_T over the seasons you train on, or
 subsampling cap).
 
 Usage:
-  python find_max_dates_pixel_npy.py --root files/npy
-  python find_max_dates_pixel_npy.py --root files/npy/2022-2023
-  python find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021
-  python find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021 2021-2022
-  python find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021,2021-2022
-  python find_max_dates_pixel_npy.py --root files/npy --no-progress
+  python preprocessing/find_max_dates_pixel_npy.py --root files/npy
+  python preprocessing/find_max_dates_pixel_npy.py --root files/npy/2022-2023
+  python preprocessing/find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021
+  python preprocessing/find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021 2021-2022
+  python preprocessing/find_max_dates_pixel_npy.py --root files/npy --exclude 2020-2021,2021-2022
+  python preprocessing/find_max_dates_pixel_npy.py --root files/npy --no-progress
 """
 from __future__ import annotations
 

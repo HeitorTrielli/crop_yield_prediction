@@ -12,8 +12,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import time
 import tempfile
+import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
@@ -42,7 +42,10 @@ import rasterio
 from rasterio.warp import Resampling, reproject
 from tqdm import tqdm
 
-from preprocess_tiff_to_npy import date_to_season_doy, season_start_from_year_range
+from preprocessing.preprocess_tiff_to_npy import (
+    date_to_season_doy,
+    season_start_from_year_range,
+)
 
 NO_DATA_VALUE = -9999
 NUM_SPECTRAL_BANDS = 10
