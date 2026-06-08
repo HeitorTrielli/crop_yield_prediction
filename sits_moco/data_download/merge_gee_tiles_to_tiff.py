@@ -2,14 +2,14 @@
 """
 Merge GEE tile .tif files (e.g. from .../raw/) into a single .tiff mosaic per date.
 
-Use when you have raw tiles from download_soy_gee_drive.py under .../raw/:
+Use when you have raw tiles from data_download/download_soy_gee_drive.py under .../raw/:
 - .tif tiles: state_41_2022-10-02-0000000000-0000009984.tif, etc.
 
 This script groups by date, merges with rasterio, and writes one .tiff per date.
 Raw .tif files are never deleted (kept as archive).
 
 Usage:
-  python merge_gee_tiles_to_tiff.py --dir files/raw_tiff/2022-2023/parana/raw
+  python data_download/merge_gee_tiles_to_tiff.py --dir files/raw_tiff/2022-2023/parana/raw
   (merged .tiff files go to parent dir by default, e.g. .../parana/state_41_YYYY_MM_DD.tiff)
 """
 

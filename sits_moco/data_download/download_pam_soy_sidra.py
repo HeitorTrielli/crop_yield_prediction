@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Download PAM soybean data from IBGE SIDRA for Paraná municipalities."""
+"""Download PAM soybean data from IBGE SIDRA for Paraná municipalities.
+
+Usage:
+  python data_download/download_pam_soy_sidra.py
+  python data_download/download_pam_soy_sidra.py --years 2019-2024 --output files/pam_soy_pr.csv
+"""
 
 from __future__ import annotations
 

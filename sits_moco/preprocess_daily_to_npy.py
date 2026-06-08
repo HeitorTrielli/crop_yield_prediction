@@ -4,7 +4,7 @@ Preprocess daily municipal TIFFs (from clip_tiffs_to_shapefiles) to .npy.
 
 Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/, stacks to
 [num_pixels, num_days, 11] (10 bands + DOY), or [N, T, 13] with --xavier-pr-nc
-(two Xavier rain channels; see xavier_rain_for_daily_npy.py).
+(two Xavier rain channels; see data_download/xavier_rain_for_daily_npy.py).
 """
 
 from __future__ import annotations
@@ -261,7 +261,9 @@ def process_municipality(
     out[:, :, 10] = doy_broadcast
 
     if xavier_pr_work is not None:
-        from xavier_rain_for_daily_npy import compute_rain_block_for_municipality
+        from data_download.xavier_rain_for_daily_npy import (
+            compute_rain_block_for_municipality,
+        )
 
         rows = (idx_final // width).astype(np.int64)
         cols = (idx_final % width).astype(np.int64)

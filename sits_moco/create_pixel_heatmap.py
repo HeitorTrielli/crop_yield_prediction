@@ -830,7 +830,7 @@ def reconstruct_spatial_predictions(
             print(
                 "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
                 f"{municipality_data.shape[-1]} channels per timestep. "
-                "Run xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
+                "Run data_download/xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
             )
 
         # Recompute keep-mask in the exact same way as preprocess_daily_to_npy
@@ -961,7 +961,7 @@ def reconstruct_spatial_predictions(
         print(
             "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
             f"{municipality_data.shape[-1]} channels per timestep. "
-            "Run xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
+            "Run data_download/xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
         )
 
     # Group TIFF files by month
