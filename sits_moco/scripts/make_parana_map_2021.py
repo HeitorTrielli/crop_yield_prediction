@@ -30,7 +30,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from run_paths import model_best_in_run, municipal_heatmaps_dir, predictions_dir, run_dir_from_path
+from run_paths import (
+    model_best_in_run,
+    municipal_heatmaps_dir,
+    predictions_dir,
+    run_dir_from_path,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +72,9 @@ def parse_args() -> argparse.Namespace:
         help="Map PNG (default: {run_dir}/figures/municipal_heatmaps/map_pr_error_2021.png)",
     )
     p.add_argument("--sequencelength", type=int, default=45)
-    p.add_argument("--seed", type=int, default=6003, help="Match training seed for run name parity")
+    p.add_argument(
+        "--seed", type=int, default=6003, help="Match training seed for run name parity"
+    )
     p.add_argument(
         "--skip-predict",
         action="store_true",
@@ -86,14 +93,18 @@ def main() -> None:
     )
 
     if args.checkpoint is None:
-        run_guess = root / "results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_2024_Seed6003"
+        run_guess = (
+            root / "results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_2024_Seed6003"
+        )
         args.checkpoint = model_best_in_run(run_guess)
     else:
         args.checkpoint = Path(args.checkpoint)
 
     run_dir = run_dir_from_path(args.checkpoint)
     if args.output_csv is None:
-        args.output_csv = predictions_dir(run_dir, create=True) / "yield_forecasts_2021_pr.csv"
+        args.output_csv = (
+            predictions_dir(run_dir, create=True) / "yield_forecasts_2021_pr.csv"
+        )
     if args.output_map is None:
         args.output_map = (
             municipal_heatmaps_dir(run_dir, create=True) / "map_pr_error_2021.png"

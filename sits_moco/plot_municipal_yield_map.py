@@ -47,13 +47,17 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from matplotlib import gridspec
 import numpy as np
 import pandas as pd
-from matplotlib.colors import Normalize
+from matplotlib import gridspec
 from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 
-from run_paths import municipal_heatmaps_dir, run_dir_from_forecasts_csv, run_dir_from_path
+from run_paths import (
+    municipal_heatmaps_dir,
+    run_dir_from_forecasts_csv,
+    run_dir_from_path,
+)
 
 try:
     import geopandas as gpd
@@ -79,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         "--state",
         type=str,
         default="PR",
-        help='IBGE state: two-letter code (e.g. PR) or numeric code (e.g. 41 for Paraná). Default: PR',
+        help="IBGE state: two-letter code (e.g. PR) or numeric code (e.g. 41 for Paraná). Default: PR",
     )
     p.add_argument(
         "--mesh-year",
@@ -224,7 +228,9 @@ def _ensure_derived_columns(
                 pct = np.where(np.abs(acv) > 1e-9, 100.0 * (fcv - acv) / acv, np.nan)
             out["pct_error"] = pct
         if "abs_pct_error" not in out.columns:
-            out["abs_pct_error"] = pd.to_numeric(out["pct_error"], errors="coerce").abs()
+            out["abs_pct_error"] = pd.to_numeric(
+                out["pct_error"], errors="coerce"
+            ).abs()
         # |forecast - actual| / max(|actual|, floor) as percent
         ft = max(float(relative_error_floor_tons), 1e-9)
         denom = np.maximum(np.abs(acv), ft)
@@ -288,7 +294,9 @@ def plot_composite_forecast_actual(
     df_plot = plot_df.assign(
         _fc=fc,
         _ac=ac,
-    )[["muni_key", "_fc", "_ac"]].drop_duplicates(subset=["muni_key"])
+    )[
+        ["muni_key", "_fc", "_ac"]
+    ].drop_duplicates(subset=["muni_key"])
 
     gdf = mun.merge(df_plot, on="muni_key", how="inner")
     if len(gdf) == 0:
@@ -356,11 +364,7 @@ def plot_composite_forecast_actual(
             ax.set_axis_off()
             ax.set_title(subt, fontsize=14, pad=10)
 
-        supt = (
-            title
-            if title
-            else f"Previsão vs observado ({state}) — {csv_name}"
-        )
+        supt = title if title else f"Previsão vs observado ({state}) — {csv_name}"
         fig.suptitle(supt, fontsize=16, y=0.96)
 
         # One shared colorbar for both panels (no duplicated scales)
@@ -376,9 +380,7 @@ def plot_composite_forecast_actual(
         cbar.set_label("Produção (t)", fontsize=12, labelpad=8)
         cbar.ax.tick_params(labelsize=10)
         # Readable thousands for large tonnage (e.g. 350000 → 350 000)
-        tons_fmt = mticker.FuncFormatter(
-            lambda x, _: f"{x:,.0f}".replace(",", " ")
-        )
+        tons_fmt = mticker.FuncFormatter(lambda x, _: f"{x:,.0f}".replace(",", " "))
         cbar.ax.xaxis.set_major_formatter(tons_fmt)
 
     out = Path(output_path).resolve()
@@ -386,7 +388,9 @@ def plot_composite_forecast_actual(
     plt.savefig(out, dpi=dpi, bbox_inches="tight")
     plt.close()
     print(f"Saved composite map: {out}")
-    print(f"  cmap={cmap!r}, shared scale [{vmin:.1f}, {vmax:.1f}] t, {len(gdf)} municipalities")
+    print(
+        f"  cmap={cmap!r}, shared scale [{vmin:.1f}, {vmax:.1f}] t, {len(gdf)} municipalities"
+    )
 
 
 def _gdf_for_column(
@@ -395,9 +399,9 @@ def _gdf_for_column(
     plot_df = df.copy()
     plot_df["muni_key"] = _normalize_muni_code(plot_df["municipality_code"])
     values = pd.to_numeric(plot_df[column], errors="coerce")
-    df_plot = plot_df.assign(_plot_value=values)[["muni_key", "_plot_value"]].drop_duplicates(
-        subset=["muni_key"]
-    )
+    df_plot = plot_df.assign(_plot_value=values)[
+        ["muni_key", "_plot_value"]
+    ].drop_duplicates(subset=["muni_key"])
     gdf = mun.merge(df_plot, on="muni_key", how="inner")
     if len(gdf) == 0:
         raise SystemExit(
@@ -477,9 +481,7 @@ def plot_composite_yield_trio(
         )
         cbar.set_label("Produção municipal (t)", fontsize=12, labelpad=8)
         cbar.ax.tick_params(labelsize=10)
-        tons_fmt = mticker.FuncFormatter(
-            lambda x, _: f"{x:,.0f}".replace(",", " ")
-        )
+        tons_fmt = mticker.FuncFormatter(lambda x, _: f"{x:,.0f}".replace(",", " "))
         cbar.ax.xaxis.set_major_formatter(tons_fmt)
 
     out = Path(output_path).resolve()
@@ -493,9 +495,7 @@ def plot_composite_yield_trio(
     )
 
 
-def _scale_from_dfs_column(
-    dfs: list[pd.DataFrame], column: str
-) -> tuple[float, float]:
+def _scale_from_dfs_column(dfs: list[pd.DataFrame], column: str) -> tuple[float, float]:
     return _yield_scale_from_dfs(dfs, columns=(column,))
 
 
@@ -542,7 +542,12 @@ def plot_composite_error_grid(
     )
     panels: list[tuple[str, str, str, str]] = [
         ("abs_error", "Erro absoluto", "Erro absoluto (t)", "Δ erro absoluto (t)"),
-        ("abs_pct_error", "Erro relativo", "|erro| / observado (%)", "Δ erro relativo (p.p.)"),
+        (
+            "abs_pct_error",
+            "Erro relativo",
+            "|erro| / observado (%)",
+            "Δ erro relativo (p.p.)",
+        ),
         ("smape_pct", "sMAPE (simétrico)", "sMAPE (%)", "Δ sMAPE (p.p.)"),
     ]
 
@@ -574,8 +579,22 @@ def plot_composite_error_grid(
         )
         if title:
             fig.suptitle(title, fontsize=14, y=0.97)
-        fig.text(0.18, 0.915, "Sem dados de chuva", ha="center", fontsize=11, fontweight="600")
-        fig.text(0.50, 0.915, "Com dados de chuva", ha="center", fontsize=11, fontweight="600")
+        fig.text(
+            0.18,
+            0.915,
+            "Sem dados de chuva",
+            ha="center",
+            fontsize=11,
+            fontweight="600",
+        )
+        fig.text(
+            0.50,
+            0.915,
+            "Com dados de chuva",
+            ha="center",
+            fontsize=11,
+            fontweight="600",
+        )
         fig.text(
             0.82,
             0.915,
@@ -731,9 +750,9 @@ def plot_choropleth_column(
     plot_df = df.copy()
     plot_df["muni_key"] = _normalize_muni_code(plot_df["municipality_code"])
     values = pd.to_numeric(plot_df[column], errors="coerce")
-    df_plot = plot_df.assign(_plot_value=values)[["muni_key", "_plot_value"]].drop_duplicates(
-        subset=["muni_key"]
-    )
+    df_plot = plot_df.assign(_plot_value=values)[
+        ["muni_key", "_plot_value"]
+    ].drop_duplicates(subset=["muni_key"])
 
     gdf = mun.merge(df_plot, on="muni_key", how="inner")
     if len(gdf) == 0:
@@ -744,7 +763,9 @@ def plot_choropleth_column(
 
     missing = len(df_plot) - len(gdf)
     if missing > 0:
-        print(f"  Note: {missing} CSV row(s) had no matching polygon (wrong state or code).")
+        print(
+            f"  Note: {missing} CSV row(s) had no matching polygon (wrong state or code)."
+        )
 
     col = "_plot_value"
     arr = gdf[col].to_numpy(dtype=float)
@@ -825,9 +846,13 @@ def main() -> None:
                 "--all-maps requires columns 'forecast' and 'actual_yield' in the CSV."
             )
         if "abs_error" not in df.columns:
-            raise SystemExit("Could not derive abs_error (need forecast and actual_yield).")
+            raise SystemExit(
+                "Could not derive abs_error (need forecast and actual_yield)."
+            )
         if "rel_abs_err_pct" not in df.columns:
-            raise SystemExit("Could not derive rel_abs_err_pct (need forecast and actual_yield).")
+            raise SystemExit(
+                "Could not derive rel_abs_err_pct (need forecast and actual_yield)."
+            )
         print(
             "--all-maps: ignoring --column; writing "
             "forecast, actual_yield, abs_error (t), rel_abs_err_pct "
@@ -851,7 +876,10 @@ def main() -> None:
             if "abs_error" not in df.columns:
                 raise SystemExit("Cannot compute abs_error from this CSV.")
 
-        if args.column in ("pct_error", "abs_pct_error") and args.column not in df.columns:
+        if (
+            args.column in ("pct_error", "abs_pct_error")
+            and args.column not in df.columns
+        ):
             df = _ensure_derived_columns(
                 df, relative_error_floor_tons=args.relative_error_floor_tons
             )
@@ -895,7 +923,11 @@ def main() -> None:
 
     if args.report_yield_maps or args.report_error_maps:
         if args.compare_forecasts_csv is None:
-            need = "--report-yield-maps" if args.report_yield_maps else "--report-error-maps"
+            need = (
+                "--report-yield-maps"
+                if args.report_yield_maps
+                else "--report-error-maps"
+            )
             raise SystemExit(f"{need} requires --compare-forecasts-csv")
         csv_com = Path(args.compare_forecasts_csv).resolve()
         if not csv_com.is_file():
@@ -1029,9 +1061,7 @@ def main() -> None:
     elif args.column == "abs_pct_error":
         legend_single = "abs_pct_error (% vs actual)"
     elif args.column == "rel_abs_err_pct":
-        legend_single = (
-            f"|forecast−actual| / max(observed, {args.relative_error_floor_tons:g} t) (%)"
-        )
+        legend_single = f"|forecast−actual| / max(observed, {args.relative_error_floor_tons:g} t) (%)"
 
     plot_choropleth_column(
         df,

@@ -26,6 +26,7 @@ the legacy behaviour.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from datetime import date
 from pathlib import Path
 
@@ -39,12 +40,13 @@ from rasterio.warp import Resampling, reproject
 from torch.amp import autocast
 from tqdm import tqdm
 
-import importlib.util
-
 from datasets.pixel_transform import PixelTransform
 from models import STNetRegression
 from run_paths import predictions_dir, run_dir_from_path
-from utils_aggregated import regression_metrics, stnet_regression_input_dim_from_state_dict
+from utils_aggregated import (
+    regression_metrics,
+    stnet_regression_input_dim_from_state_dict,
+)
 
 
 def recursive_todevice(x, device):
@@ -192,7 +194,9 @@ def compute_daily_valid_pixel_mask_fast(daily_tiffs: list[Path]) -> np.ndarray |
     return _compute_daily_valid_pixel_mask(daily_tiffs, force_reproject=False)
 
 
-def compute_daily_valid_pixel_mask_reproject(daily_tiffs: list[Path]) -> np.ndarray | None:
+def compute_daily_valid_pixel_mask_reproject(
+    daily_tiffs: list[Path],
+) -> np.ndarray | None:
     """Valid-pixel mask with every day warped onto the first TIFF grid."""
     return _compute_daily_valid_pixel_mask(daily_tiffs, force_reproject=True)
 
@@ -361,8 +365,14 @@ def parse_args() -> argparse.Namespace:
         help="Max time-series length (default: 45)",
     )
     p.add_argument("--rc", action="store_true", help="Random choice subsampling")
-    p.add_argument("--interp", action="store_true", help="Interpolate time series to sequencelength")
-    p.add_argument("--chunk-size", type=int, default=2000, help="Pixels per forward pass")
+    p.add_argument(
+        "--interp",
+        action="store_true",
+        help="Interpolate time series to sequencelength",
+    )
+    p.add_argument(
+        "--chunk-size", type=int, default=2000, help="Pixels per forward pass"
+    )
     p.add_argument("-d", "--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=27)
     p.add_argument(
@@ -411,7 +421,9 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def resolve_muni_npy(datapath: Path, municipality_code: str, year_range: str) -> Path | None:
+def resolve_muni_npy(
+    datapath: Path, municipality_code: str, year_range: str
+) -> Path | None:
     """Find municipality .npy under datapath (flat or year-range subfolder)."""
     candidates = [
         datapath / municipality_code / f"{municipality_code}.npy",
@@ -503,7 +515,11 @@ def _run_model_chunk(model, chunk, device) -> np.ndarray:
     chunk_doy = torch.stack([p[2] for p in chunk])
     chunk_weight = torch.stack([p[3] for p in chunk])
     batch = recursive_todevice((chunk_x, chunk_mask, chunk_doy, chunk_weight), device)
-    ctx = autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.no_grad()
+    ctx = (
+        autocast("cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else torch.no_grad()
+    )
     with ctx:
         preds = model(batch)
     if preds.dim() == 1:
@@ -633,7 +649,12 @@ def forecast_for_talhao(
     return float(vals.sum()), int(vals.size)
 
 
-def load_model(checkpoint_path: Path, device: torch.device, sequencelength: int, feature_layout: str):
+def load_model(
+    checkpoint_path: Path,
+    device: torch.device,
+    sequencelength: int,
+    feature_layout: str,
+):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint["model_state"]
     input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
@@ -706,7 +727,9 @@ def main() -> None:
     if args.reproject_tiffs:
         print("Valid-pixel mask: reproject each daily TIFF (slow)")
     else:
-        print("Valid-pixel mask: direct read when grids match, else warp + .keep_mask.npy cache")
+        print(
+            "Valid-pixel mask: direct read when grids match, else warp + .keep_mask.npy cache"
+        )
     pixel_transform = PixelTransform(
         args.sequencelength,
         feature_layout,
@@ -744,7 +767,9 @@ def main() -> None:
                 failed.append(str(row["talhao_key"]))
             continue
 
-        ref_transform, ref_crs, height, width = _reference_grid_from_first_tiff(daily_tiffs)
+        ref_transform, ref_crs, height, width = _reference_grid_from_first_tiff(
+            daily_tiffs
+        )
         if ref_transform is None:
             for _, row in group.iterrows():
                 failed.append(str(row["talhao_key"]))
@@ -849,7 +874,9 @@ def main() -> None:
                 sub["forecast"].values,
                 sub["baseline_tons"].values,
             )
-            print(f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):")
+            print(
+                f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):"
+            )
             print(f"  RMSE: {metrics_t['rmse']:.2f}")
             print(f"  MAE:  {metrics_t['mae']:.2f}")
             print(f"  R²:   {metrics_t['r2']:.4f}")
@@ -861,7 +888,9 @@ def main() -> None:
                     sub_ha["forecast_t_ha"].values,
                     sub_ha["baseline_t_ha"].values,
                 )
-                print(f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):")
+                print(
+                    f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):"
+                )
                 print(f"  RMSE: {metrics_ha['rmse']:.2f}")
                 print(f"  MAE:  {metrics_ha['mae']:.2f}")
                 print(f"  R²:   {metrics_ha['r2']:.4f}")

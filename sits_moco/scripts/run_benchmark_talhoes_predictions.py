@@ -185,7 +185,9 @@ def run_one(
 
 def main() -> None:
     args = parse_args()
-    default_run = _ROOT / "results" / "Yield_STNetRegression_Pad_Hy_2020_2022_2023_Seed6007"
+    default_run = (
+        _ROOT / "results" / "Yield_STNetRegression_Pad_Hy_2020_2022_2023_Seed6007"
+    )
 
     if args.checkpoint is None:
         args.checkpoint = model_best_in_run(default_run)
