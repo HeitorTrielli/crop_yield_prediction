@@ -48,7 +48,7 @@ def parse_args():
         "--output-csv",
         type=str,
         default=None,
-        help="Output CSV file path for forecasts (default: auto-generated with split suffix if using --eval-only, etc.)",
+        help="Output CSV path (default: auto-generated; split suffix if using --test-only, etc.)",
     )
     parser.add_argument(
         "--municipalities-csv",
@@ -81,9 +81,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--eval-only",
+        "--test-only",
         action="store_true",
-        help="Only predict municipalities in the 'eval' split (requires --yield-csv)",
+        help="Only predict municipalities in the 'test' split",
     )
     parser.add_argument(
         "--valid-only",
@@ -258,8 +258,8 @@ def main():
 
     # Check if user wants to filter by split
     split_filter = None
-    if args.eval_only:
-        split_filter = "eval"
+    if args.test_only:
+        split_filter = "test"
     elif args.valid_only:
         split_filter = "valid"
     elif args.train_only:
@@ -268,7 +268,7 @@ def main():
     if args.restrict_to_yield_year:
         if split_filter:
             raise ValueError(
-                "--restrict-to-yield-year cannot be used with --eval-only / --valid-only / --train-only"
+                "--restrict-to-yield-year cannot be used with --test-only / --valid-only / --train-only"
             )
         if args.yield_year is None:
             raise ValueError("--restrict-to-yield-year requires --yield-year")

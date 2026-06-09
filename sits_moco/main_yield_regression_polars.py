@@ -422,7 +422,7 @@ def train(args):
         args.rc,
         args.interp,
         args.seed,
-        mode="eval",
+        mode="test",
         target_mean=target_mean,
         target_std=target_std,
         harvest_years=args.harvest_years_set,

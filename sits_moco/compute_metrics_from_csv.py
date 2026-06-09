@@ -1,6 +1,6 @@
 """
 Script to compute evaluation metrics (RMSE, MAE, R²) directly from a CSV file with forecasts.
-Can filter by split (eval, valid, train) or compute for all splits.
+Can filter by split (train, valid, test) or compute for all splits.
 """
 
 import argparse
@@ -35,8 +35,8 @@ def parse_args():
         "--split",
         type=str,
         default=None,
-        choices=["train", "valid", "eval"],
-        help="Filter by split (train/valid/eval). If None, computes metrics for all splits separately",
+        choices=["train", "valid", "test"],
+        help="Filter by split (train/valid/test). If None, computes metrics for all splits separately",
     )
     parser.add_argument(
         "--output-csv",
@@ -164,7 +164,7 @@ def main():
             )
         )
     elif "split" in forecasts_df.columns:
-        for split_name in ["train", "valid", "eval"]:
+        for split_name in ["train", "valid", "test"]:
             print(f"\nComputing metrics for '{split_name}' split...")
             all_metrics.append(
                 compute_metrics_for_split(

@@ -3,7 +3,7 @@
 
 Usage:
   python data_download/download_pam_soy_sidra.py
-  python add_train_valid_test_split.py   # adds split column (default test year: 2021)
+  python add_train_valid_test_split.py --holdout-years 2021
 """
 
 from __future__ import annotations
