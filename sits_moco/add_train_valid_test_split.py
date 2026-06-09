@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+
 def add_split_to_csv(
     yield_csv,
     test_years=None,
@@ -55,24 +56,16 @@ def add_split_to_csv(
     print(f"Loading yield CSV from {yield_csv}...")
     yield_df = pd.read_csv(yield_csv)
 
-    # Find municipality code column
-    municipality_code_col = None
-    for col in ["municipality_code", "code", "municipality", "muni_code"]:
-        if col in yield_df.columns:
-            municipality_code_col = col
-            break
-
-    if municipality_code_col is None:
+    municipality_code_col = "municipality_code"
+    year_col = "year"
+    if municipality_code_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find municipality code column in {yield_csv}. "
+            f"Yield CSV missing {municipality_code_col!r} in {yield_csv}. "
             f"Available columns: {list(yield_df.columns)}"
         )
-
-    # Year column is always 'year'
-    year_col = "year"
     if year_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find 'year' column in {yield_csv}. "
+            f"Yield CSV missing {year_col!r} in {yield_csv}. "
             f"Available columns: {list(yield_df.columns)}"
         )
 
@@ -247,15 +240,13 @@ def main():
     if not (0 < args.train_ratio < 1):
         parser.error(f"train_ratio must be between 0 and 1, got {args.train_ratio}")
 
-    # Auto-detect yield CSV if not specified
-    if args.yield_csv:
-        yield_csv = Path(args.yield_csv)
-    else:
-        yield_csv = Path("files/pam_soy_pr_2019_2025.csv")
-        if not yield_csv.exists():
-            raise FileNotFoundError(
-                f"Could not find yield CSV. Expected {yield_csv} or specify --yield-csv"
-            )
+    yield_csv = (
+        Path(args.yield_csv)
+        if args.yield_csv
+        else Path("files/pam_soy_pr_2019_2025.csv")
+    )
+    if not yield_csv.exists():
+        raise FileNotFoundError(f"Yield CSV not found: {yield_csv}")
 
     add_split_to_csv(
         yield_csv,

@@ -28,6 +28,8 @@ from utils_aggregated import (
     sum_municipality_from_pixel_chunks,
 )
 
+YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -49,7 +51,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help="Path to yield CSV file with 'split' column (default: files/pam_soy_pr_2019_2025.csv)",
+        help=f"Path to yield CSV (default: {YIELD_CSV})",
     )
     parser.add_argument(
         "--output-csv",
@@ -103,6 +105,8 @@ def parse_args():
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    args.yield_csv = Path(args.yield_csv) if args.yield_csv else YIELD_CSV
 
     return args
 
@@ -188,76 +192,44 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
 
-    # Load test municipalities from yield CSV
-    yield_csv_path = Path(
-        args.yield_csv
-        if args.yield_csv
-        else "files/pam_soy_pr_2019_2025.csv"
-    )
+    if not args.yield_csv.exists():
+        raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
 
-    if not yield_csv_path.exists():
-        raise FileNotFoundError(
-            f"Yield CSV not found at {yield_csv_path}. Please specify --yield-csv"
-        )
+    print(f"Loading yield CSV from {args.yield_csv}...")
+    yield_df = pd.read_csv(args.yield_csv)
 
-    print(f"Loading yield CSV from {yield_csv_path}...")
-    yield_df = pd.read_csv(yield_csv_path)
-
-    # Find columns
-    muni_code_col = None
-    for col in ["municipality_code", "code", "municipality", "muni_code"]:
-        if col in yield_df.columns:
-            muni_code_col = col
-            break
-
-    if muni_code_col is None:
+    muni_code_col = "municipality_code"
+    yield_col = "production_t"
+    year_col = "year"
+    if muni_code_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find municipality code column. Available: {list(yield_df.columns)}"
+            f"Yield CSV missing {muni_code_col!r}. Available: {list(yield_df.columns)}"
         )
-
-    yield_col = None
-    for col in ("production", "production_t", "yield", "yield_tons", "tons"):
-        if col in yield_df.columns:
-            yield_col = col
-            break
-    if yield_col is None:
+    if yield_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find yield column. Available: {list(yield_df.columns)}"
+            f"Yield CSV missing {yield_col!r}. Available: {list(yield_df.columns)}"
+        )
+    if year_col not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {year_col!r}. Available: {list(yield_df.columns)}"
         )
 
-    # Use full CSV (train + valid + test) so we have yield targets for all years (e.g. 2023 in train/valid)
     yield_df[muni_code_col] = yield_df[muni_code_col].astype(str)
+    yield_df[year_col] = yield_df[year_col].astype(int)
     print("Using all splits (train/valid/test) for yield targets")
-
-    # Check if year column exists
-    year_col = None
-    if "year" in yield_df.columns:
-        year_col = "year"
-    elif "Year" in yield_df.columns:
-        year_col = "Year"
-    elif "YEAR" in yield_df.columns:
-        year_col = "YEAR"
-
-    if year_col is None:
-        print(
-            "⚠️  Warning: No 'year' column found in CSV. Using municipality_code only."
+    muni_to_yield = {
+        (str(muni_code), int(year)): yield_val
+        for muni_code, year, yield_val in zip(
+            yield_df[muni_code_col], yield_df[year_col], yield_df[yield_col]
         )
-        muni_to_yield = dict(zip(yield_df[muni_code_col], yield_df[yield_col]))
-    else:
-        yield_df[year_col] = yield_df[year_col].astype(int)
-        muni_to_yield = {
-            (str(muni_code), int(year)): yield_val
-            for muni_code, year, yield_val in zip(
-                yield_df[muni_code_col], yield_df[year_col], yield_df[yield_col]
-            )
-        }
+    }
 
     # Dataset for vectorized loading and transform (mode="all" = use full CSV so we get all munis with .npy)
     print("Building dataset for pixel loading...")
     dataset = USCropsAggregatedNPY(
         mode="all",
         root=args.datapath,
-        yield_csv=yield_csv_path,
+        yield_csv=args.yield_csv,
         year=None,
         sequencelength=args.sequencelength,
         randomchoice=False,
@@ -275,7 +247,10 @@ def main():
         else:
             target_year = None
         if target_year is None:
-            target_year = 2023  # fallback
+            raise ValueError(
+                f"Cannot infer harvest year from datapath folder name {folder_name!r}. "
+                "Use a season folder like 2022-2023."
+            )
         munis_with_npy = set(m for m, y in dataset.municipality_list)
         # Munis that have .npy and appear in CSV (any year)
         munis_in_csv = set(m for m, y in muni_to_yield.keys())

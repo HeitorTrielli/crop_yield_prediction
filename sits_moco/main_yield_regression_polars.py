@@ -138,7 +138,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help="path to yield CSV file with municipality codes and production",
+        help=f"path to yield CSV (default: {YIELD_CSV})",
     )
     parser.add_argument("--seed", type=int, default=5000, help="random seed")
     parser.add_argument(
@@ -267,14 +267,10 @@ def compute_target_statistics(yield_csv, datapath, harvest_years=None):
         infer_schema_length=10000,
     )
 
-    yield_col = None
-    for col in ("production", "production_t", "yield", "yield_tons", "tons"):
-        if col in yield_df.columns:
-            yield_col = col
-            break
-    if yield_col is None:
+    yield_col = "production_t"
+    if yield_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find yield column. Available: {list(yield_df.columns)}"
+            f"Yield CSV missing {yield_col!r}. Available: {list(yield_df.columns)}"
         )
 
     available_years = find_available_years(datapath)
@@ -300,12 +296,12 @@ def compute_target_statistics(yield_csv, datapath, harvest_years=None):
         train_df = train_df.filter(pl.col("year").is_in(available_years))
         print(f"  Filtered to available years: {len(train_df)} rows")
 
-    if "split" in yield_df.columns:
-        train_df = train_df.filter(pl.col("split") == "train")
-        print(f"  Filtered to train split: {len(train_df)} rows")
-    elif "mode" in yield_df.columns:
-        train_df = train_df.filter(pl.col("mode") == "train")
-        print(f"  Filtered to train mode: {len(train_df)} rows")
+    if "split" not in yield_df.columns:
+        raise ValueError(
+            "Yield CSV has no 'split' column. Run add_train_valid_test_split.py first."
+        )
+    train_df = train_df.filter(pl.col("split") == "train")
+    print(f"  Filtered to train split: {len(train_df)} rows")
 
     valid_targets = train_df.select(yield_col).drop_nulls()[yield_col].to_list()
     valid_targets = [float(t) for t in valid_targets if t is not None and t != ""]
@@ -377,7 +373,9 @@ def save_training_config_json(logdir: Path, args, extras: dict) -> None:
 
 def train(args):
     target_mean, target_std = compute_target_statistics(
-        args.yield_csv, args.datapath, harvest_years=args.harvest_years_set
+        args.yield_csv,
+        args.datapath,
+        harvest_years=args.harvest_years_set,
     )
 
     print("=> creating dataloader (Polars-optimized)")
