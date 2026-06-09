@@ -11,7 +11,7 @@ Typical usage (all talhões in benchmark shapes, Seed6007):
 
 Or call directly (no --municipalities = all talhões in the GPKG/GeoJSON):
 
-  python predict_yield_talhoes.py --checkpoint results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_Seed6007/model_best.pth --datapath files/npy --tiffpath files/daily_tiff --year-range 2020-2021 --sequencelength 45
+  python predict_yield_talhoes.py --checkpoint results/Total_20_22_23_Seed6007/training/model_best.pth --datapath files/npy --tiffpath files/daily_tiff --year-range 2020-2021 --sequencelength 45
 
 Polygons: benchmark/talhoes_baseline.geojson (or .gpkg). Output CSV defaults to
 {run_dir}/predictions/talhoes_forecasts.csv with columns forecast (t), baseline_tons, error (t),

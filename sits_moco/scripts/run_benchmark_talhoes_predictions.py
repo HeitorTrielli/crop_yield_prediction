@@ -39,7 +39,7 @@ def harvest_to_year_range(harvest_year: int) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    run_name = "Yield_STNetRegression_Pad_Hy_2020_2022_2023_Seed6007"
+    run_name = "Total_20_22_23_Seed6007"
     default_run = _ROOT / "results" / run_name
 
     p = argparse.ArgumentParser(description=__doc__)
@@ -178,7 +178,7 @@ def run_one(
 def main() -> None:
     args = parse_args()
     default_run = (
-        _ROOT / "results" / "Yield_STNetRegression_Pad_Hy_2020_2022_2023_Seed6007"
+        _ROOT / "results" / "Total_20_22_23_Seed6007"
     )
 
     if args.checkpoint is None:

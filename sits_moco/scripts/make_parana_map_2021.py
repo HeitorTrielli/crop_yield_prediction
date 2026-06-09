@@ -94,7 +94,7 @@ def main() -> None:
 
     if args.checkpoint is None:
         run_guess = (
-            root / "results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_2024_Seed6003"
+            root / "results/Total_20_22_23_24_Seed6003"
         )
         args.checkpoint = model_best_in_run(run_guess)
     else:

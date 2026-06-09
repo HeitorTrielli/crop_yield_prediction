@@ -11,7 +11,7 @@ Requires: pip install geopandas matplotlib geobr
 Example (Seed6003 model, eval split, Paraná-only map of forecast error in tons):
 
   python predict_yield.py ^
-    --checkpoint results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_2024_Seed6003/model_best.pth ^
+    --checkpoint results/Total_20_22_23_24_Seed6003/training/model_best.pth ^
     --datapath files/npy/2020-2024 ^
     --yield-csv files/pam_soy_pr_2019_2025.csv ^
     --eval-only ^

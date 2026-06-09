@@ -44,8 +44,50 @@ from utils_aggregated import (
 # Default paths
 DATAPATH = Path(r"files/npy")
 YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
+YIELD_TARGET_COLUMN = "production_t"  # production_t → Total; yield_t_ha → Productivity
+DEFAULT_REGRESSION_MODEL = "STNetRegression"
 YEARS = [None]
 SEEDS = [6007]
+
+
+def target_run_prefix(target_column: str = YIELD_TARGET_COLUMN) -> str:
+    if target_column == "production_t":
+        return "Total"
+    if target_column == "yield_t_ha":
+        return "Productivity"
+    raise ValueError(
+        f"Unknown yield target {target_column!r}; expected 'production_t' or 'yield_t_ha'"
+    )
+
+
+def format_years_for_run_name(
+    harvest_years_set: set[int] | None,
+    single_year: int | None = None,
+) -> str:
+    if harvest_years_set:
+        return "_".join(f"{y % 100:02d}" for y in sorted(harvest_years_set))
+    if single_year is not None:
+        return f"{int(single_year) % 100:02d}"
+    return "AllYears"
+
+
+def build_run_name(
+    *,
+    target_column: str = YIELD_TARGET_COLUMN,
+    model_class_name: str = DEFAULT_REGRESSION_MODEL,
+    harvest_years_set: set[int] | None,
+    year: int | None,
+    seed: int,
+    suffix: str | None = None,
+) -> str:
+    parts = [target_run_prefix(target_column)]
+    if model_class_name != DEFAULT_REGRESSION_MODEL:
+        parts.append(model_class_name)
+    parts.append(format_years_for_run_name(harvest_years_set, year))
+    parts.append(f"Seed{seed}")
+    if suffix:
+        parts.append(suffix)
+    return "_".join(parts)
 
 
 def parse_args():
@@ -200,15 +242,6 @@ def parse_args():
             )
         args.year = None
 
-    if args.interp and args.rc:
-        args.rc_str = "IntRC"
-    elif args.interp:
-        args.rc_str = "Int"
-    elif args.rc:
-        args.rc_str = "RC"
-    else:
-        args.rc_str = "Pad"
-
     if args.use_doy:
         if args.suffix:
             args.suffix = "doy_" + args.suffix
@@ -345,30 +378,89 @@ def _json_sanitize(obj):
     return str(obj)
 
 
-def save_training_config_json(logdir: Path, args, extras: dict) -> None:
-    """Persist CLI + computed training metadata at run start (single source of truth per folder)."""
-    cfg = {"cli": {}}
+CONFIG_JSON_VERSION = 1
+
+
+def _args_to_cli_dict(args) -> dict:
+    cli = {}
     for k in sorted(vars(args).keys()):
         if k.startswith("_"):
             continue
         try:
-            cfg["cli"][k] = _json_sanitize(getattr(args, k))
+            cli[k] = _json_sanitize(getattr(args, k))
         except Exception:
-            cfg["cli"][k] = str(getattr(args, k))
-    cfg["computed"] = _json_sanitize(extras)
-    cfg["environment"] = {
-        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
-        "argv": sys.argv,
-        "python": sys.version.split()[0],
-        "torch": torch.__version__,
-        "numpy": np.__version__,
-        "polars": pl.__version__,
+            cli[k] = str(getattr(args, k))
+    return cli
+
+
+def _load_config_sessions(config_path: Path) -> list[dict]:
+    if not config_path.exists():
+        return []
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "sessions" in data:
+        return list(data["sessions"])
+    if isinstance(data, dict) and "cli" in data:
+        return [
+            {
+                "session_index": 0,
+                "kind": "initial",
+                "cli": data.get("cli"),
+                "computed": data.get("computed"),
+                "environment": data.get("environment"),
+                "resume": None,
+            }
+        ]
+    return []
+
+
+def append_training_config_session(
+    training_dir: Path,
+    args,
+    *,
+    computed: dict,
+    run_paths: dict,
+    resume: dict | None = None,
+    torch_compiled: bool,
+) -> None:
+    """
+    Append one training session record to training/config.json.
+
+    Each invocation (fresh run or resume) adds a session so continuation runs
+    keep a full audit trail of CLI + computed state at start time.
+    """
+    config_path = Path(training_dir) / "config.json"
+    sessions = _load_config_sessions(config_path)
+    session_index = len(sessions)
+    kind = "resume" if resume is not None else "initial"
+
+    session = {
+        "session_index": session_index,
+        "kind": kind,
+        "cli": _args_to_cli_dict(args),
+        "computed": _json_sanitize(computed),
+        "run_paths": _json_sanitize(run_paths),
+        "resume": _json_sanitize(resume) if resume is not None else None,
+        "environment": {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "argv": list(sys.argv),
+            "python": sys.version.split()[0],
+            "torch": torch.__version__,
+            "numpy": np.__version__,
+            "polars": pl.__version__,
+            "torch_compiled": bool(torch_compiled),
+        },
     }
-    out = Path(logdir) / "config.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print(f"Wrote training config to {out}")
+    sessions.append(session)
+
+    payload = {"version": CONFIG_JSON_VERSION, "sessions": sessions}
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(
+        f"Wrote training config session {session_index} ({kind}) to {config_path} "
+        f"({len(sessions)} session(s) total)"
+    )
 
 
 def train(args):
@@ -495,25 +587,23 @@ def train(args):
         else:
             print("  ⚠️  Warning: No decoder weights found in checkpoint!")
 
-    if args.harvest_years_set:
-        year_str = "Hy_" + "_".join(str(y) for y in sorted(args.harvest_years_set))
-    elif args.year is None:
-        year_str = "AllYears"
-    else:
-        year_str = str(args.year)
-    if args.suffix:
-        model.modelname = f"Yield_{model.modelname}_{args.rc_str}_{year_str}_Seed{args.seed}_{args.suffix}"
-    else:
-        model.modelname = (
-            f"Yield_{model.modelname}_{args.rc_str}_{year_str}_Seed{args.seed}"
-        )
+    model.modelname = build_run_name(
+        target_column=YIELD_TARGET_COLUMN,
+        model_class_name=model.__class__.__name__,
+        harvest_years_set=args.harvest_years_set,
+        year=args.year,
+        seed=args.seed,
+        suffix=args.suffix,
+    )
 
     # Compile model for faster execution (PyTorch 2.0+)
     # Wrap in try-except in case compilation fails (e.g., missing Python headers in WSL)
+    torch_compiled = False
     if hasattr(torch, "compile"):
         try:
             print("Compiling model with torch.compile() for faster execution...")
             model = torch.compile(model)
+            torch_compiled = True
             print("Model compilation successful!")
         except Exception as e:
             print(
@@ -529,20 +619,6 @@ def train(args):
     print(f"  training:    {training_dir_path}")
     print(f"  predictions: {predictions_dir_path}")
     print(f"  figures:     {figures_dir_path}")
-
-    save_training_config_json(
-        training_dir_path,
-        args,
-        {
-            "model_run_name": model.modelname,
-            "input_dim": int(input_dim),
-            "target_mean": float(target_mean),
-            "target_std": float(target_std),
-            "num_train_municipalities": len(traindataloader.dataset),
-            "num_valid_municipalities": len(valdataloader.dataset),
-            "num_eval_municipalities": len(testdataloader.dataset),
-        },
-    )
 
     # Pass normalization stats for denormalization in evaluation
     criterion = AggregatedMSELoss(
@@ -563,53 +639,59 @@ def train(args):
     val_loss_min = np.inf
     not_improved_count = 0
 
+    resume_info = None
+    pretrained_path_resolved = None
+    if args.pretrained:
+        pretrained_path_resolved = Path(args.pretrained).resolve()
+
     # Resume from checkpoint if pretrained model is provided
     if pretrained_checkpoint is not None:
         checkpoint = pretrained_checkpoint
         print(f"Resuming training from checkpoint...")
 
-        # Load optimizer state if available
+        loaded_optimizer = False
         if "optimizer_state" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
+            loaded_optimizer = True
             print("  ✓ Loaded optimizer state")
 
-        # Load training state if available
         if "epoch" in checkpoint:
-            start_epoch = checkpoint["epoch"]
+            start_epoch = int(checkpoint["epoch"])
             print(f"  ✓ Resuming from epoch {start_epoch}")
 
         if "val_loss_min" in checkpoint:
-            val_loss_min = checkpoint["val_loss_min"]
+            val_loss_min = float(checkpoint["val_loss_min"])
             print(f"  ✓ Loaded best validation loss: {val_loss_min:.4f}")
         elif "val_loss" in checkpoint:
-            # Fallback for older checkpoints
-            val_loss_min = checkpoint["val_loss"]
+            val_loss_min = float(checkpoint["val_loss"])
             print(f"  ✓ Loaded validation loss: {val_loss_min:.4f}")
 
         if "not_improved_count" in checkpoint:
-            not_improved_count = checkpoint["not_improved_count"]
+            not_improved_count = int(checkpoint["not_improved_count"])
             print(f"  ✓ Loaded not_improved_count: {not_improved_count}")
 
-        # Note: target_mean and target_std are recomputed from data, but saved for reference
-        if "target_mean" in checkpoint and "target_std" in checkpoint:
-            saved_mean = checkpoint["target_mean"]
-            saved_std = checkpoint["target_std"]
-            if (
-                abs(saved_mean - target_mean) > 1e-3
-                or abs(saved_std - target_std) > 1e-3
-            ):
+        ck_target_mean = checkpoint.get("target_mean")
+        ck_target_std = checkpoint.get("target_std")
+        normalization_stats_match = None
+        if ck_target_mean is not None and ck_target_std is not None:
+            ck_target_mean = float(ck_target_mean)
+            ck_target_std = float(ck_target_std)
+            normalization_stats_match = (
+                abs(ck_target_mean - target_mean) <= 1e-3
+                and abs(ck_target_std - target_std) <= 1e-3
+            )
+            if not normalization_stats_match:
                 print(f"  ⚠️  Warning: Normalization stats differ!")
-                print(f"      Saved: mean={saved_mean:.2f}, std={saved_std:.2f}")
-                print(f"      Current: mean={target_mean:.2f}, std={target_std:.2f}")
+                print(f"      Checkpoint: mean={ck_target_mean:.2f}, std={ck_target_std:.2f}")
+                print(f"      This run:   mean={target_mean:.2f}, std={target_std:.2f}")
             else:
                 print(f"  ✓ Normalization stats match")
 
-        # Load existing training log if it exists
         trainlog_file = trainlog_path(run_dir)
+        trainlog_entries_loaded = 0
         if trainlog_file.exists():
             try:
                 existing_log_df = pd.read_csv(trainlog_file, index_col="epoch")
-                # reset_index() so epoch is a column; to_dict("records") drops the index
                 log = existing_log_df.reset_index().to_dict("records")
                 for entry in log:
                     ep = entry.get("epoch")
@@ -619,11 +701,68 @@ def train(args):
                         entry["epoch"] = int(ep)
                     except (ValueError, TypeError):
                         pass
-                print(f"  ✓ Loaded existing training log with {len(log)} entries")
+                trainlog_entries_loaded = len(log)
+                print(f"  ✓ Loaded existing training log with {trainlog_entries_loaded} entries")
             except Exception as e:
                 print(f"  ⚠️  Could not load existing log: {e}, starting fresh")
         else:
             print("  ℹ️  No existing training log found, starting fresh")
+
+        resume_info = {
+            "from_checkpoint": str(pretrained_path_resolved),
+            "resumed_from_epoch": int(start_epoch),
+            "loaded_optimizer_state": loaded_optimizer,
+            "loaded_val_loss_min": float(val_loss_min) if np.isfinite(val_loss_min) else None,
+            "loaded_not_improved_count": int(not_improved_count),
+            "checkpoint_target_mean": ck_target_mean,
+            "checkpoint_target_std": ck_target_std,
+            "checkpoint_feature_layout": checkpoint.get("feature_layout"),
+            "normalization_stats_match": normalization_stats_match,
+            "trainlog_path": str(trainlog_file.resolve()),
+            "trainlog_entries_loaded": trainlog_entries_loaded,
+        }
+
+    imagery_years_available = find_available_years(args.datapath)
+    append_training_config_session(
+        training_dir_path,
+        args,
+        computed={
+            "model_run_name": model.modelname,
+            "input_dim": int(input_dim),
+            "feature_layout": args.feature_layout,
+            "yield_target_column": YIELD_TARGET_COLUMN,
+            "run_name_target_prefix": target_run_prefix(YIELD_TARGET_COLUMN),
+            "municipality_aggregation": "sum",
+            "target_mean": float(target_mean),
+            "target_std": float(target_std),
+            "num_train_municipalities": len(traindataloader.dataset),
+            "num_valid_municipalities": len(valdataloader.dataset),
+            "num_test_municipalities": len(testdataloader.dataset),
+            "dataloader_meta": {
+                "train": train_meta,
+                "valid": val_meta,
+                "test": test_meta,
+            },
+            "imagery_years_available": imagery_years_available,
+            "imagery_years_used": sorted(args.harvest_years_set)
+            if args.harvest_years_set
+            else imagery_years_available,
+            "epoch_plan": {
+                "start_epoch": int(start_epoch),
+                "end_epoch_exclusive": int(args.epochs),
+                "num_epochs_this_session": max(0, int(args.epochs) - int(start_epoch)),
+            },
+        },
+        run_paths={
+            "run_dir": run_dir,
+            "training_dir": training_dir_path,
+            "predictions_dir": predictions_dir_path,
+            "figures_dir": figures_dir_path,
+            "best_model_path": best_model_path,
+        },
+        resume=resume_info,
+        torch_compiled=torch_compiled,
+    )
 
     print(f"Training {model.modelname}...")
     for epoch in range(start_epoch, args.epochs):
