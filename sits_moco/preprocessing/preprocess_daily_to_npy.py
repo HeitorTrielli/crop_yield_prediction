@@ -4,7 +4,7 @@ Preprocess daily municipal TIFFs (from clip_tiffs_to_shapefiles) to .npy.
 
 Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/, stacks to
 [num_pixels, num_days, 11] (10 bands + DOY), or [N, T, 13] with --xavier-pr-nc
-(two Xavier rain channels; see xavier_rain_for_daily_npy.py).
+(two Xavier rain channels; see data_download/xavier_rain_for_daily_npy.py).
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import time
 import tempfile
+import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
@@ -42,7 +42,10 @@ import rasterio
 from rasterio.warp import Resampling, reproject
 from tqdm import tqdm
 
-from preprocess_tiff_to_npy import date_to_season_doy, season_start_from_year_range
+from preprocessing.preprocess_tiff_to_npy import (
+    date_to_season_doy,
+    season_start_from_year_range,
+)
 
 NO_DATA_VALUE = -9999
 NUM_SPECTRAL_BANDS = 10
@@ -59,27 +62,24 @@ def _save_npy_atomic(out_path: Path, arr: np.ndarray, *, max_retries: int = 4) -
     # Path must end with .npy: np.save appends ".npy" if the filename does not,
     # so the old "x.npy.tmp" became "x.npy.tmp.npy" and os.replace failed.
     tmp = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
-    legacy_double = out_path.parent / f"{out_path.name}.tmp.npy"
     last_err: OSError | None = None
     for attempt in range(max_retries):
         try:
-            for p in (tmp, legacy_double):
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
             np.save(os.fspath(tmp), arr)
             os.replace(os.fspath(tmp), os.fspath(out_path))
             return
         except OSError as e:
             last_err = e
-            for p in (tmp, legacy_double):
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
             time.sleep(0.4 * (attempt + 1))
     assert last_err is not None
     raise last_err
@@ -261,7 +261,9 @@ def process_municipality(
     out[:, :, 10] = doy_broadcast
 
     if xavier_pr_work is not None:
-        from xavier_rain_for_daily_npy import compute_rain_block_for_municipality
+        from data_download.xavier_rain_for_daily_npy import (
+            compute_rain_block_for_municipality,
+        )
 
         rows = (idx_final // width).astype(np.int64)
         cols = (idx_final % width).astype(np.int64)

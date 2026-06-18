@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 _REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_YIELD_CSV = _REPO_ROOT / "files" / "municipality_production_with_codes.csv"
+DEFAULT_YIELD_CSV = _REPO_ROOT / "files" / "pam_soy_pr_2019_2025.csv"
 
 
 def normalize_municipality_code(code: str | int) -> str:

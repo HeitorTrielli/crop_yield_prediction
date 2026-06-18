@@ -5,7 +5,7 @@ Download Brazilian soybean Sentinel-2 daily imagery from Google Earth Engine.
 Uses MapBiomas year-X soy classification to mask pixels. By default fetches the
 soybean growth cycle Oct (X-1)--Mar (X); optional --start-date/--end-date override.
 Exports to Google Drive, then downloads the exact GEE files to local .../raw/ and deletes them from Drive (no merge).
-To merge raw tiles into .tiff later, use merge_gee_tiles_to_tiff.py (raw files are never deleted locally).
+To merge raw tiles into .tiff later, use preprocessing/merge_gee_tiles_to_tiff.py (raw files are never deleted locally).
 Output: raw_tiff/{year_start}-{year_end}/{municipality}/raw/<exact GEE filename>.
 Per-municipality download_log.csv (date, status, note) for retries and progress.
 
@@ -14,9 +14,9 @@ NO_DATA_VALUE (-9999) and the TIFF nodata tag is set so downstream (clip, traini
 can exclude them and only use real observations.
 
 Usage:
-  python download_soy_gee_drive.py --shapefile path/to/municipality.shp --season-year 2024
-  python download_soy_gee_drive.py --shapefile a.shp --shapefile b.shp --start-date 2023-10-01 --end-date 2024-03-31
-  python download_soy_gee_drive.py --shapefile-dir path/to/shapefiles --season-year 2024 --max-download-workers 4
+  python data_download/download_soy_gee_drive.py --shapefile path/to/municipality.shp --season-year 2024
+  python data_download/download_soy_gee_drive.py --shapefile a.shp --shapefile b.shp --start-date 2023-10-01 --end-date 2024-03-31
+  python data_download/download_soy_gee_drive.py --shapefile-dir path/to/shapefiles --season-year 2024 --max-download-workers 4
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from typing import Any, Optional
 
 import ee
 import geopandas as gpd
-
 from drive_api import (
     build_drive_service,
     delete_file_from_drive,
@@ -320,9 +319,7 @@ def run_one_municipality(
     raw_d = (
         Path(args.raw_dir).resolve()
         if getattr(args, "raw_dir", None) is not None
-        else raw_dir_for_date(
-            args.output_dir, municipality_code, year_start, year_end
-        )
+        else raw_dir_for_date(args.output_dir, municipality_code, year_start, year_end)
     )
     if raw_d.exists():
         existing_dates = set()

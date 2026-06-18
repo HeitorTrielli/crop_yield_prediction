@@ -3,12 +3,12 @@
 Download official Brazilian state boundary shapefile using geobr (IBGE data).
 
 Mirrors the approach of municipal_shapefiles.ipynb but for state-level boundaries.
-Use this to get a single state (e.g. Paraná) for running download_soy_gee_drive.py
-with a state shapefile, then clip_tiffs_to_shapefiles.py to split by municipalities.
+Use this to get a single state (e.g. Paraná) for running data_download/download_soy_gee_drive.py
+with a state shapefile, then preprocessing/clip_tiffs_to_shapefiles.py to split by municipalities.
 
 Usage:
-  python download_state_shapefile.py --state PR --output files/state_shapefile
-  python download_state_shapefile.py --state 41 --year 2020 --output files/parana_state.shp
+  python data_download/download_state_shapefile.py --state PR --output files/state_shapefile
+  python data_download/download_state_shapefile.py --state 41 --year 2020 --output files/parana_state.shp
 """
 
 from __future__ import annotations

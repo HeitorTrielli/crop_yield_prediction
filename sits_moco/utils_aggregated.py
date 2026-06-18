@@ -9,7 +9,128 @@ import torch
 import torch.nn as nn
 
 # Pixels per forward pass
-MAX_PIXEL_BATCH_SIZE = 200
+MAX_PIXEL_BATCH_SIZE = 160
+
+TARGET_SPECS = {
+    "total": {"column": "production_t", "aggregation": "sum", "unit": "tons"},
+    "total_adj": {
+        "column": "production_t_s2_adj",
+        "aggregation": "sum",
+        "unit": "tons",
+    },
+    "productivity": {"column": "yield_t_ha", "aggregation": "mean", "unit": "t/ha"},
+}
+
+
+def resolve_target(target: str) -> tuple[str, str, str]:
+    """Return (target_column, aggregation, unit) for a registered target name."""
+    spec = TARGET_SPECS.get(target)
+    if spec is None:
+        choices = ", ".join(TARGET_SPECS)
+        raise ValueError(f"Unknown target {target!r}; expected one of: {choices}")
+    return spec["column"], spec["aggregation"], spec["unit"]
+
+
+def resolve_inference_target(
+    run_config: dict,
+    checkpoint: dict | None = None,
+) -> tuple[str, str, str, str]:
+    """
+    Resolve (target, target_column, aggregation, unit) for inference.
+
+    Reads training/config.json first, then checkpoint metadata saved at train time.
+    """
+    computed = run_config.get("computed") or {}
+    cli = run_config.get("cli") or {}
+    ck = checkpoint or {}
+
+    target = computed.get("target") or cli.get("target") or ck.get("target")
+    if target is not None:
+        col, agg, unit = resolve_target(target)
+        return target, col, agg, unit
+
+    target_column = computed.get("yield_target_column") or ck.get("target_column")
+    aggregation = computed.get("municipality_aggregation") or ck.get("aggregation")
+    if target_column is not None:
+        if aggregation is None:
+            aggregation = aggregation_for_target_column(target_column)
+        for name, spec in TARGET_SPECS.items():
+            if spec["column"] == target_column:
+                return name, target_column, aggregation, spec["unit"]
+
+    if aggregation == "mean":
+        col, agg, unit = resolve_target("productivity")
+        return "productivity", col, agg, unit
+    if aggregation == "sum":
+        col, agg, unit = resolve_target("total")
+        return "total", col, agg, unit
+
+    config_path = run_config.get("config_path", "training/config.json")
+    raise ValueError(
+        f"Cannot determine training target from {config_path} or checkpoint. "
+        "Re-train with --target total|total_adj|productivity."
+    )
+
+
+def aggregation_for_target_column(target_column: str) -> str:
+    for spec in TARGET_SPECS.values():
+        if spec["column"] == target_column:
+            return spec["aggregation"]
+    raise ValueError(
+        f"Unknown target column {target_column!r}; "
+        f"expected one of: {', '.join(s['column'] for s in TARGET_SPECS.values())}"
+    )
+
+
+def aggregate_pixels(predictions: torch.Tensor, aggregation: str) -> torch.Tensor:
+    if aggregation == "sum":
+        return predictions.sum(dim=0)
+    if aggregation == "mean":
+        return predictions.mean(dim=0)
+    raise ValueError(f"aggregation must be 'sum' or 'mean', got {aggregation!r}")
+
+
+class MunicipalityPixelAccumulator:
+    """Accumulate pixel predictions into a municipality-level sum or mean."""
+
+    def __init__(self, aggregation: str = "sum"):
+        if aggregation not in ("sum", "mean"):
+            raise ValueError(
+                f"aggregation must be 'sum' or 'mean', got {aggregation!r}"
+            )
+        self.aggregation = aggregation
+        self._sum: torch.Tensor | None = None
+        self.pixel_count = 0
+
+    def add(self, chunk_predictions: torch.Tensor) -> None:
+        chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
+        if self._sum is None:
+            self._sum = chunk_sum
+        else:
+            self._sum = self._sum + chunk_sum
+        self.pixel_count += int(chunk_predictions.shape[0])
+
+    @property
+    def valid(self) -> bool:
+        return self._sum is not None and self.pixel_count > 0
+
+    def value(self) -> torch.Tensor | None:
+        if not self.valid:
+            return None
+        if self.aggregation == "sum":
+            return self._sum
+        return self._sum / float(self.pixel_count)
+
+    def detach(self) -> None:
+        if self._sum is not None:
+            self._sum = self._sum.detach()
+
+    def is_extreme(self) -> bool:
+        val = self.value()
+        if val is None or torch.isinf(val).any():
+            return True
+        limit = 1e7 if self.aggregation == "sum" else 1e3
+        return torch.abs(val).max().item() > limit
 
 
 def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
@@ -20,13 +141,15 @@ def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
     return 10
 
 
-def sum_municipality_from_pixel_chunks(model, pixel_chunks, device) -> float | None:
-    """Run STNet on stacked pixel chunks and return summed municipality prediction (tons)."""
+def aggregate_municipality_from_pixel_chunks(
+    model, pixel_chunks, device, aggregation: str = "sum"
+) -> float | None:
+    """Run STNet on pixel chunks; aggregate to municipality prediction (sum or mean)."""
     from torch.amp import autocast
 
     from utils import recursive_todevice
 
-    municipality_sum = None
+    acc = MunicipalityPixelAccumulator(aggregation)
     model.eval()
     with torch.no_grad():
         for pixel_chunk in pixel_chunks:
@@ -45,27 +168,25 @@ def sum_municipality_from_pixel_chunks(model, pixel_chunks, device) -> float | N
                 else torch.no_grad()
             ):
                 chunk_predictions = model(municipality_X_chunk)
-            chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
-            if municipality_sum is None:
-                municipality_sum = chunk_sum
-            else:
-                municipality_sum = municipality_sum.to(torch.float32) + chunk_sum.to(
-                    torch.float32
-                )
+            acc.add(chunk_predictions)
 
-    if municipality_sum is None:
+    result = acc.value()
+    if result is None:
         return None
-    municipality_sum = municipality_sum.squeeze()
-    if municipality_sum.dim() > 0:
-        municipality_sum = (
-            municipality_sum[0]
-            if len(municipality_sum) > 0
-            else torch.tensor(0.0)
-        )
-    return municipality_sum.item()
+    result = result.squeeze()
+    if result.dim() > 0:
+        result = result[0] if len(result) > 0 else torch.tensor(0.0)
+    return float(result.item())
 
 
-def regression_metrics(y_pred, y_true):
+def sum_municipality_from_pixel_chunks(model, pixel_chunks, device) -> float | None:
+    """Backward-compatible alias: sum aggregation (total production in tons)."""
+    return aggregate_municipality_from_pixel_chunks(
+        model, pixel_chunks, device, aggregation="sum"
+    )
+
+
+def regression_metrics(y_pred, y_true, *, target_column: str = "production_t"):
     """Calculate regression metrics: RMSE, MAE, R², MAPE."""
     y_pred = np.array(y_pred).flatten()
     y_true = np.array(y_true).flatten()
@@ -88,9 +209,8 @@ def regression_metrics(y_pred, y_true):
     # MAPE: Filter out values where y_true is too small (less than 1% of mean or absolute threshold)
     # This prevents division by near-zero values that cause MAPE to explode
     mean_y_true = np.mean(np.abs(y_true))
-    threshold = max(
-        mean_y_true * 0.01, 100.0
-    )  # At least 1% of mean or 100, whichever is larger
+    floor = 0.1 if target_column == "yield_t_ha" else 100.0
+    threshold = max(mean_y_true * 0.01, floor)
     mape_mask = np.abs(y_true) >= threshold
     if mape_mask.sum() > 0:
         mape = (
@@ -105,15 +225,24 @@ def regression_metrics(y_pred, y_true):
 
 
 class AggregatedMSELoss(nn.Module):
-    """Loss function: sums pixel predictions per municipality, compares to municipality target."""
+    """Loss: aggregate pixel predictions per municipality (sum or mean), compare to target."""
 
-    def __init__(self, reduction="mean", target_mean=None, target_std=None):
+    def __init__(
+        self,
+        reduction="mean",
+        target_mean=None,
+        target_std=None,
+        aggregation: str = "sum",
+        target_column: str = "production_t",
+    ):
         super().__init__()
         self.reduction = reduction
         self.mse = nn.MSELoss(reduction="none")
         self.target_mean = target_mean if target_mean is not None else 0.0
         self.target_std = target_std if target_std is not None else 1.0
         self.normalize = target_mean is not None and target_std is not None
+        self.aggregation = aggregation
+        self.target_column = target_column
 
     def forward(self, predictions_list, targets, num_pixels_list=None):
         """
@@ -123,8 +252,7 @@ class AggregatedMSELoss(nn.Module):
         """
         aggregated_predictions = []
         for pred in predictions_list:
-            municipality_sum = pred.sum(dim=0)  # Sum over pixels: [num_outputs]
-            aggregated_predictions.append(municipality_sum)
+            aggregated_predictions.append(aggregate_pixels(pred, self.aggregation))
 
         aggregated = torch.stack(aggregated_predictions)  # [batch_size, num_outputs]
 
@@ -190,6 +318,7 @@ def train_epoch_aggregated(
 
     losses = AverageMeter("Loss", ":.4e")
     model.train()
+    aggregation = getattr(criterion, "aggregation", "sum")
     scaler = GradScaler("cuda")
 
     # Debug: Store initial weights for first batch to check if they change
@@ -234,10 +363,8 @@ def train_epoch_aggregated(
                 # Note: Negative targets are normal after normalization, so we don't warn about them
 
                 dataset = dataloader.dataset
-                municipality_sum = None
+                pixel_acc = MunicipalityPixelAccumulator(aggregation)
                 chunk_idx = 0
-                # Ensure municipality_sum will be float32 (not float16 from autocast)
-                municipality_sum_dtype = torch.float32
                 total_chunks = (
                     num_pixels + MAX_PIXEL_BATCH_SIZE - 1
                 ) // MAX_PIXEL_BATCH_SIZE
@@ -329,94 +456,19 @@ def train_epoch_aggregated(
                         )
                         continue
 
-                    chunk_sum = chunk_predictions.sum(dim=0)
-                    # Convert to float32 to avoid float16 overflow (float16 max is 65504)
-                    chunk_sum = chunk_sum.to(torch.float32)
-
-                    # Check if chunk_sum is inf before accumulating
-                    chunk_sum_is_inf = torch.isinf(chunk_sum)
-                    if chunk_sum.dim() == 0:
-                        chunk_sum_is_inf_value = chunk_sum_is_inf.item()
-                        chunk_sum_value = chunk_sum.item()
-                    else:
-                        chunk_sum_is_inf_value = chunk_sum_is_inf.any().item()
-                        chunk_sum_value = (
-                            chunk_sum.item()
-                            if chunk_sum.numel() == 1
-                            else chunk_sum.max().item()
-                        )
-
-                    if chunk_sum_is_inf_value:
-                        print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has inf chunk_sum!"
+                    pixel_acc.add(chunk_predictions)
+                    if pixel_acc.is_extreme():
+                        agg_val = pixel_acc.value()
+                        abs_val = (
+                            torch.abs(agg_val).max().item()
+                            if agg_val is not None
+                            else float("nan")
                         )
                         print(
-                            f"      Chunk sum: {chunk_sum_value}, Predictions range: [{chunk_predictions.min().item():.2f}, {chunk_predictions.max().item():.2f}]"
+                            f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme "
+                            f"{aggregation} at chunk {chunk_idx}: {abs_val:.2f}"
                         )
-                        print(
-                            f"      Predictions sum check: {chunk_predictions.sum().item():.2f}, is_inf: {torch.isinf(chunk_predictions.sum()).item()}"
-                        )
-                        municipality_sum = None
-                        break
-
-                    # Check previous accumulated sum before adding
-                    if municipality_sum is not None:
-                        prev_sum_is_inf = torch.isinf(municipality_sum)
-                        if municipality_sum.dim() == 0:
-                            prev_sum_is_inf_value = prev_sum_is_inf.item()
-                            prev_sum_value = municipality_sum.item()
-                        else:
-                            prev_sum_is_inf_value = prev_sum_is_inf.any().item()
-                            prev_sum_value = municipality_sum.max().item()
-
-                        if prev_sum_is_inf_value:
-                            print(
-                                f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} - previous sum was already inf: {prev_sum_value}"
-                            )
-                            municipality_sum = None
-                            break
-
-                    # Ensure float32 dtype to avoid float16 overflow
-                    if municipality_sum is None:
-                        municipality_sum = chunk_sum.to(torch.float32)
-                    else:
-                        # Ensure both are float32 before adding
-                        municipality_sum = municipality_sum.to(
-                            torch.float32
-                        ) + chunk_sum.to(torch.float32)
-
-                    # Check if accumulated sum is becoming extreme (inf or very large)
-                    # Handle both scalar and tensor cases
-                    is_inf = torch.isinf(municipality_sum)
-                    if municipality_sum.dim() == 0:
-                        is_inf_value = is_inf.item()
-                        abs_sum = torch.abs(municipality_sum).item()
-                    else:
-                        is_inf_value = is_inf.any().item()
-                        abs_sum = torch.abs(municipality_sum).max().item()
-
-                    if (
-                        is_inf_value or abs_sum > 1e8
-                    ):  # Increased threshold from 1e7 to 1e8
-                        print(
-                            f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme accumulated sum at chunk {chunk_idx}"
-                        )
-                        print(
-                            f"      Accumulated sum: {abs_sum:.2f} (inf={is_inf_value})"
-                        )
-                        print(
-                            f"      Chunk sum: {chunk_sum_value:.2f}, Predictions range: [{chunk_predictions.min().item():.2f}, {chunk_predictions.max().item():.2f}]"
-                        )
-                        print(
-                            f"      Chunk size: {len(pixel_chunk)}, Total chunks so far: {chunk_idx}"
-                        )
-                        if municipality_sum is not None:
-                            print(
-                                f"      Previous sum before adding: {prev_sum_value:.2f} (was inf: {prev_sum_is_inf_value})"
-                            )
-                        municipality_sum = (
-                            None  # Mark as invalid to skip this municipality
-                        )
+                        pixel_acc = MunicipalityPixelAccumulator(aggregation)
                         break
 
                     chunk_idx += 1
@@ -426,69 +478,51 @@ def train_epoch_aggregated(
                     is_last_chunk = chunk_idx == total_chunks
                     should_update = (chunks_in_group == 0) or is_last_chunk
 
-                    if should_update and municipality_sum is not None:
-                        # Check if sum is extreme before using it
-                        if (
-                            torch.isinf(municipality_sum).any()
-                            or torch.abs(municipality_sum).max() > 1e7
-                        ):
-                            print(
-                                f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme sum at update: {municipality_sum.item():.2f}"
-                            )
-                            municipality_sum = None
+                    if should_update and pixel_acc.valid:
+                        if pixel_acc.is_extreme():
+                            pixel_acc = MunicipalityPixelAccumulator(aggregation)
                             break
 
-                        # Normalize the accumulated sum
-                        municipality_sum_normalized = municipality_sum.squeeze()
-                        if municipality_sum_normalized.dim() == 0:
-                            municipality_sum_normalized = (
-                                municipality_sum_normalized.unsqueeze(0)
-                            )
-                        elif municipality_sum_normalized.dim() > 1:
-                            municipality_sum_normalized = (
-                                municipality_sum_normalized.flatten()[0:1]
-                            )
+                        municipality_agg = pixel_acc.value().squeeze()
+                        if municipality_agg.dim() == 0:
+                            municipality_agg = municipality_agg.unsqueeze(0)
+                        elif municipality_agg.dim() > 1:
+                            municipality_agg = municipality_agg.flatten()[0:1]
 
-                        # Ensure target has same shape and dtype
                         target_normalized = target.squeeze().to(torch.float32)
                         if target_normalized.dim() == 0:
                             target_normalized = target_normalized.unsqueeze(0)
 
-                        # Ensure municipality_sum_normalized is float32 for accumulation
-                        municipality_sum_normalized = municipality_sum_normalized.to(
-                            torch.float32
-                        )
-
-                        # Normalize predictions if normalization is enabled (targets are already normalized)
+                        municipality_agg_normalized = municipality_agg.to(torch.float32)
                         if target_mean is not None and target_std is not None:
-                            municipality_sum_normalized = (
-                                municipality_sum_normalized - target_mean
+                            municipality_agg_normalized = (
+                                municipality_agg_normalized - target_mean
                             ) / target_std
 
-                        # Compare accumulated sum to proportional target
-                        # For intermediate updates, scale target by fraction of chunks processed
-                        # This ensures we're comparing partial sum to partial target
                         fraction_processed = (
-                            chunk_idx / total_chunks if total_chunks > 0 else 1.0
+                            pixel_acc.pixel_count / num_pixels
+                            if num_pixels > 0
+                            else 1.0
                         )
-                        expected_partial_target = (
-                            target_normalized * fraction_processed
-                        ).to(torch.float32)
+                        if aggregation == "sum":
+                            expected_partial_target = (
+                                target_normalized * fraction_processed
+                            ).to(torch.float32)
+                        else:
+                            expected_partial_target = target_normalized
 
                         # Compute loss directly on normalized values
                         muni_loss = torch.nn.functional.mse_loss(
-                            municipality_sum_normalized, expected_partial_target
+                            municipality_agg_normalized, expected_partial_target
                         )
 
-                        # Don't print intermediate updates - only print final result per municipality
-
-                        # Debug: Check loss
                         if torch.isnan(muni_loss) or torch.isinf(muni_loss):
                             print(
                                 f"  ❌ DEBUG: Municipality {municipality_code} has invalid loss: {muni_loss.item()}"
                             )
                             print(
-                                f"      Expected partial target: {expected_partial_target.item():.4f}, Sum: {municipality_sum_normalized.item():.4f}"
+                                f"      Expected partial target: {expected_partial_target.item():.4f}, "
+                                f"Pred: {municipality_agg_normalized.item():.4f}"
                             )
                             print(
                                 f"      Chunks: {chunk_idx}/{total_chunks}, Fraction processed: {fraction_processed:.4f}"
@@ -514,8 +548,7 @@ def train_epoch_aggregated(
                             True  # Mark that gradients were accumulated
                         )
 
-                        # Detach to break computational graph for next iteration
-                        municipality_sum = municipality_sum.detach()
+                        pixel_acc.detach()
 
                         # Continue processing remaining chunks (don't exit loop early)
                         # Only break if this was the last chunk
@@ -523,75 +556,51 @@ def train_epoch_aggregated(
                             break
                         continue
 
-                # Calculate final loss for this municipality (for logging)
-                if municipality_sum is not None and chunk_idx > 0:
-                    # Check if sum is extreme before calculating loss
-                    if (
-                        torch.isinf(municipality_sum).any()
-                        or torch.abs(municipality_sum).max() > 1e7
-                    ):
+                if pixel_acc.valid and chunk_idx > 0 and not pixel_acc.is_extreme():
+                    municipality_agg = pixel_acc.value().squeeze()
+                    if municipality_agg.dim() == 0:
+                        municipality_agg = municipality_agg.unsqueeze(0)
+                    elif municipality_agg.dim() > 1:
+                        municipality_agg = municipality_agg.flatten()[0:1]
+
+                    target_normalized = target.squeeze().to(torch.float32)
+                    if target_normalized.dim() == 0:
+                        target_normalized = target_normalized.unsqueeze(0)
+
+                    municipality_agg_normalized = municipality_agg.to(torch.float32)
+                    if target_mean is not None and target_std is not None:
+                        municipality_agg_normalized = (
+                            municipality_agg_normalized - target_mean
+                        ) / target_std
+
+                    final_loss = torch.nn.functional.mse_loss(
+                        municipality_agg_normalized, target_normalized
+                    )
+
+                    if torch.isnan(final_loss) or torch.isinf(final_loss):
                         print(
-                            f"  ⚠️  DEBUG: Municipality {municipality_code} skipped - extreme sum: {municipality_sum.item():.2f}"
+                            f"  ❌ DEBUG: Municipality {municipality_code} final loss is invalid: {final_loss.item()}"
                         )
-                        municipality_sum = None
-
-                    if municipality_sum is not None:
-                        municipality_sum_normalized = municipality_sum.squeeze()
-                        if municipality_sum_normalized.dim() == 0:
-                            municipality_sum_normalized = (
-                                municipality_sum_normalized.unsqueeze(0)
-                            )
-                        elif municipality_sum_normalized.dim() > 1:
-                            municipality_sum_normalized = (
-                                municipality_sum_normalized.flatten()[0:1]
-                            )
-
-                        target_normalized = target.squeeze().to(torch.float32)
-                        if target_normalized.dim() == 0:
-                            target_normalized = target_normalized.unsqueeze(0)
-
-                        # Ensure municipality_sum_normalized is float32
-                        municipality_sum_normalized = municipality_sum_normalized.to(
-                            torch.float32
-                        )
-
-                        # Normalize predictions if normalization is enabled (targets are already normalized)
+                    else:
                         if target_mean is not None and target_std is not None:
-                            municipality_sum_normalized = (
-                                municipality_sum_normalized - target_mean
-                            ) / target_std
-
-                        # Compute loss directly on normalized values
-                        final_loss = torch.nn.functional.mse_loss(
-                            municipality_sum_normalized, target_normalized
-                        )
-
-                        if torch.isnan(final_loss) or torch.isinf(final_loss):
-                            print(
-                                f"  ❌ DEBUG: Municipality {municipality_code} final loss is invalid: {final_loss.item()}"
+                            target_denorm = (
+                                target_normalized.item() * target_std + target_mean
                             )
-                            print(
-                                f"      Target: {target_normalized.item()}, Sum: {municipality_sum_normalized.item()}"
+                            pred_denorm = (
+                                municipality_agg_normalized.item() * target_std
+                                + target_mean
                             )
                         else:
-                            # Debug: Print final result for this municipality (one line only)
-                            # Show denormalized values for readability
-                            if target_mean is not None and target_std is not None:
-                                target_denorm = (
-                                    target_normalized.item() * target_std + target_mean
-                                )
-                                pred_denorm = (
-                                    municipality_sum_normalized.item() * target_std
-                                    + target_mean
-                                )
-                            else:
-                                target_denorm = target_normalized.item()
-                                pred_denorm = municipality_sum_normalized.item()
-                            timestamp = datetime.now().strftime("%H:%M:%S")
-                            print(
-                                f"[{timestamp}] Muni {municipality_code}: target={target_denorm:.0f}, pred={pred_denorm:.0f}, chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
-                            )
-                            total_loss += final_loss.item()
+                            target_denorm = target_normalized.item()
+                            pred_denorm = municipality_agg_normalized.item()
+                        fmt = ".2f" if aggregation == "mean" else ".0f"
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        print(
+                            f"[{timestamp}] Muni {municipality_code}: "
+                            f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
+                            f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
+                        )
+                        total_loss += final_loss.item()
 
                 # Step optimizer after processing all municipalities in the batch
                 # Only if at least one municipality accumulated gradients
@@ -698,6 +707,8 @@ def test_epoch_aggregated(
 
     losses = AverageMeter("Loss", ":.4e")
     model.eval()
+    aggregation = getattr(criterion, "aggregation", "sum")
+    target_column = getattr(criterion, "target_column", "production_t")
     all_aggregated_preds = []
     all_targets = []
 
@@ -764,7 +775,7 @@ def test_epoch_aggregated(
                 losses.update(loss.item(), len(municipalities))
 
                 aggregated_preds = torch.stack(
-                    [pred.sum(dim=0) for pred in predictions_list]
+                    [aggregate_pixels(pred, aggregation) for pred in predictions_list]
                 )
                 if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
                     aggregated_preds = aggregated_preds.squeeze(1)
@@ -788,6 +799,8 @@ def test_epoch_aggregated(
 
         all_aggregated_preds = np.concatenate(all_aggregated_preds)
         all_targets = np.concatenate(all_targets)
-        scores = regression_metrics(all_aggregated_preds, all_targets)
+        scores = regression_metrics(
+            all_aggregated_preds, all_targets, target_column=target_column
+        )
 
     return losses.avg, scores

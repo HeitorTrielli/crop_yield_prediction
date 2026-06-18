@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 # name -> input_dim for STNet MLP, optional [start, end) slice of .npy channels to append after spectral+DOY block
-# Channels 0..9 = spectral, 10 = DOY; extras live at 11+ (see preprocess_daily_to_npy).
+# Channels 0..9 = spectral, 10 = DOY; extras live at 11+ (see preprocessing/preprocess_daily_to_npy).
 _LAYOUT: dict[str, dict[str, Any]] = {
     "spectral": {
         "input_dim": 10,

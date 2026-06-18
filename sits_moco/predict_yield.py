@@ -18,12 +18,21 @@ from datasets.feature_layout import (
     normalize_feature_layout,
 )
 from models import STNetRegression
-from run_paths import predictions_dir, run_dir_from_path
-from utils_aggregated import (
-    regression_metrics,
-    stnet_regression_input_dim_from_state_dict,
-    sum_municipality_from_pixel_chunks,
+from run_paths import (
+    apply_run_config_to_args,
+    load_latest_run_config,
+    predictions_dir,
+    resolve_checkpoint_path,
+    run_dir_from_path,
 )
+from utils_aggregated import (
+    aggregate_municipality_from_pixel_chunks,
+    regression_metrics,
+    resolve_inference_target,
+    stnet_regression_input_dim_from_state_dict,
+)
+
+YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
 
 
 def parse_args():
@@ -39,14 +48,14 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/npy",
-        help="Path to dataset root directory containing municipality .npy files",
+        default=None,
+        help="Dataset root (default: training/config.json from --checkpoint)",
     )
     parser.add_argument(
         "--output-csv",
         type=str,
         default=None,
-        help="Output CSV file path for forecasts (default: auto-generated with split suffix if using --eval-only, etc.)",
+        help="Output CSV path (default: auto-generated; split suffix if using --test-only, etc.)",
     )
     parser.add_argument(
         "--municipalities-csv",
@@ -58,7 +67,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help="Path to yield CSV file with 'split' column (used with --eval-only, --valid-only, --train-only)",
+        help=f"Yield CSV (default: training/config.json; fallback {YIELD_CSV} if missing)",
     )
     parser.add_argument(
         "--yield-year",
@@ -79,9 +88,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--eval-only",
+        "--test-only",
         action="store_true",
-        help="Only predict municipalities in the 'eval' split (requires --yield-csv)",
+        help="Only predict municipalities in the 'test' split",
     )
     parser.add_argument(
         "--valid-only",
@@ -94,10 +103,11 @@ def parse_args():
         help="Only predict municipalities in the 'train' split (requires --yield-csv)",
     )
     parser.add_argument(
+        "-seq",
         "--sequencelength",
         type=int,
-        default=6,
-        help="Maximum length of time series data (default: 6)",
+        default=None,
+        help="Max time steps (default: training/config.json)",
     )
     parser.add_argument(
         "--rc",
@@ -125,32 +135,36 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=27,
-        help="Random seed for reproducibility (default: 27)",
+        default=None,
+        help="Random seed (default: training/config.json)",
     )
     parser.add_argument(
         "--feature-layout",
         type=str,
-        default="auto",
+        default=None,
         metavar="NAME",
         help=(
-            "Optional check against training: "
+            "Override feature layout from training/config.json: "
             + ", ".join(feature_layout_choices())
-            + ', or "auto" (default) to infer input width only from the checkpoint.'
         ),
     )
     args = parser.parse_args()
 
-    args.datapath = Path(args.datapath)
-    args.checkpoint = Path(args.checkpoint)
-
-    if args.feature_layout != "auto":
-        normalize_feature_layout(args.feature_layout)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    return args
+    run_config = load_latest_run_config(args.checkpoint)
+    apply_run_config_to_args(args, run_config)
+    if args.yield_csv is None:
+        args.yield_csv = YIELD_CSV
+    args.datapath = Path(args.datapath)
+    args.yield_csv = Path(args.yield_csv)
+    if args.feature_layout is not None:
+        normalize_feature_layout(args.feature_layout)
+
+    return args, run_config
 
 
 def predict_municipality(
@@ -160,16 +174,19 @@ def predict_municipality(
     chunk_size,
     device,
     year=None,
+    aggregation: str = "sum",
 ):
     """Predict yield via USCropsAggregatedNPY (same transform as training)."""
     chunks = dataset.load_pixels_from_municipality(
         municipality_code, year=year, chunk_size=chunk_size
     )
-    return sum_municipality_from_pixel_chunks(model, chunks, device)
+    return aggregate_municipality_from_pixel_chunks(
+        model, chunks, device, aggregation=aggregation
+    )
 
 
 def main():
-    args = parse_args()
+    args, run_config = parse_args()
 
     # Set random seed
     np.random.seed(args.seed)
@@ -188,12 +205,12 @@ def main():
     ck_fl = checkpoint.get("feature_layout")
     if ck_fl is not None:
         print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
-    if args.feature_layout != "auto":
+    if args.feature_layout is not None:
         expected_dim = feature_layout_input_dim(args.feature_layout)
         if input_dim != expected_dim:
             raise ValueError(
                 f"Checkpoint has input_dim={input_dim} but --feature-layout {args.feature_layout!r} "
-                f"implies {expected_dim}. Use --feature-layout auto or match training."
+                f"implies {expected_dim}. Omit --feature-layout to use training/config.json."
             )
         if ck_fl is not None and normalize_feature_layout(
             ck_fl
@@ -202,13 +219,20 @@ def main():
                 f"Checkpoint feature_layout={ck_fl!r} does not match --feature-layout {args.feature_layout!r}."
             )
 
-    # Extract normalization parameters (stored for reference, but model outputs are in original scale)
+    target, target_column, aggregation, target_unit = resolve_inference_target(
+        run_config, checkpoint
+    )
     target_mean = checkpoint.get("target_mean", 0.0)
     target_std = checkpoint.get("target_std", 1.0)
     print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
+    print(
+        f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
+    )
+    print(
         f"Training normalization stats (for reference): mean={target_mean:.2f}, std={target_std:.2f}"
     )
-    print("Note: Model outputs are in original scale (tons), no denormalization needed")
 
     # Create model
     print("Creating model...")
@@ -227,31 +251,24 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
 
-    if args.feature_layout == "auto":
-        if ck_fl is not None:
-            feature_layout = normalize_feature_layout(ck_fl)
-        elif input_dim == 12:
-            feature_layout = "spectral_xavier"
-        else:
-            feature_layout = "spectral"
-    else:
-        feature_layout = args.feature_layout
+    feature_layout = normalize_feature_layout(args.feature_layout)
+    if ck_fl is not None and normalize_feature_layout(ck_fl) != feature_layout:
+        raise ValueError(
+            f"Checkpoint feature_layout={ck_fl!r} does not match "
+            f"training config feature_layout={feature_layout!r}."
+        )
 
-    yield_csv_for_dataset = Path(
-        args.yield_csv
-        if args.yield_csv
-        else "files/municipality_production_with_codes.csv"
-    )
     dataset = USCropsAggregatedNPY(
         mode="all",
         root=args.datapath.resolve(),
-        yield_csv=yield_csv_for_dataset,
+        yield_csv=args.yield_csv,
         year=None,
         sequencelength=args.sequencelength,
         randomchoice=args.rc,
         interp=args.interp,
         seed=args.seed,
         feature_layout=feature_layout,
+        target_column=target_column,
     )
 
     # Get list of municipalities to predict
@@ -259,8 +276,8 @@ def main():
 
     # Check if user wants to filter by split
     split_filter = None
-    if args.eval_only:
-        split_filter = "eval"
+    if args.test_only:
+        split_filter = "test"
     elif args.valid_only:
         split_filter = "valid"
     elif args.train_only:
@@ -269,39 +286,26 @@ def main():
     if args.restrict_to_yield_year:
         if split_filter:
             raise ValueError(
-                "--restrict-to-yield-year cannot be used with --eval-only / --valid-only / --train-only"
+                "--restrict-to-yield-year cannot be used with --test-only / --valid-only / --train-only"
             )
         if args.yield_year is None:
             raise ValueError("--restrict-to-yield-year requires --yield-year")
-        yield_csv_path = Path(
-            args.yield_csv
-            if args.yield_csv
-            else "files/municipality_production_with_codes.csv"
-        )
-        if not yield_csv_path.exists():
-            raise FileNotFoundError(f"Yield CSV not found: {yield_csv_path}")
+        if not args.yield_csv.exists():
+            raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
         print(
             f"Restricting list to municipalities with yield year {args.yield_year} "
-            f"(from {yield_csv_path.name}) ∩ .npy under {args.datapath}"
+            f"(from {args.yield_csv.name}) ∩ .npy under {args.datapath}"
         )
-        ydf = pd.read_csv(yield_csv_path)
-        muni_code_col = None
-        for col in ["municipality_code", "code", "municipality", "muni_code"]:
-            if col in ydf.columns:
-                muni_code_col = col
-                break
-        if muni_code_col is None:
+        ydf = pd.read_csv(args.yield_csv)
+        muni_code_col = "municipality_code"
+        year_col = "year"
+        if muni_code_col not in ydf.columns:
             raise ValueError(
-                f"Could not find municipality code column. Available: {list(ydf.columns)}"
+                f"Yield CSV missing {muni_code_col!r}. Available: {list(ydf.columns)}"
             )
-        year_col = None
-        for c in ("year", "Year", "YEAR"):
-            if c in ydf.columns:
-                year_col = c
-                break
-        if year_col is None:
+        if year_col not in ydf.columns:
             raise ValueError(
-                "Yield CSV has no year/Year/YEAR column; cannot use --restrict-to-yield-year"
+                f"Yield CSV missing {year_col!r}; required for --restrict-to-yield-year"
             )
         ydf = ydf[ydf[year_col].astype(int) == int(args.yield_year)]
         codes_csv = set(ydf[muni_code_col].astype(str).str.strip())
@@ -322,34 +326,15 @@ def main():
             return
 
     elif split_filter:
-        # Filter by split from yield CSV
-        if not args.yield_csv:
-            # Try to find default yield CSV
-            default_yield_csv = Path("files/municipality_production_with_codes.csv")
-            if default_yield_csv.exists():
-                args.yield_csv = str(default_yield_csv)
-                print(f"Using default yield CSV: {args.yield_csv}")
-            else:
-                raise ValueError(
-                    f"--{split_filter}-only requires --yield-csv. "
-                    f"Could not find default at {default_yield_csv}"
-                )
-
+        if not args.yield_csv.exists():
+            raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
         print(f"Loading yield CSV from {args.yield_csv}...")
         yield_df = pd.read_csv(args.yield_csv)
-
-        # Find municipality code column
-        muni_code_col = None
-        for col in ["municipality_code", "code", "municipality", "muni_code"]:
-            if col in yield_df.columns:
-                muni_code_col = col
-                break
-        if muni_code_col is None:
+        muni_code_col = "municipality_code"
+        if muni_code_col not in yield_df.columns:
             raise ValueError(
-                f"Could not find municipality code column. Available: {list(yield_df.columns)}"
+                f"Yield CSV missing {muni_code_col!r}. Available: {list(yield_df.columns)}"
             )
-
-        # Check if split column exists
         if "split" not in yield_df.columns:
             raise ValueError(
                 f"CSV file {args.yield_csv} does not have 'split' column. "
@@ -370,15 +355,11 @@ def main():
     elif args.municipalities_csv:
         print(f"Loading municipality list from {args.municipalities_csv}...")
         muni_df = pd.read_csv(args.municipalities_csv)
-        # Try to find municipality code column
-        muni_code_col = None
-        for col in ["municipality_code", "code", "municipality", "muni_code"]:
-            if col in muni_df.columns:
-                muni_code_col = col
-                break
-        if muni_code_col is None:
+        muni_code_col = "municipality_code"
+        if muni_code_col not in muni_df.columns:
             raise ValueError(
-                f"Could not find municipality code column. Available: {list(muni_df.columns)}"
+                f"Municipalities CSV missing {muni_code_col!r}. "
+                f"Available: {list(muni_df.columns)}"
             )
         municipality_list = muni_df[muni_code_col].astype(str).tolist()
         print(f"Found {len(municipality_list)} municipalities in CSV")
@@ -418,6 +399,7 @@ def main():
             dataset,
             args.chunk_size,
             device,
+            aggregation=aggregation,
         )
 
         if prediction is not None:
@@ -445,127 +427,88 @@ def main():
         print(f"  Forecast mean: {results_df['forecast'].mean():.2f}")
 
         # Compute metrics if yield CSV is available
-        if (
-            args.yield_csv
-            or split_filter
-            or args.yield_year is not None
-            or args.restrict_to_yield_year
-        ):
-            yield_csv_path = Path(
-                args.yield_csv
-                if args.yield_csv
-                else "files/municipality_production_with_codes.csv"
-            )
-
-            if yield_csv_path.exists():
-                print(
-                    f"\nComputing metrics using ground truth from {yield_csv_path}..."
+        if split_filter or args.yield_year is not None or args.restrict_to_yield_year:
+            if not args.yield_csv.exists():
+                raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
+            print(f"\nComputing metrics using ground truth from {args.yield_csv}...")
+            yield_df = pd.read_csv(args.yield_csv)
+            muni_code_col = "municipality_code"
+            yield_col = target_column
+            year_col = "year"
+            if muni_code_col not in yield_df.columns:
+                raise ValueError(
+                    f"Yield CSV missing {muni_code_col!r}. Available: {list(yield_df.columns)}"
                 )
-                yield_df = pd.read_csv(yield_csv_path)
-
-                if args.yield_year is not None:
-                    year_col_f = None
-                    for c in ("year", "Year", "YEAR"):
-                        if c in yield_df.columns:
-                            year_col_f = c
-                            break
-                    if year_col_f is None:
-                        print(
-                            "  ⚠️  --yield-year ignored: no year/Year/YEAR column in yield CSV"
-                        )
-                    else:
-                        yield_df = yield_df[
-                            yield_df[year_col_f].astype(int) == int(args.yield_year)
-                        ].copy()
-                        print(
-                            f"  Using yield rows for harvest year {args.yield_year} ({len(yield_df)} rows)"
-                        )
-
-                # Find columns
-                muni_code_col = None
-                for col in ["municipality_code", "code", "municipality", "muni_code"]:
-                    if col in yield_df.columns:
-                        muni_code_col = col
-                        break
-
-                yield_col = None
-                for col in ["production", "yield", "yield_tons", "tons"]:
-                    if col in yield_df.columns:
-                        yield_col = col
-                        break
-
-                if muni_code_col and yield_col:
-                    # Convert to string for matching
-                    yield_df[muni_code_col] = yield_df[muni_code_col].astype(str)
-                    results_df["municipality_code"] = results_df[
-                        "municipality_code"
-                    ].astype(str)
-
-                    # Merge predictions with ground truth
-                    merged_df = results_df.merge(
-                        yield_df[[muni_code_col, yield_col]],
-                        left_on="municipality_code",
-                        right_on=muni_code_col,
-                        how="inner",
+            if yield_col not in yield_df.columns:
+                raise ValueError(
+                    f"Yield CSV missing {yield_col!r}. Available: {list(yield_df.columns)}"
+                )
+            if args.yield_year is not None:
+                if year_col not in yield_df.columns:
+                    raise ValueError(
+                        f"Yield CSV missing {year_col!r}; required for --yield-year"
                     )
-
-                    if len(merged_df) > 0:
-                        y_pred = merged_df["forecast"].values
-                        y_true = merged_df[yield_col].values
-
-                        # Filter out NaN/inf values
-                        valid_mask = np.isfinite(y_pred) & np.isfinite(y_true)
-                        y_pred = y_pred[valid_mask]
-                        y_true = y_true[valid_mask]
-
-                        if len(y_pred) > 0:
-                            metrics = regression_metrics(y_pred, y_true)
-
-                            print(f"\n{'='*60}")
-                            print(f"EVALUATION METRICS ({len(y_pred)} municipalities)")
-                            print(f"{'='*60}")
-                            print(f"  RMSE: {metrics['rmse']:.2f} tons")
-                            print(f"  MAE:  {metrics['mae']:.2f} tons")
-                            print(f"  R²:   {metrics['r2']:.4f}")
-                            if not np.isnan(metrics["mape"]):
-                                print(f"  MAPE: {metrics['mape']:.2f}%")
-                            print(f"{'='*60}")
-
-                            # Add metrics to results CSV if requested
-                            if len(merged_df) == len(results_df):
-                                # All predictions have ground truth
-                                results_df = results_df.merge(
-                                    yield_df[[muni_code_col, yield_col]],
-                                    left_on="municipality_code",
-                                    right_on=muni_code_col,
-                                    how="left",
-                                )
-                                results_df = results_df.rename(
-                                    columns={yield_col: "actual_yield"}
-                                )
-                                results_df["error"] = (
-                                    results_df["forecast"] - results_df["actual_yield"]
-                                )
-                                results_df["abs_error"] = np.abs(results_df["error"])
-                                results_df.to_csv(args.output_csv, index=False)
-                                print(
-                                    f"\n✓ Updated CSV with actual_yield, error, and abs_error columns"
-                                )
-                        else:
-                            print(
-                                "  ⚠️  No valid predictions with ground truth for metric computation"
-                            )
-                    else:
-                        print(
-                            "  ⚠️  No matching municipalities found between predictions and yield CSV"
-                        )
-                else:
-                    print(
-                        f"  ⚠️  Could not find required columns in yield CSV for metric computation"
-                    )
-            else:
+                yield_df = yield_df[
+                    yield_df[year_col].astype(int) == int(args.yield_year)
+                ].copy()
                 print(
-                    f"  ⚠️  Yield CSV not found at {yield_csv_path}, skipping metrics computation"
+                    f"  Using yield rows for harvest year {args.yield_year} ({len(yield_df)} rows)"
+                )
+
+            yield_df[muni_code_col] = yield_df[muni_code_col].astype(str)
+            results_df["municipality_code"] = results_df["municipality_code"].astype(
+                str
+            )
+            merged_df = results_df.merge(
+                yield_df[[muni_code_col, yield_col]],
+                left_on="municipality_code",
+                right_on=muni_code_col,
+                how="inner",
+            )
+            if len(merged_df) == 0:
+                raise ValueError(
+                    "No matching municipalities between predictions and yield CSV"
+                )
+
+            y_pred = merged_df["forecast"].values
+            y_true = merged_df[yield_col].values
+            valid_mask = np.isfinite(y_pred) & np.isfinite(y_true)
+            y_pred = y_pred[valid_mask]
+            y_true = y_true[valid_mask]
+            if len(y_pred) == 0:
+                raise ValueError(
+                    "No valid predictions with ground truth for metric computation"
+                )
+
+            metrics = regression_metrics(
+                y_pred, y_true, target_column=target_column
+            )
+            unit = target_unit
+            print(f"\n{'='*60}")
+            print(f"EVALUATION METRICS ({len(y_pred)} municipalities)")
+            print(f"{'='*60}")
+            print(f"  RMSE: {metrics['rmse']:.2f} {unit}")
+            print(f"  MAE:  {metrics['mae']:.2f} {unit}")
+            print(f"  R²:   {metrics['r2']:.4f}")
+            if not np.isnan(metrics["mape"]):
+                print(f"  MAPE: {metrics['mape']:.2f}%")
+            print(f"{'='*60}")
+
+            if len(merged_df) == len(results_df):
+                results_df = results_df.merge(
+                    yield_df[[muni_code_col, yield_col]],
+                    left_on="municipality_code",
+                    right_on=muni_code_col,
+                    how="left",
+                )
+                results_df = results_df.rename(columns={yield_col: "actual_yield"})
+                results_df["error"] = (
+                    results_df["forecast"] - results_df["actual_yield"]
+                )
+                results_df["abs_error"] = np.abs(results_df["error"])
+                results_df.to_csv(args.output_csv, index=False)
+                print(
+                    "\n✓ Updated CSV with actual_yield, error, and abs_error columns"
                 )
     else:
         print("\n⚠️  No predictions generated!")

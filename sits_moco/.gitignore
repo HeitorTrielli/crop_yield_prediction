@@ -165,11 +165,10 @@ figures/
 trial.py
 .DS_Store
 results/
-preprocessing/
 archive/
 SITS-MoCo/
 main_bert.py
-
+preprocess_old/
 
 files/
 heatmaps/

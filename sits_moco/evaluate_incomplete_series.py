@@ -21,12 +21,22 @@ from datasets.feature_layout import (
     normalize_feature_layout,
 )
 from models import STNetRegression
-from run_paths import predictions_dir, run_dir_from_path
-from utils_aggregated import (
-    regression_metrics,
-    stnet_regression_input_dim_from_state_dict,
-    sum_municipality_from_pixel_chunks,
+from run_paths import (
+    apply_run_config_to_args,
+    load_latest_run_config,
+    predictions_dir,
+    resolve_checkpoint_path,
+    run_dir_from_path,
 )
+from utils_aggregated import (
+    aggregate_municipality_from_pixel_chunks,
+    aggregation_for_target_column,
+    regression_metrics,
+    resolve_inference_target,
+    stnet_regression_input_dim_from_state_dict,
+)
+
+YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
 
 
 def parse_args():
@@ -42,14 +52,14 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/npy/2022-2023",
-        help="Season root: npy/2022-2023/<municipio>/<municipio>.npy (one folder per municipality, .npy inside)",
+        default=None,
+        help="Season root (default: training/config.json; override for a specific harvest folder)",
     )
     parser.add_argument(
         "--yield-csv",
         type=str,
         default=None,
-        help="Path to yield CSV file with 'split' column (default: files/municipality_production_with_codes.csv)",
+        help=f"Yield CSV (default: training/config.json; fallback {YIELD_CSV})",
     )
     parser.add_argument(
         "--output-csv",
@@ -58,20 +68,11 @@ def parse_args():
         help="Output CSV path (default: {run_dir}/predictions/incomplete_series_evaluation.csv)",
     )
     parser.add_argument(
+        "-seq",
         "--sequencelength",
         type=int,
-        default=45,
-        help="Model max time steps; match training -seq. Extra days in a window are dropped (earliest 45 by DOY).",
-    )
-    parser.add_argument(
-        "--rc",
-        action="store_true",
-        help="Ignored for incomplete-period eval (kept for compatibility with dataset init).",
-    )
-    parser.add_argument(
-        "--interp",
-        action="store_true",
-        help="Ignored for incomplete-period eval (kept for compatibility with dataset init).",
+        default=None,
+        help="Model max time steps (default: training/config.json)",
     )
     parser.add_argument(
         "--chunk-size",
@@ -89,16 +90,16 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=27,
-        help="Random seed for reproducibility (default: 27)",
+        default=None,
+        help="Random seed (default: training/config.json)",
     )
     parser.add_argument(
         "--feature-layout",
         type=str,
-        default="spectral",
+        default=None,
         choices=feature_layout_choices(),
         metavar="NAME",
-        help="Must match training: spectral (10 inputs) or spectral_xavier (12).",
+        help="Override feature layout from training/config.json",
     )
     parser.add_argument(
         "--reference-date",
@@ -108,13 +109,21 @@ def parse_args():
     )
     args = parser.parse_args()
     args.reference_date = datetime.strptime(args.reference_date, "%Y-%m-%d").date()
-    args.datapath = Path(args.datapath).resolve()
-    args.checkpoint = Path(args.checkpoint)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    return args
+    run_config = load_latest_run_config(args.checkpoint)
+    apply_run_config_to_args(args, run_config)
+    if args.yield_csv is None:
+        args.yield_csv = YIELD_CSV
+    args.datapath = Path(args.datapath).resolve()
+    args.yield_csv = Path(args.yield_csv)
+    if args.feature_layout is not None:
+        normalize_feature_layout(args.feature_layout)
+
+    return args, run_config
 
 
 def predict_municipality_with_periods(
@@ -131,11 +140,16 @@ def predict_municipality_with_periods(
     chunks = dataset.load_pixels_from_municipality_with_periods(
         municipality_code, year, num_periods, chunk_size, reference_date
     )
-    return sum_municipality_from_pixel_chunks(model, chunks, device)
+    return aggregate_municipality_from_pixel_chunks(
+        model,
+        chunks,
+        device,
+        aggregation=aggregation_for_target_column(dataset.target_column),
+    )
 
 
 def main():
-    args = parse_args()
+    args, run_config = parse_args()
 
     if args.output_csv is None:
         pred_dir = predictions_dir(run_dir_from_path(args.checkpoint), create=True)
@@ -198,83 +212,61 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
 
-    # Load test municipalities from yield CSV
-    yield_csv_path = Path(
-        args.yield_csv
-        if args.yield_csv
-        else "files/municipality_production_with_codes.csv"
+    target, target_column, aggregation, target_unit = resolve_inference_target(
+        run_config, checkpoint
+    )
+    print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
+    print(
+        f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
     )
 
-    if not yield_csv_path.exists():
-        raise FileNotFoundError(
-            f"Yield CSV not found at {yield_csv_path}. Please specify --yield-csv"
-        )
+    if not args.yield_csv.exists():
+        raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
 
-    print(f"Loading yield CSV from {yield_csv_path}...")
-    yield_df = pd.read_csv(yield_csv_path)
+    print(f"Loading yield CSV from {args.yield_csv}...")
+    yield_df = pd.read_csv(args.yield_csv)
 
-    # Find columns
-    muni_code_col = None
-    for col in ["municipality_code", "code", "municipality", "muni_code"]:
-        if col in yield_df.columns:
-            muni_code_col = col
-            break
-
-    if muni_code_col is None:
+    muni_code_col = "municipality_code"
+    yield_col = target_column
+    year_col = "year"
+    if muni_code_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find municipality code column. Available: {list(yield_df.columns)}"
+            f"Yield CSV missing {muni_code_col!r}. Available: {list(yield_df.columns)}"
         )
-
-    yield_col = None
-    for col in ["production", "yield", "yield_tons", "tons"]:
-        if col in yield_df.columns:
-            yield_col = col
-            break
-
-    if yield_col is None:
+    if yield_col not in yield_df.columns:
         raise ValueError(
-            f"Could not find yield column. Available: {list(yield_df.columns)}"
+            f"Yield CSV missing {yield_col!r}. Available: {list(yield_df.columns)}"
+        )
+    if year_col not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {year_col!r}. Available: {list(yield_df.columns)}"
         )
 
-    # Use full CSV (train + valid + test) so we have yield targets for all years (e.g. 2023 in train/valid)
     yield_df[muni_code_col] = yield_df[muni_code_col].astype(str)
+    yield_df[year_col] = yield_df[year_col].astype(int)
     print("Using all splits (train/valid/test) for yield targets")
-
-    # Check if year column exists
-    year_col = None
-    if "year" in yield_df.columns:
-        year_col = "year"
-    elif "Year" in yield_df.columns:
-        year_col = "Year"
-    elif "YEAR" in yield_df.columns:
-        year_col = "YEAR"
-
-    if year_col is None:
-        print(
-            "⚠️  Warning: No 'year' column found in CSV. Using municipality_code only."
+    muni_to_yield = {
+        (str(muni_code), int(year)): yield_val
+        for muni_code, year, yield_val in zip(
+            yield_df[muni_code_col], yield_df[year_col], yield_df[yield_col]
         )
-        muni_to_yield = dict(zip(yield_df[muni_code_col], yield_df[yield_col]))
-    else:
-        yield_df[year_col] = yield_df[year_col].astype(int)
-        muni_to_yield = {
-            (str(muni_code), int(year)): yield_val
-            for muni_code, year, yield_val in zip(
-                yield_df[muni_code_col], yield_df[year_col], yield_df[yield_col]
-            )
-        }
+    }
 
     # Dataset for vectorized loading and transform (mode="all" = use full CSV so we get all munis with .npy)
     print("Building dataset for pixel loading...")
     dataset = USCropsAggregatedNPY(
         mode="all",
         root=args.datapath,
-        yield_csv=yield_csv_path,
+        yield_csv=args.yield_csv,
         year=None,
         sequencelength=args.sequencelength,
         randomchoice=args.rc,
         interp=args.interp,
         seed=args.seed,
-        feature_layout=args.feature_layout,
+        feature_layout=normalize_feature_layout(args.feature_layout),
+        target_column=target_column,
     )
 
     single_season = getattr(dataset, "is_single_season", False) and year_col is not None
@@ -286,7 +278,10 @@ def main():
         else:
             target_year = None
         if target_year is None:
-            target_year = 2023  # fallback
+            raise ValueError(
+                f"Cannot infer harvest year from datapath folder name {folder_name!r}. "
+                "Use a season folder like 2022-2023."
+            )
         munis_with_npy = set(m for m, y in dataset.municipality_list)
         # Munis that have .npy and appear in CSV (any year)
         munis_in_csv = set(m for m, y in muni_to_yield.keys())
@@ -389,7 +384,7 @@ def main():
             y_pred = np.array(y_pred)
             y_true = np.array(y_true)
 
-            metrics = regression_metrics(y_pred, y_true)
+            metrics = regression_metrics(y_pred, y_true, target_column=target_column)
 
             print(
                 f"\nResults for {num_periods} time periods ({len(y_pred)} municipalities):"

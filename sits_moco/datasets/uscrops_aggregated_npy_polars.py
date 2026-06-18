@@ -75,6 +75,7 @@ class USCropsAggregatedNPY(Dataset):
         target_std=None,
         harvest_years: Optional[Iterable[int]] = None,
         feature_layout: str = "spectral",
+        target_column: str = "production_t",
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -111,26 +112,17 @@ class USCropsAggregatedNPY(Dataset):
             infer_schema_length=10000,  # Increase to better infer schema with null values
         )
 
-        # Find columns (try common names)
-        municipality_code_col = None
-        for col in ["municipality_code", "code", "municipality", "muni_code"]:
-            if col in yield_df.columns:
-                municipality_code_col = col
-                break
-        if municipality_code_col is None:
+        municipality_code_col = "municipality_code"
+        yield_col = target_column
+        cols = list(yield_df.columns)
+        if municipality_code_col not in cols:
             raise ValueError(
-                f"Could not find municipality code column. Available: {list(yield_df.columns)}"
+                f"Yield CSV missing {municipality_code_col!r}. Available: {cols}"
             )
-
-        yield_col = None
-        for col in ["production", "yield", "yield_tons", "tons"]:
-            if col in yield_df.columns:
-                yield_col = col
-                break
-        if yield_col is None:
-            raise ValueError(
-                f"Could not find yield column. Available: {list(yield_df.columns)}"
-            )
+        if yield_col not in cols:
+            raise ValueError(f"Yield CSV missing {yield_col!r}. Available: {cols}")
+        self.municipality_code_column = municipality_code_col
+        self.target_column = yield_col
 
         # Convert municipality_code to string and filter by split
         yield_df = yield_df.with_columns(
@@ -145,9 +137,11 @@ class USCropsAggregatedNPY(Dataset):
             print(f"Filtered to {target_split} split: {len(yield_df)} rows")
         elif mode == "all" and "split" in yield_df.columns:
             print(f"Using all splits (train/valid/test): {len(yield_df)} rows")
-        elif "mode" in yield_df.columns and mode != "all":
-            yield_df = yield_df.filter(pl.col("mode") == mode)
-            print(f"Filtered to {mode} mode: {len(yield_df)} rows")
+        elif mode != "all":
+            raise ValueError(
+                f"Yield CSV has no 'split' column; cannot filter for mode={mode!r}. "
+                "Run add_train_valid_test_split.py or use mode='all'."
+            )
 
         harvest_years_set = (
             set(int(y) for y in harvest_years) if harvest_years is not None else None

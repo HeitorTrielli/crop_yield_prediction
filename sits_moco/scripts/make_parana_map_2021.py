@@ -11,7 +11,7 @@ Training alignment:
 Requires local data:
   - --datapath must be the season directory whose .npy files correspond to harvest 2021
     (often named like 2020-2021 with folders per municipality).
-  - files/municipality_production_with_codes.csv with year column and production.
+  - files/pam_soy_pr_2019_2025.csv with year column and production_t.
 
 Dependencies for the map step: pip install geopandas geobr matplotlib
 
@@ -51,13 +51,13 @@ def parse_args() -> argparse.Namespace:
         "--yield-csv",
         type=Path,
         default=None,
-        help="Defaults to files/municipality_production_with_codes.csv under repo root",
+        help="Defaults to files/pam_soy_pr_2019_2025.csv under repo root",
     )
     p.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
-        help="model_best.pth (default: Seed6003 run under results/, new or legacy layout)",
+        help="model_best.pth (default: Seed6003 run under results/training/)",
     )
     p.add_argument(
         "--output-csv",
@@ -89,12 +89,12 @@ def main() -> None:
     yield_csv = (
         Path(args.yield_csv)
         if args.yield_csv
-        else root / "files/municipality_production_with_codes.csv"
+        else root / "files/pam_soy_pr_2019_2025.csv"
     )
 
     if args.checkpoint is None:
         run_guess = (
-            root / "results/Yield_STNetRegression_Pad_Hy_2020_2022_2023_2024_Seed6003"
+            root / "results/Total_20_22_23_24_Seed6003"
         )
         args.checkpoint = model_best_in_run(run_guess)
     else:

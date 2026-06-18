@@ -9,13 +9,13 @@ Days with no valid pixels for a municipality are skipped. No-data: 0, -9999, NaN
 
 CLI usage:
   # Defaults: tiff-dir=files/raw_tiff/2022-2023/parana, shapefile-dir=files/shapefiles, output-dir=files/daily_tiff
-  python clip_tiffs_to_shapefiles.py
+  python preprocessing/clip_tiffs_to_shapefiles.py
 
   # Custom paths and 20 parallel workers
-  python clip_tiffs_to_shapefiles.py --tiff-dir files/raw_tiff/2022-2023/parana --shapefile-dir files/shapefiles --output-dir files/daily_tiff -j 20
+  python preprocessing/clip_tiffs_to_shapefiles.py --tiff-dir files/raw_tiff/2022-2023/parana --shapefile-dir files/shapefiles --output-dir files/daily_tiff -j 20
 
   # Single shapefile(s) instead of directory
-  python clip_tiffs_to_shapefiles.py --shapefile path/to/4100103.shp --shapefile path/to/4100202.shp -j 20
+  python preprocessing/clip_tiffs_to_shapefiles.py --shapefile path/to/4100103.shp --shapefile path/to/4100202.shp -j 20
 """
 
 from __future__ import annotations
@@ -77,13 +77,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("files/daily_tiff"),
         help="Base output directory (default: files/daily_tiff). Output: {output_dir}/{season}/{municipal_code}/",
-    )
-    p.add_argument(
-        "--resolution",
-        type=int,
-        default=30,
-        metavar="M",
-        help="Unused (kept for backward-compatible CLI). Resolution is not part of output paths.",
     )
     p.add_argument(
         "--all-touched",
@@ -282,7 +275,6 @@ def clip_state_tiffs_to_municipalities(
     shapefile_dir: Path | str | None = None,
     shapefiles: list[Path | str] | None = None,
     output_dir: Path | str = "files/daily_tiff",
-    resolution: int = 30,
     year_range: str | None = None,
     all_touched: bool = True,
     verbose: bool = True,
@@ -310,8 +302,6 @@ def clip_state_tiffs_to_municipalities(
     output_dir : path
         Base output directory (default: files/daily_tiff). Output will be
         {output_dir}/{season}/{municipal_code}/.
-    resolution : int
-        Unused; kept for API compatibility.
     year_range : str, optional
         Subfolder name for year range (e.g. "2022-2023"). If None, inferred from TIFF filenames.
     all_touched : bool
@@ -405,7 +395,6 @@ def main() -> None:
             shapefile_dir=args.shapefile_dir,
             shapefiles=args.shapefiles or [],
             output_dir=args.output_dir,
-            resolution=args.resolution,
             year_range=getattr(args, "year_range", None),
             all_touched=args.all_touched,
             verbose=True,
