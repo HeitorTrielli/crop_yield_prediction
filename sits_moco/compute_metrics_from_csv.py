@@ -9,8 +9,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from run_paths import predictions_dir, run_dir_from_forecasts_csv
-from utils_aggregated import regression_metrics
+from run_paths import (
+    load_latest_run_config,
+    predictions_dir,
+    run_dir_from_forecasts_csv,
+)
+from utils_aggregated import regression_metrics, resolve_inference_target
 
 YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
 
@@ -29,7 +33,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help=f"Path to yield CSV with ground truth (default: {YIELD_CSV})",
+        help=f"Yield CSV (default: training/config.json from forecasts run; fallback {YIELD_CSV})",
     )
     parser.add_argument(
         "--split",
@@ -60,6 +64,7 @@ def compute_metrics_for_split(
     yield_muni_col,
     yield_col,
     split_name=None,
+    target_column=None,
 ):
     """Compute metrics for a specific split or all data."""
     if split_name:
@@ -109,7 +114,9 @@ def compute_metrics_for_split(
     if len(y_pred) == 0:
         raise ValueError("No valid predictions with ground truth for metric computation")
 
-    metrics = regression_metrics(y_pred, y_true)
+    metrics = regression_metrics(
+        y_pred, y_true, target_column=target_column or yield_col
+    )
     return {
         "split": split_name if split_name else "all",
         "num_municipalities": len(y_pred),
@@ -134,9 +141,30 @@ def main():
 
     if not args.forecasts_csv.exists():
         raise FileNotFoundError(f"Forecasts CSV not found: {args.forecasts_csv}")
+
+    run_dir = run_dir_from_forecasts_csv(args.forecasts_csv)
+    if run_dir is not None:
+        run_config = load_latest_run_config(run_dir)
+        _, target_column, _, target_unit = resolve_inference_target(run_config)
+        if args.yield_csv is None:
+            cli_yield = run_config["cli"].get("yield_csv")
+            args.yield_csv = Path(cli_yield) if cli_yield else YIELD_CSV
+        print(
+            f"Run config: {run_config['config_path']} "
+            f"(session {run_config['session_index']})"
+        )
+    else:
+        if args.yield_csv is None:
+            args.yield_csv = YIELD_CSV
+        raise ValueError(
+            f"Forecasts CSV is not under a run's predictions/ folder ({args.forecasts_csv}). "
+            "Pass a CSV from predict_yield.py or provide --yield-csv explicitly."
+        )
+
     if not args.yield_csv.exists():
         raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
 
+    print(f"Target: {target_column} ({target_unit})")
     print(f"Loading forecasts from {args.forecasts_csv}...")
     forecasts_df = pd.read_csv(args.forecasts_csv)
     if "forecast" not in forecasts_df.columns:
@@ -149,7 +177,7 @@ def main():
     all_metrics = []
     forecasts_muni_col = "municipality_code"
     yield_muni_col = "municipality_code"
-    yield_col = "production_t"
+    yield_col = target_column
 
     if args.split:
         print(f"\nComputing metrics for '{args.split}' split...")
@@ -161,6 +189,7 @@ def main():
                 yield_muni_col,
                 yield_col,
                 args.split,
+                target_column=yield_col,
             )
         )
     elif "split" in forecasts_df.columns:
@@ -174,6 +203,7 @@ def main():
                     yield_muni_col,
                     yield_col,
                     split_name,
+                    target_column=yield_col,
                 )
             )
     else:
@@ -186,6 +216,7 @@ def main():
                 yield_muni_col,
                 yield_col,
                 None,
+                target_column=yield_col,
             )
         )
 
@@ -197,8 +228,8 @@ def main():
         print(
             f"\n{split_name.upper()} Split ({metrics['num_municipalities']} municipalities):"
         )
-        print(f"  RMSE: {metrics['rmse']:.2f} tons")
-        print(f"  MAE:  {metrics['mae']:.2f} tons")
+        print(f"  RMSE: {metrics['rmse']:.2f} {target_unit}")
+        print(f"  MAE:  {metrics['mae']:.2f} {target_unit}")
         print(f"  R²:   {metrics['r2']:.4f}")
         if metrics["mape"] is not None:
             print(f"  MAPE: {metrics['mape']:.2f}%")

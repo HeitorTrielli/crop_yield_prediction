@@ -40,9 +40,16 @@ from tqdm import tqdm
 
 from datasets.pixel_transform import PixelTransform
 from models import STNetRegression
-from run_paths import predictions_dir, run_dir_from_path
+from run_paths import (
+    apply_run_config_to_args,
+    load_latest_run_config,
+    predictions_dir,
+    resolve_checkpoint_path,
+    run_dir_from_path,
+)
 from utils_aggregated import (
     regression_metrics,
+    resolve_inference_target,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -313,8 +320,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--datapath",
         type=Path,
-        default=Path("files/npy"),
-        help="Root with {municipality}/{municipality}.npy (or {year-range}/{muni}/...)",
+        default=None,
+        help="NPY root (default: training/config.json)",
     )
     p.add_argument(
         "--tiffpath",
@@ -357,28 +364,23 @@ def parse_args() -> argparse.Namespace:
         help="Output CSV path (default: {run_dir}/predictions/talhoes_forecasts.csv)",
     )
     p.add_argument(
+        "-seq",
         "--sequencelength",
         type=int,
-        default=45,
-        help="Max time-series length (default: 45)",
-    )
-    p.add_argument("--rc", action="store_true", help="Random choice subsampling")
-    p.add_argument(
-        "--interp",
-        action="store_true",
-        help="Interpolate time series to sequencelength",
+        default=None,
+        help="Max time-series length (default: training/config.json)",
     )
     p.add_argument(
         "--chunk-size", type=int, default=2000, help="Pixels per forward pass"
     )
     p.add_argument("-d", "--device", type=str, default=None)
-    p.add_argument("--seed", type=int, default=27)
+    p.add_argument("--seed", type=int, default=None)
     p.add_argument(
         "--feature-layout",
         type=str,
-        default="auto",
+        default=None,
         metavar="NAME",
-        help=", ".join(feature_layout_choices()) + ', or "auto"',
+        help="Override feature layout from training/config.json",
     )
     p.add_argument(
         "--municipalities",
@@ -404,11 +406,14 @@ def parse_args() -> argparse.Namespace:
         geojson = here / "benchmark" / "talhoes_baseline.geojson"
         args.talhoes_gpkg = gpkg if gpkg.is_file() else geojson
 
-    if args.feature_layout != "auto":
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
+    run_config = load_latest_run_config(args.checkpoint)
+    apply_run_config_to_args(args, run_config)
+    if args.feature_layout is not None:
         normalize_feature_layout(args.feature_layout)
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
-    return args
+    return args, run_config
 
 
 def resolve_muni_npy(
@@ -623,8 +628,9 @@ def forecast_for_talhao(
     pred_grid: np.ndarray,
     keep_mask: np.ndarray,
     transform,
+    aggregation: str = "sum",
 ) -> tuple[float, int]:
-    """Sum pixel predictions whose centers fall inside the talhão polygon."""
+    """Aggregate pixel predictions inside the talhão polygon (sum or mean)."""
     inside = features.geometry_mask(
         [geometry],
         out_shape=pred_grid.shape,
@@ -636,6 +642,8 @@ def forecast_for_talhao(
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         return float("nan"), 0
+    if aggregation == "mean":
+        return float(vals.mean()), int(vals.size)
     return float(vals.sum()), int(vals.size)
 
 
@@ -648,12 +656,17 @@ def load_model(
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint["model_state"]
     input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
-    if feature_layout != "auto":
-        expected = feature_layout_input_dim(feature_layout)
-        if input_dim != expected:
-            raise ValueError(
-                f"Checkpoint input_dim={input_dim} vs --feature-layout {feature_layout!r} ({expected})"
-            )
+    resolved_layout = normalize_feature_layout(feature_layout)
+    expected = feature_layout_input_dim(resolved_layout)
+    if input_dim != expected:
+        raise ValueError(
+            f"Checkpoint input_dim={input_dim} vs feature_layout {resolved_layout!r} ({expected})"
+        )
+    ck_fl = checkpoint.get("feature_layout")
+    if ck_fl is not None and normalize_feature_layout(ck_fl) != resolved_layout:
+        raise ValueError(
+            f"Checkpoint feature_layout={ck_fl!r} does not match config {resolved_layout!r}"
+        )
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
@@ -664,21 +677,17 @@ def load_model(
     else:
         model.load_state_dict(state_dict, strict=False)
     model.eval()
-    ck_fl = checkpoint.get("feature_layout")
-    if feature_layout == "auto":
-        if ck_fl is not None:
-            resolved_layout = normalize_feature_layout(ck_fl)
-        elif input_dim == 12:
-            resolved_layout = "spectral_xavier"
-        else:
-            resolved_layout = "spectral"
-    else:
-        resolved_layout = normalize_feature_layout(feature_layout)
-    return model, input_dim, resolved_layout
+    _, _, aggregation, _ = resolve_inference_target(
+        load_latest_run_config(checkpoint_path), checkpoint
+    )
+    return model, input_dim, resolved_layout, aggregation
 
 
 def main() -> None:
-    args = parse_args()
+    args, run_config = parse_args()
+    print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
     if args.output_csv is None:
         args.output_csv = (
             predictions_dir(run_dir_from_path(args.checkpoint), create=True)
@@ -706,10 +715,10 @@ def main() -> None:
         talhoes = talhoes[talhoes["geo_cod"].astype(str).isin(codes)]
         print(f"  filtered to {len(talhoes)} talhões in municipalities {sorted(codes)}")
 
-    model, input_dim, feature_layout = load_model(
+    model, input_dim, feature_layout, aggregation = load_model(
         args.checkpoint, device, args.sequencelength, args.feature_layout
     )
-    print(f"Model loaded (input_dim={input_dim})")
+    print(f"Model loaded (input_dim={input_dim}, pixel aggregation={aggregation})")
     print("Mode: talhão-only (infer pixels inside plot polygons only)")
     if args.reproject_tiffs:
         print("Valid-pixel mask: reproject each daily TIFF (slow)")
@@ -791,7 +800,7 @@ def main() -> None:
 
         for _, row in sub.iterrows():
             forecast, n_pixels = forecast_for_talhao(
-                row.geometry, pred_grid, keep_mask, transform
+                row.geometry, pred_grid, keep_mask, transform, aggregation
             )
             rec = {
                 "talhao_key": row["talhao_key"],

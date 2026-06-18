@@ -14,7 +14,9 @@ Layout::
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 TRAINING_SUBDIR = "training"
 FIGURES_SUBDIR = "figures"
@@ -127,3 +129,101 @@ def run_dir_from_forecasts_csv(csv_path: Path | str) -> Path | None:
     if csv_path.parent.name == PREDICTIONS_SUBDIR:
         return csv_path.parent.parent
     return None
+
+
+def training_config_path(run_dir: Path | str) -> Path:
+    """Path to training/config.json under a run root."""
+    return training_dir(run_dir) / "config.json"
+
+
+def load_training_sessions(config_path: Path) -> list[dict[str, Any]]:
+    """Load session records from training/config.json (supports legacy single-object format)."""
+    if not config_path.is_file():
+        return []
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "sessions" in data:
+        return list(data["sessions"])
+    if isinstance(data, dict) and "cli" in data:
+        return [
+            {
+                "session_index": 0,
+                "kind": "initial",
+                "cli": data.get("cli"),
+                "computed": data.get("computed"),
+                "environment": data.get("environment"),
+                "resume": None,
+            }
+        ]
+    return []
+
+
+def load_latest_run_config(checkpoint_or_run_dir: Path | str) -> dict[str, Any]:
+    """
+    Return the latest training session from training/config.json for a run.
+
+    Keys: run_dir, config_path, session_index, cli, computed.
+    """
+    run_dir = run_dir_from_path(checkpoint_or_run_dir)
+    config_path = training_config_path(run_dir)
+    sessions = load_training_sessions(config_path)
+    if not sessions:
+        raise FileNotFoundError(
+            f"No training config at {config_path}. "
+            "Pass a checkpoint under a run with training/config.json."
+        )
+    latest = sessions[-1]
+    return {
+        "run_dir": run_dir,
+        "config_path": config_path,
+        "session_index": latest.get("session_index", len(sessions) - 1),
+        "cli": dict(latest.get("cli") or {}),
+        "computed": dict(latest.get("computed") or {}),
+    }
+
+
+def _config_value(cli: dict, computed: dict, cli_key: str, computed_key: str | None = None):
+    if computed_key and computed.get(computed_key) is not None:
+        return computed[computed_key]
+    return cli.get(cli_key)
+
+
+def apply_run_config_to_args(
+    args,
+    run_config: dict[str, Any],
+    *,
+    path_fields: frozenset[str] = frozenset({"datapath", "yield_csv"}),
+) -> None:
+    """
+    Fill argparse Namespace fields from the latest training session when unset (None).
+
+    Boolean flags rc/interp are taken from config when the key is present.
+    """
+    cli = run_config["cli"]
+    computed = run_config["computed"]
+    config_path = run_config["config_path"]
+
+    scalar_fields = {
+        "datapath": ("datapath", None),
+        "yield_csv": ("yield_csv", None),
+        "sequencelength": ("sequencelength", None),
+        "feature_layout": ("feature_layout", "feature_layout"),
+        "seed": ("seed", None),
+    }
+    for arg_name, (cli_key, computed_key) in scalar_fields.items():
+        if not hasattr(args, arg_name):
+            continue
+        if getattr(args, arg_name) is not None:
+            continue
+        val = _config_value(cli, computed, cli_key, computed_key)
+        if val is None:
+            raise ValueError(
+                f"Missing {arg_name!r} in {config_path} and not passed on the command line."
+            )
+        setattr(args, arg_name, Path(val) if arg_name in path_fields else val)
+
+    for arg_name, cli_key, default in (
+        ("rc", "rc", False),
+        ("interp", "interp", False),
+    ):
+        setattr(args, arg_name, bool(cli[cli_key]) if cli_key in cli else default)

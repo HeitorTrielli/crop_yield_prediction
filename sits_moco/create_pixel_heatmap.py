@@ -37,11 +37,28 @@ from municipality_labels import (
     resolve_municipality_display_name,
 )
 from run_paths import (
+    apply_run_config_to_args,
     intramunicipal_heatmap_dir,
+    load_latest_run_config,
     resolve_checkpoint_path,
     run_dir_from_path,
 )
-from utils_aggregated import stnet_regression_input_dim_from_state_dict
+from utils_aggregated import (
+    resolve_inference_target,
+    stnet_regression_input_dim_from_state_dict,
+)
+
+
+def _yield_stats_text(valid_predictions, unit: str, aggregation: str) -> str:
+    lines = [
+        f"Min: {valid_predictions.min():.2f} {unit}",
+        f"Max: {valid_predictions.max():.2f} {unit}",
+        f"Mean: {valid_predictions.mean():.2f} {unit}",
+    ]
+    if aggregation == "sum":
+        lines.append(f"Total: {valid_predictions.sum():.2f} {unit}")
+    lines.append(f"Pixels: {len(valid_predictions):,}")
+    return "\n".join(lines)
 
 
 def parse_args():
@@ -57,10 +74,10 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/npy",
+        default=None,
         help=(
-            "Dataset root: {datapath}/{muni}/{muni}.npy or "
-            "{datapath}/{year-range}/{muni}/{muni}.npy (use --year-range for daily mode)"
+            "Dataset root (default: training/config.json). "
+            "Override with a season folder when using --year-range."
         ),
     )
     parser.add_argument(
@@ -101,10 +118,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "-seq",
         "--sequencelength",
         type=int,
-        default=45,
-        help="Maximum length of time series data (default: 45). For daily mode, extra days are dropped (earliest by DOY).",
+        default=None,
+        help="Max time steps (default: training/config.json)",
     )
     parser.add_argument(
         "--rc",
@@ -132,8 +150,8 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=27,
-        help="Random seed for reproducibility (default: 27)",
+        default=None,
+        help="Random seed (default: training/config.json)",
     )
     parser.add_argument(
         "--year",
@@ -161,13 +179,9 @@ def parse_args():
     parser.add_argument(
         "--feature-layout",
         type=str,
-        default="auto",
+        default=None,
         metavar="NAME",
-        help=(
-            "Optional check vs training: "
-            + ", ".join(feature_layout_choices())
-            + ', or "auto" (default) from checkpoint only.'
-        ),
+        help="Override feature layout from training/config.json",
     )
     parser.add_argument(
         "--report-panel",
@@ -212,12 +226,14 @@ def parse_args():
     )
     args = parser.parse_args()
 
-    if args.feature_layout != "auto":
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
+    run_config = load_latest_run_config(args.checkpoint)
+    apply_run_config_to_args(args, run_config)
+    if args.feature_layout is not None:
         normalize_feature_layout(args.feature_layout)
 
     args.datapath = Path(args.datapath)
     args.tiffpath = Path(args.tiffpath)
-    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
     if args.compare_checkpoint is not None:
         args.compare_checkpoint = resolve_checkpoint_path(args.compare_checkpoint)
     if args.output_dir is not None:
@@ -230,7 +246,7 @@ def parse_args():
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    return args
+    return args, run_config
 
 
 def parse_filename(filename):
@@ -1119,6 +1135,9 @@ def create_heatmap(
     tiffpath=None,
     year=None,
     title=None,
+    *,
+    target_unit: str,
+    aggregation: str,
 ):
     """Create heatmap visualization from spatial predictions using geographic coordinates."""
     if not prediction_map:
@@ -1164,7 +1183,7 @@ def create_heatmap(
 
     # Add colorbar
     cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Yield Prediction (tons)", rotation=270, labelpad=20)
+    cbar.set_label(f"Yield Prediction ({target_unit})", rotation=270, labelpad=20)
 
     municipality_name = get_municipality_name(tiffpath, municipality_code)
     if title is None:
@@ -1177,13 +1196,7 @@ def create_heatmap(
     # Add statistics text
     valid_predictions = heatmap[~np.isnan(heatmap)]
     if len(valid_predictions) > 0:
-        stats_text = (
-            f"Min: {valid_predictions.min():.2f} tons\n"
-            f"Max: {valid_predictions.max():.2f} tons\n"
-            f"Mean: {valid_predictions.mean():.2f} tons\n"
-            f"Total: {valid_predictions.sum():.2f} tons\n"
-            f"Pixels: {len(valid_predictions):,}"
-        )
+        stats_text = _yield_stats_text(valid_predictions, target_unit, aggregation)
         ax.text(
             0.02,
             0.98,
@@ -1545,28 +1558,25 @@ def load_stnet_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
     sequencelength: int,
-    feature_layout: str = "auto",
+    feature_layout: str,
 ) -> tuple[STNetRegression, int]:
     checkpoint = torch.load(
         checkpoint_path, map_location=device, weights_only=False
     )
     state_dict = checkpoint["model_state"]
     input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
+    layout = normalize_feature_layout(feature_layout)
+    expected_dim = feature_layout_input_dim(layout)
+    if input_dim != expected_dim:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} has input_dim={input_dim} but "
+            f"feature_layout {layout!r} implies {expected_dim}."
+        )
     ck_fl = checkpoint.get("feature_layout")
-    if feature_layout != "auto":
-        expected_dim = feature_layout_input_dim(feature_layout)
-        if input_dim != expected_dim:
-            raise ValueError(
-                f"Checkpoint {checkpoint_path} has input_dim={input_dim} but "
-                f"--feature-layout {feature_layout!r} implies {expected_dim}."
-            )
-        if ck_fl is not None and normalize_feature_layout(
-            ck_fl
-        ) != normalize_feature_layout(feature_layout):
-            raise ValueError(
-                f"Checkpoint feature_layout={ck_fl!r} does not match "
-                f"--feature-layout {feature_layout!r}."
-            )
+    if ck_fl is not None and normalize_feature_layout(ck_fl) != layout:
+        raise ValueError(
+            f"Checkpoint feature_layout={ck_fl!r} does not match config {layout!r}."
+        )
 
     model = STNetRegression(
         input_dim=input_dim,
@@ -1753,6 +1763,9 @@ def create_combined_heatmap(
     output_path,
     municipality_codes,
     tiffpath=None,
+    *,
+    target_unit: str,
+    aggregation: str,
 ):
     """Create a combined heatmap visualization with multiple municipalities side by side."""
     num_municipalities = len(heatmaps_data)
@@ -1823,12 +1836,8 @@ def create_combined_heatmap(
         # Add statistics text
         valid_predictions = heatmap[~np.isnan(heatmap)]
         if len(valid_predictions) > 0:
-            stats_text = (
-                f"Min: {valid_predictions.min():.2f} tons\n"
-                f"Max: {valid_predictions.max():.2f} tons\n"
-                f"Mean: {valid_predictions.mean():.2f} tons\n"
-                f"Total: {valid_predictions.sum():.2f} tons\n"
-                f"Pixels: {len(valid_predictions):,}"
+            stats_text = _yield_stats_text(
+                valid_predictions, target_unit, aggregation
             )
             ax.text(
                 0.02,
@@ -1868,7 +1877,7 @@ def create_combined_heatmap(
         [0.93, pos.y0, 0.02, pos.height]
     )  # [left, bottom, width, height]
     cbar = fig.colorbar(im, cax=cbar_ax, orientation="vertical")
-    cbar.set_label("Yield Prediction (tons)", rotation=270, labelpad=20)
+    cbar.set_label(f"Yield Prediction ({target_unit})", rotation=270, labelpad=20)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1887,6 +1896,8 @@ def save_yield_heatmap_only(
     year,
     suffix: str = "",
     title_suffix: str = "",
+    target_unit: str,
+    aggregation: str,
 ) -> bool:
     """Save a single yield prediction heatmap (used for incomplete-series k=1..6)."""
     if prediction_map is None:
@@ -1908,6 +1919,8 @@ def save_yield_heatmap_only(
         tiffpath=tiffpath,
         year=year,
         title=plot_title,
+        target_unit=target_unit,
+        aggregation=aggregation,
     )
     return True
 
@@ -1925,6 +1938,8 @@ def save_individual_municipality_figures(
     *,
     tiffpath,
     year,
+    target_unit: str,
+    aggregation: str,
 ) -> bool:
     """Write yield / NDVI heatmaps and histograms for one municipality (no model inference)."""
     if prediction_map is None:
@@ -1944,6 +1959,8 @@ def save_individual_municipality_figures(
         municipality_code,
         tiffpath=tiffpath,
         year=year,
+        target_unit=target_unit,
+        aggregation=aggregation,
     )
 
     ndvi_mean_suffix = "Mean (harvest year, after month 3)"
@@ -1967,7 +1984,7 @@ def save_individual_municipality_figures(
             pred_values,
             output_dir / f"{file_stem}_predictions_histogram.png",
             f"Yield predictions - {municipality_name}",
-            "Prediction (tons)",
+            f"Prediction ({target_unit})",
         )
 
     ndvi_map = ndvi_map or {}
@@ -2011,7 +2028,17 @@ def save_individual_municipality_figures(
 
 
 def main():
-    args = parse_args()
+    args, run_config = parse_args()
+    checkpoint = torch.load(
+        args.checkpoint, map_location=args.device, weights_only=False
+    )
+    _, _, args.aggregation, args.target_unit = resolve_inference_target(
+        run_config, checkpoint
+    )
+    print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
+    print(f"Target unit: {args.target_unit} (pixel aggregation: {args.aggregation})")
 
     if args.incomplete_series:
         if args.num_periods:
@@ -2033,29 +2060,21 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     print(f"Loading checkpoint from {args.checkpoint}...")
-    checkpoint = torch.load(
-        args.checkpoint, map_location=args.device, weights_only=False
-    )
-
     state_dict = checkpoint["model_state"]
     input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
     print(f"STNet input_dim from checkpoint: {input_dim}")
+    feature_layout = normalize_feature_layout(args.feature_layout)
+    expected_dim = feature_layout_input_dim(feature_layout)
+    if input_dim != expected_dim:
+        raise ValueError(
+            f"Checkpoint has input_dim={input_dim} but feature_layout {feature_layout!r} "
+            f"implies {expected_dim}."
+        )
     ck_fl = checkpoint.get("feature_layout")
-    if ck_fl is not None:
-        print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
-    if args.feature_layout != "auto":
-        expected_dim = feature_layout_input_dim(args.feature_layout)
-        if input_dim != expected_dim:
-            raise ValueError(
-                f"Checkpoint has input_dim={input_dim} but --feature-layout {args.feature_layout!r} "
-                f"implies {expected_dim}. Use --feature-layout auto or match training."
-            )
-        if ck_fl is not None and normalize_feature_layout(
-            ck_fl
-        ) != normalize_feature_layout(args.feature_layout):
-            raise ValueError(
-                f"Checkpoint feature_layout={ck_fl!r} does not match --feature-layout {args.feature_layout!r}."
-            )
+    if ck_fl is not None and normalize_feature_layout(ck_fl) != feature_layout:
+        raise ValueError(
+            f"Checkpoint feature_layout={ck_fl!r} does not match config {feature_layout!r}."
+        )
 
     # Create model
     print("Creating model...")
@@ -2147,6 +2166,8 @@ def main():
                         f"first {num_periods} season month"
                         + ("s" if num_periods != 1 else "")
                     ),
+                    target_unit=args.target_unit,
+                    aggregation=args.aggregation,
                 )
                 continue
 
@@ -2232,7 +2253,9 @@ def main():
             args.output_dir,
             tiffpath=args.tiffpath,
             year=args.year,
-            ):
+            target_unit=args.target_unit,
+            aggregation=args.aggregation,
+        ):
             print("\n❌ Failed to create individual heatmap")
     else:
         output_path = (
@@ -2247,6 +2270,8 @@ def main():
             output_path,
             municipality_codes,
             tiffpath=args.tiffpath,
+            target_unit=args.target_unit,
+            aggregation=args.aggregation,
         )
         print(f"\n✓ Done! Combined heatmap saved to {output_path}")
 

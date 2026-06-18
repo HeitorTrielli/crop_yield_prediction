@@ -75,6 +75,7 @@ class USCropsAggregatedNPY(Dataset):
         target_std=None,
         harvest_years: Optional[Iterable[int]] = None,
         feature_layout: str = "spectral",
+        target_column: str = "production_t",
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -112,7 +113,7 @@ class USCropsAggregatedNPY(Dataset):
         )
 
         municipality_code_col = "municipality_code"
-        yield_col = "production_t"
+        yield_col = target_column
         cols = list(yield_df.columns)
         if municipality_code_col not in cols:
             raise ValueError(

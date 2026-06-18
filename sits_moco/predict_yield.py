@@ -18,11 +18,18 @@ from datasets.feature_layout import (
     normalize_feature_layout,
 )
 from models import STNetRegression
-from run_paths import predictions_dir, run_dir_from_path
+from run_paths import (
+    apply_run_config_to_args,
+    load_latest_run_config,
+    predictions_dir,
+    resolve_checkpoint_path,
+    run_dir_from_path,
+)
 from utils_aggregated import (
+    aggregate_municipality_from_pixel_chunks,
     regression_metrics,
+    resolve_inference_target,
     stnet_regression_input_dim_from_state_dict,
-    sum_municipality_from_pixel_chunks,
 )
 
 YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
@@ -41,8 +48,8 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/npy",
-        help="Path to dataset root directory containing municipality .npy files",
+        default=None,
+        help="Dataset root (default: training/config.json from --checkpoint)",
     )
     parser.add_argument(
         "--output-csv",
@@ -60,7 +67,7 @@ def parse_args():
         "--yield-csv",
         type=str,
         default=None,
-        help=f"Path to yield CSV (default: {YIELD_CSV})",
+        help=f"Yield CSV (default: training/config.json; fallback {YIELD_CSV} if missing)",
     )
     parser.add_argument(
         "--yield-year",
@@ -96,10 +103,11 @@ def parse_args():
         help="Only predict municipalities in the 'train' split (requires --yield-csv)",
     )
     parser.add_argument(
+        "-seq",
         "--sequencelength",
         type=int,
-        default=6,
-        help="Maximum length of time series data (default: 6)",
+        default=None,
+        help="Max time steps (default: training/config.json)",
     )
     parser.add_argument(
         "--rc",
@@ -127,34 +135,36 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=27,
-        help="Random seed for reproducibility (default: 27)",
+        default=None,
+        help="Random seed (default: training/config.json)",
     )
     parser.add_argument(
         "--feature-layout",
         type=str,
-        default="auto",
+        default=None,
         metavar="NAME",
         help=(
-            "Optional check against training: "
+            "Override feature layout from training/config.json: "
             + ", ".join(feature_layout_choices())
-            + ', or "auto" (default) to infer input width only from the checkpoint.'
         ),
     )
     args = parser.parse_args()
 
-    args.datapath = Path(args.datapath)
-    args.checkpoint = Path(args.checkpoint)
-
-    if args.feature_layout != "auto":
-        normalize_feature_layout(args.feature_layout)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    args.yield_csv = Path(args.yield_csv) if args.yield_csv else YIELD_CSV
+    run_config = load_latest_run_config(args.checkpoint)
+    apply_run_config_to_args(args, run_config)
+    if args.yield_csv is None:
+        args.yield_csv = YIELD_CSV
+    args.datapath = Path(args.datapath)
+    args.yield_csv = Path(args.yield_csv)
+    if args.feature_layout is not None:
+        normalize_feature_layout(args.feature_layout)
 
-    return args
+    return args, run_config
 
 
 def predict_municipality(
@@ -164,16 +174,19 @@ def predict_municipality(
     chunk_size,
     device,
     year=None,
+    aggregation: str = "sum",
 ):
     """Predict yield via USCropsAggregatedNPY (same transform as training)."""
     chunks = dataset.load_pixels_from_municipality(
         municipality_code, year=year, chunk_size=chunk_size
     )
-    return sum_municipality_from_pixel_chunks(model, chunks, device)
+    return aggregate_municipality_from_pixel_chunks(
+        model, chunks, device, aggregation=aggregation
+    )
 
 
 def main():
-    args = parse_args()
+    args, run_config = parse_args()
 
     # Set random seed
     np.random.seed(args.seed)
@@ -192,12 +205,12 @@ def main():
     ck_fl = checkpoint.get("feature_layout")
     if ck_fl is not None:
         print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
-    if args.feature_layout != "auto":
+    if args.feature_layout is not None:
         expected_dim = feature_layout_input_dim(args.feature_layout)
         if input_dim != expected_dim:
             raise ValueError(
                 f"Checkpoint has input_dim={input_dim} but --feature-layout {args.feature_layout!r} "
-                f"implies {expected_dim}. Use --feature-layout auto or match training."
+                f"implies {expected_dim}. Omit --feature-layout to use training/config.json."
             )
         if ck_fl is not None and normalize_feature_layout(
             ck_fl
@@ -206,13 +219,20 @@ def main():
                 f"Checkpoint feature_layout={ck_fl!r} does not match --feature-layout {args.feature_layout!r}."
             )
 
-    # Extract normalization parameters (stored for reference, but model outputs are in original scale)
+    target, target_column, aggregation, target_unit = resolve_inference_target(
+        run_config, checkpoint
+    )
     target_mean = checkpoint.get("target_mean", 0.0)
     target_std = checkpoint.get("target_std", 1.0)
     print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
+    print(
+        f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
+    )
+    print(
         f"Training normalization stats (for reference): mean={target_mean:.2f}, std={target_std:.2f}"
     )
-    print("Note: Model outputs are in original scale (tons), no denormalization needed")
 
     # Create model
     print("Creating model...")
@@ -231,15 +251,12 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
 
-    if args.feature_layout == "auto":
-        if ck_fl is not None:
-            feature_layout = normalize_feature_layout(ck_fl)
-        elif input_dim == 12:
-            feature_layout = "spectral_xavier"
-        else:
-            feature_layout = "spectral"
-    else:
-        feature_layout = args.feature_layout
+    feature_layout = normalize_feature_layout(args.feature_layout)
+    if ck_fl is not None and normalize_feature_layout(ck_fl) != feature_layout:
+        raise ValueError(
+            f"Checkpoint feature_layout={ck_fl!r} does not match "
+            f"training config feature_layout={feature_layout!r}."
+        )
 
     dataset = USCropsAggregatedNPY(
         mode="all",
@@ -251,6 +268,7 @@ def main():
         interp=args.interp,
         seed=args.seed,
         feature_layout=feature_layout,
+        target_column=target_column,
     )
 
     # Get list of municipalities to predict
@@ -381,6 +399,7 @@ def main():
             dataset,
             args.chunk_size,
             device,
+            aggregation=aggregation,
         )
 
         if prediction is not None:
@@ -414,7 +433,7 @@ def main():
             print(f"\nComputing metrics using ground truth from {args.yield_csv}...")
             yield_df = pd.read_csv(args.yield_csv)
             muni_code_col = "municipality_code"
-            yield_col = "production_t"
+            yield_col = target_column
             year_col = "year"
             if muni_code_col not in yield_df.columns:
                 raise ValueError(
@@ -461,8 +480,10 @@ def main():
                     "No valid predictions with ground truth for metric computation"
                 )
 
-            metrics = regression_metrics(y_pred, y_true)
-            unit = "tons"
+            metrics = regression_metrics(
+                y_pred, y_true, target_column=target_column
+            )
+            unit = target_unit
             print(f"\n{'='*60}")
             print(f"EVALUATION METRICS ({len(y_pred)} municipalities)")
             print(f"{'='*60}")

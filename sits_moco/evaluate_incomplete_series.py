@@ -21,11 +21,19 @@ from datasets.feature_layout import (
     normalize_feature_layout,
 )
 from models import STNetRegression
-from run_paths import predictions_dir, run_dir_from_path
+from run_paths import (
+    apply_run_config_to_args,
+    load_latest_run_config,
+    predictions_dir,
+    resolve_checkpoint_path,
+    run_dir_from_path,
+)
 from utils_aggregated import (
+    aggregate_municipality_from_pixel_chunks,
+    aggregation_for_target_column,
     regression_metrics,
+    resolve_inference_target,
     stnet_regression_input_dim_from_state_dict,
-    sum_municipality_from_pixel_chunks,
 )
 
 YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
@@ -44,14 +52,14 @@ def parse_args():
     parser.add_argument(
         "--datapath",
         type=str,
-        default="files/npy/2022-2023",
-        help="Season root: npy/2022-2023/<municipio>/<municipio>.npy (one folder per municipality, .npy inside)",
+        default=None,
+        help="Season root (default: training/config.json; override for a specific harvest folder)",
     )
     parser.add_argument(
         "--yield-csv",
         type=str,
         default=None,
-        help=f"Path to yield CSV (default: {YIELD_CSV})",
+        help=f"Yield CSV (default: training/config.json; fallback {YIELD_CSV})",
     )
     parser.add_argument(
         "--output-csv",
@@ -60,10 +68,11 @@ def parse_args():
         help="Output CSV path (default: {run_dir}/predictions/incomplete_series_evaluation.csv)",
     )
     parser.add_argument(
+        "-seq",
         "--sequencelength",
         type=int,
-        default=45,
-        help="Model max time steps; match training -seq. Extra days in a window are dropped (earliest 45 by DOY).",
+        default=None,
+        help="Model max time steps (default: training/config.json)",
     )
     parser.add_argument(
         "--chunk-size",
@@ -81,16 +90,16 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=27,
-        help="Random seed for reproducibility (default: 27)",
+        default=None,
+        help="Random seed (default: training/config.json)",
     )
     parser.add_argument(
         "--feature-layout",
         type=str,
-        default="spectral",
+        default=None,
         choices=feature_layout_choices(),
         metavar="NAME",
-        help="Must match training: spectral (10 inputs) or spectral_xavier (12).",
+        help="Override feature layout from training/config.json",
     )
     parser.add_argument(
         "--reference-date",
@@ -100,15 +109,21 @@ def parse_args():
     )
     args = parser.parse_args()
     args.reference_date = datetime.strptime(args.reference_date, "%Y-%m-%d").date()
-    args.datapath = Path(args.datapath).resolve()
-    args.checkpoint = Path(args.checkpoint)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    args.yield_csv = Path(args.yield_csv) if args.yield_csv else YIELD_CSV
+    run_config = load_latest_run_config(args.checkpoint)
+    apply_run_config_to_args(args, run_config)
+    if args.yield_csv is None:
+        args.yield_csv = YIELD_CSV
+    args.datapath = Path(args.datapath).resolve()
+    args.yield_csv = Path(args.yield_csv)
+    if args.feature_layout is not None:
+        normalize_feature_layout(args.feature_layout)
 
-    return args
+    return args, run_config
 
 
 def predict_municipality_with_periods(
@@ -125,11 +140,16 @@ def predict_municipality_with_periods(
     chunks = dataset.load_pixels_from_municipality_with_periods(
         municipality_code, year, num_periods, chunk_size, reference_date
     )
-    return sum_municipality_from_pixel_chunks(model, chunks, device)
+    return aggregate_municipality_from_pixel_chunks(
+        model,
+        chunks,
+        device,
+        aggregation=aggregation_for_target_column(dataset.target_column),
+    )
 
 
 def main():
-    args = parse_args()
+    args, run_config = parse_args()
 
     if args.output_csv is None:
         pred_dir = predictions_dir(run_dir_from_path(args.checkpoint), create=True)
@@ -192,6 +212,16 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print("Model loaded successfully")
 
+    target, target_column, aggregation, target_unit = resolve_inference_target(
+        run_config, checkpoint
+    )
+    print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
+    print(
+        f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
+    )
+
     if not args.yield_csv.exists():
         raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
 
@@ -199,7 +229,7 @@ def main():
     yield_df = pd.read_csv(args.yield_csv)
 
     muni_code_col = "municipality_code"
-    yield_col = "production_t"
+    yield_col = target_column
     year_col = "year"
     if muni_code_col not in yield_df.columns:
         raise ValueError(
@@ -232,10 +262,11 @@ def main():
         yield_csv=args.yield_csv,
         year=None,
         sequencelength=args.sequencelength,
-        randomchoice=False,
-        interp=False,
+        randomchoice=args.rc,
+        interp=args.interp,
         seed=args.seed,
-        feature_layout=args.feature_layout,
+        feature_layout=normalize_feature_layout(args.feature_layout),
+        target_column=target_column,
     )
 
     single_season = getattr(dataset, "is_single_season", False) and year_col is not None
@@ -353,7 +384,7 @@ def main():
             y_pred = np.array(y_pred)
             y_true = np.array(y_true)
 
-            metrics = regression_metrics(y_pred, y_true)
+            metrics = regression_metrics(y_pred, y_true, target_column=target_column)
 
             print(
                 f"\nResults for {num_periods} time periods ({len(y_pred)} municipalities):"
