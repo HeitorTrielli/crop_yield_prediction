@@ -2,14 +2,22 @@
 Utilities for aggregated regression: pixel-level predictions → municipality-level targets.
 """
 
+from __future__ import annotations
+
 from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+from datasets.pixel_chunk import (
+    iter_municipality_pixel_chunks,
+    prepare_chunk_on_device,
+    unpack_pixel_chunk,
+)
+
 # Pixels per forward pass
-MAX_PIXEL_BATCH_SIZE = 160
+MAX_PIXEL_BATCH_SIZE = 1024
 
 TARGET_SPECS = {
     "total": {"column": "production_t", "aggregation": "sum", "unit": "tons"},
@@ -153,15 +161,10 @@ def aggregate_municipality_from_pixel_chunks(
     model.eval()
     with torch.no_grad():
         for pixel_chunk in pixel_chunks:
-            if not pixel_chunk:
+            unpacked = unpack_pixel_chunk(pixel_chunk)
+            if unpacked is None:
                 continue
-            chunk_x = torch.stack([p[0] for p in pixel_chunk])
-            chunk_mask = torch.stack([p[1] for p in pixel_chunk])
-            chunk_doy = torch.stack([p[2] for p in pixel_chunk])
-            chunk_weight = torch.stack([p[3] for p in pixel_chunk])
-            municipality_X_chunk = recursive_todevice(
-                (chunk_x, chunk_mask, chunk_doy, chunk_weight), device
-            )
+            municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
             with (
                 autocast("cuda", dtype=torch.bfloat16)
                 if device.type == "cuda"
@@ -314,33 +317,20 @@ def train_epoch_aggregated(
     from torch.amp import GradScaler, autocast
     from tqdm import tqdm
 
-    from utils import AverageMeter, recursive_todevice
+    from utils import AverageMeter
 
     losses = AverageMeter("Loss", ":.4e")
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
     scaler = GradScaler("cuda")
 
-    # Debug: Store initial weights for first batch to check if they change
-    if hasattr(train_epoch_aggregated, "_first_batch"):
-        first_batch = False
-    else:
-        first_batch = True
-        train_epoch_aggregated._first_batch = False
-        # Store a sample weight to check if it changes
-        sample_param = next(iter(model.parameters()))
-        train_epoch_aggregated._initial_weight = sample_param.data.clone()
-
     CHUNKS_PER_GRAD_UPDATE = (
         50  # Lower is fine: mainly affects gradient accumulation, not computation speed
     )
 
-    with tqdm(
-        enumerate(dataloader),
-        total=len(dataloader),
-        leave=True,
-    ) as iterator:
-        for idx, (municipalities, targets, num_pixels_list, years) in iterator:
+    iterator = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
+
+    for idx, (municipalities, targets, num_pixels_list, years) in iterator:
             targets = targets.to(device).float()
             total_loss = 0.0
             num_municipalities = len(municipalities)
@@ -378,17 +368,18 @@ def train_epoch_aggregated(
 
                 # Get year for this municipality (if multi-year mode)
                 year = years[muni_idx] if years[muni_idx] is not None else None
-                for pixel_chunk in dataset.load_pixels_from_municipality(
-                    municipality_code, year=year, chunk_size=MAX_PIXEL_BATCH_SIZE
-                ):
-                    # Skip empty or single-sample chunks (BatchNorm needs batch_size > 1)
-                    if len(pixel_chunk) < 2:
+                chunk_source = iter_municipality_pixel_chunks(
+                    dataset,
+                    municipality_code,
+                    year=year,
+                    chunk_size=MAX_PIXEL_BATCH_SIZE,
+                )
+                for pixel_chunk in chunk_source:
+                    unpacked = unpack_pixel_chunk(pixel_chunk)
+                    if unpacked is None:
                         continue
 
-                    chunk_x = torch.stack([p[0] for p in pixel_chunk])
-                    chunk_mask = torch.stack([p[1] for p in pixel_chunk])
-                    chunk_doy = torch.stack([p[2] for p in pixel_chunk])
-                    chunk_weight = torch.stack([p[3] for p in pixel_chunk])
+                    chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
 
                     # Debug: Check input data for NaN/Inf
                     if torch.isnan(chunk_x).any() or torch.isinf(chunk_x).any():
@@ -418,15 +409,7 @@ def train_epoch_aggregated(
                         )
                         continue
 
-                    municipality_X_chunk = (
-                        chunk_x,
-                        chunk_mask,
-                        chunk_doy,
-                        chunk_weight,
-                    )
-                    municipality_X_chunk = recursive_todevice(
-                        municipality_X_chunk, device
-                    )
+                    municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
 
                     # Use bfloat16 for faster computation with Tensor Cores
                     with autocast("cuda", dtype=torch.bfloat16):
@@ -606,12 +589,6 @@ def train_epoch_aggregated(
                 # Only if at least one municipality accumulated gradients
                 if (muni_idx + 1) == num_municipalities:
                     if batch_has_gradients:
-                        # Debug: Check if gradients exist before stepping
-                        has_grad = any(
-                            p.grad is not None and p.grad.abs().sum() > 0
-                            for p in model.parameters()
-                        )
-                        # Check for NaN gradients before optimizer step
                         has_nan_grad = any(
                             p.grad is not None and torch.isnan(p.grad).any()
                             for p in model.parameters()
@@ -620,49 +597,14 @@ def train_epoch_aggregated(
                         if has_nan_grad:
                             optimizer.zero_grad()
                         else:
-                            # Clip gradients to prevent explosion
-                            # Max norm of 5.0 is reasonable for normalized loss values
-                            # Allows gradients to flow while preventing extreme values
                             max_grad_norm = 5.0
-                            scaler.unscale_(
-                                optimizer
-                            )  # Unscale gradients before clipping
-                            # clip_grad_norm_ returns the total norm before clipping
-                            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
                                 model.parameters(), max_norm=max_grad_norm
                             )
-
-                            clipped_status = (
-                                "clipped"
-                                if total_grad_norm > max_grad_norm
-                                else "not clipped"
-                            )
-                            print(
-                                f"  🔧 Optimizer step: grad_norm={total_grad_norm:.2e} ({clipped_status}, max={max_grad_norm:.2e}), lr={optimizer.param_groups[0]['lr']:.2e}"
-                            )
-
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad()
-
-                            # Debug: Check if weights changed (only for first batch)
-                            if first_batch and idx == 0:
-                                sample_param = next(iter(model.parameters()))
-                                weight_diff = (
-                                    (
-                                        sample_param.data
-                                        - train_epoch_aggregated._initial_weight
-                                    )
-                                    .abs()
-                                    .max()
-                                    .item()
-                                )
-                                if weight_diff < 1e-10:
-                                    print(f"      ⚠️  WARNING: Weights did not change!")
-                                else:
-                                    print(
-                                        f"      ✓ Weights updated (change: {weight_diff:.2e})"
-                                    )
                     else:
                         # No gradients accumulated in this batch, skip optimizer step
                         optimizer.zero_grad()
@@ -690,20 +632,27 @@ def train_epoch_aggregated(
                 )
                 loss_value = 0.0
 
-            iterator.set_description(f"train loss={loss_value:.2f}")
+            if hasattr(iterator, "set_description"):
+                iterator.set_description(f"train loss={loss_value:.2f}")
             losses.update(loss_value, len(municipalities))
 
     return losses.avg
 
 
 def test_epoch_aggregated(
-    model, criterion, dataloader, device, args, target_mean=None, target_std=None
+    model,
+    criterion,
+    dataloader,
+    device,
+    args,
+    target_mean=None,
+    target_std=None,
 ):
     """Test/validation epoch."""
     from torch.amp import autocast
     from tqdm import tqdm
 
-    from utils import AverageMeter, recursive_todevice
+    from utils import AverageMeter
 
     losses = AverageMeter("Loss", ":.4e")
     model.eval()
@@ -712,13 +661,10 @@ def test_epoch_aggregated(
     all_aggregated_preds = []
     all_targets = []
 
+    iterator_ctx = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
+
     with torch.no_grad():
-        with tqdm(
-            enumerate(dataloader),
-            total=len(dataloader),
-            leave=True,
-        ) as iterator:
-            for idx, (municipalities, targets, num_pixels_list, years) in iterator:
+        for idx, (municipalities, targets, num_pixels_list, years) in iterator_ctx:
                 targets = targets.to(device).float()
                 predictions_list = []
 
@@ -728,37 +674,19 @@ def test_epoch_aggregated(
 
                     # Get year for this municipality (if multi-year mode)
                     year = years[muni_idx] if years[muni_idx] is not None else None
-                    for pixel_chunk in dataset.load_pixels_from_municipality(
-                        municipality_code, year=year, chunk_size=MAX_PIXEL_BATCH_SIZE
-                    ):
-                        # Skip empty or single-sample chunks
-                        if len(pixel_chunk) < 2:
+                    chunk_source = iter_municipality_pixel_chunks(
+                        dataset,
+                        municipality_code,
+                        year=year,
+                        chunk_size=MAX_PIXEL_BATCH_SIZE,
+                    )
+                    for pixel_chunk in chunk_source:
+                        unpacked = unpack_pixel_chunk(pixel_chunk)
+                        if unpacked is None:
                             continue
 
-                        chunk_x = torch.stack([p[0] for p in pixel_chunk])
-                        chunk_mask = torch.stack([p[1] for p in pixel_chunk])
-                        chunk_doy = torch.stack([p[2] for p in pixel_chunk])
-                        chunk_weight = torch.stack([p[3] for p in pixel_chunk])
+                        municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
 
-                        # Ensure chunk_x has correct shape: [batch_size, seq_len, features]
-                        # If it's 2D, add batch dimension
-                        if chunk_x.dim() == 2:
-                            chunk_x = chunk_x.unsqueeze(0)
-                            chunk_mask = chunk_mask.unsqueeze(0)
-                            chunk_doy = chunk_doy.unsqueeze(0)
-                            chunk_weight = chunk_weight.unsqueeze(0)
-
-                        municipality_X_chunk = (
-                            chunk_x,
-                            chunk_mask,
-                            chunk_doy,
-                            chunk_weight,
-                        )
-                        municipality_X_chunk = recursive_todevice(
-                            municipality_X_chunk, device
-                        )
-
-                        # Use bfloat16 for faster computation with Tensor Cores
                         with autocast("cuda", dtype=torch.bfloat16):
                             chunk_predictions = model(municipality_X_chunk)
                         pixel_predictions_chunks.append(chunk_predictions.cpu())

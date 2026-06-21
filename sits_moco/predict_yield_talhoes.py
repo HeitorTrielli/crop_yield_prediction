@@ -308,7 +308,8 @@ def transform_pixel(
 ):
     """Delegate to PixelTransform (same as training / predict_yield on .npy)."""
     raw = np.asarray(x, dtype=np.float32)
-    return pixel_transform.transform_chunk(raw[np.newaxis, :])[0]
+    x, mask, doy, weight = pixel_transform.transform_chunk(raw[np.newaxis, :])
+    return x[0], mask[0], doy[0], weight[0]
 
 
 def parse_args() -> argparse.Namespace:

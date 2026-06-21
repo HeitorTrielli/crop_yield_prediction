@@ -180,3 +180,4 @@ docs/*
 *.png
 presentation/
 benchmark/
+*/profiling/

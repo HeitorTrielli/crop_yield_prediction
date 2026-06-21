@@ -35,6 +35,7 @@ SPECTRAL_STD = np.array(
 )
 
 PixelTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+BatchChunk = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 class PixelTransform:
@@ -86,8 +87,8 @@ class PixelTransform:
             x = x_spec_n
         return x, weight, doy
 
-    def transform_chunk(self, chunk_arr: np.ndarray) -> list[PixelTuple]:
-        """Vectorized transform. chunk_arr: (N, T, C) with DOY at channel 10."""
+    def transform_chunk(self, chunk_arr: np.ndarray) -> BatchChunk:
+        """Return (x, mask, doy, weight) each [N, T, ...] — batched, no per-pixel list."""
         n, t, _ = chunk_arr.shape
         x, weight, doy = self.features_from_chunk(chunk_arr)
         fdim = self.input_feature_dim
@@ -145,8 +146,9 @@ class PixelTransform:
         doy_pad_broadcast = np.ascontiguousarray(doy_pad_broadcast.astype(np.int64))
         weight_pad = np.ascontiguousarray(weight_pad.astype(np.float32))
 
-        x_t = torch.from_numpy(x_pad)
-        mask_t = torch.from_numpy(mask_bool)
-        doy_t = torch.from_numpy(doy_pad_broadcast)
-        weight_t = torch.from_numpy(weight_pad)
-        return [(x_t[i], mask_t[i], doy_t[i], weight_t[i]) for i in range(n)]
+        return (
+            torch.from_numpy(x_pad),
+            torch.from_numpy(mask_bool),
+            torch.from_numpy(doy_pad_broadcast),
+            torch.from_numpy(weight_pad),
+        )
