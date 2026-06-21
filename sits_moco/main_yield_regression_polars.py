@@ -164,6 +164,46 @@ def parse_args():
         "--pretrained", default=None, type=str, help="path to pretrained checkpoint"
     )
     parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile (recommended on WSL to avoid orphan compile workers)",
+    )
+    parser.add_argument(
+        "--disable-vram-guard",
+        action="store_true",
+        help="Disable automatic VRAM throttling during train/valid",
+    )
+    parser.add_argument(
+        "--pixel-chunk-size",
+        type=int,
+        default=None,
+        help="Initial pixels per GPU forward pass (default: 512; auto-reduced under VRAM pressure)",
+    )
+    parser.add_argument(
+        "--min-pixel-chunk-size",
+        type=int,
+        default=128,
+        help="Smallest pixel chunk size when VRAM guard throttles (default: 128)",
+    )
+    parser.add_argument(
+        "--vram-warn-fraction",
+        type=float,
+        default=0.82,
+        help="Start VRAM cleanup above this fraction of total GPU memory (default: 0.82)",
+    )
+    parser.add_argument(
+        "--vram-critical-fraction",
+        type=float,
+        default=0.90,
+        help="Aggressively throttle above this fraction (default: 0.90)",
+    )
+    parser.add_argument(
+        "--vram-min-free-gb",
+        type=float,
+        default=1.5,
+        help="Treat VRAM as critical when free memory drops below this many GB (default: 1.5)",
+    )
+    parser.add_argument(
         "--datapath", type=str, default=None, help="path to dataset root directory"
     )
     parser.add_argument(
@@ -689,7 +729,7 @@ def train(args):
     # Compile model for faster execution (PyTorch 2.0+)
     # Wrap in try-except in case compilation fails (e.g., missing Python headers in WSL)
     torch_compiled = False
-    if hasattr(torch, "compile"):
+    if hasattr(torch, "compile") and not args.no_compile:
         try:
             print("Compiling model with torch.compile() for faster execution...")
             model = torch.compile(model)

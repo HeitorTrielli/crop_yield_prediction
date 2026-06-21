@@ -10,14 +10,33 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from cuda_memory import CudaMemoryGuard
 from datasets.pixel_chunk import (
     iter_municipality_pixel_chunks,
     prepare_chunk_on_device,
     unpack_pixel_chunk,
 )
 
-# Pixels per forward pass
-MAX_PIXEL_BATCH_SIZE = 1024
+# Pixels per forward pass (~11 GB VRAM at 1024 on a clean GPU; use 512 if sharing with desktop apps)
+MAX_PIXEL_BATCH_SIZE = 5120
+
+# Max consecutive chunk forwards before backward; lower = less VRAM, more backward calls
+CHUNKS_PER_GRAD_UPDATE = 10
+
+
+def _vram_guard(device, args) -> CudaMemoryGuard:
+    chunk_size = getattr(args, "pixel_chunk_size", None) or MAX_PIXEL_BATCH_SIZE
+    return CudaMemoryGuard(
+        device,
+        enabled=not getattr(args, "disable_vram_guard", False),
+        initial_chunk_size=chunk_size,
+        initial_chunks_per_grad=CHUNKS_PER_GRAD_UPDATE,
+        min_chunk_size=getattr(args, "min_pixel_chunk_size", 128),
+        warn_used_fraction=getattr(args, "vram_warn_fraction", 0.82),
+        critical_used_fraction=getattr(args, "vram_critical_fraction", 0.90),
+        min_free_gb=getattr(args, "vram_min_free_gb", 1.5),
+    )
+
 
 TARGET_SPECS = {
     "total": {"column": "production_t", "aggregation": "sum", "unit": "tons"},
@@ -132,6 +151,10 @@ class MunicipalityPixelAccumulator:
     def detach(self) -> None:
         if self._sum is not None:
             self._sum = self._sum.detach()
+
+    def start_new_grad_segment(self) -> None:
+        """Break the autograd chain after backward while keeping running totals."""
+        self.detach()
 
     def is_extreme(self) -> bool:
         val = self.value()
@@ -323,223 +346,145 @@ def train_epoch_aggregated(
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
     scaler = GradScaler("cuda")
-
-    CHUNKS_PER_GRAD_UPDATE = (
-        50  # Lower is fine: mainly affects gradient accumulation, not computation speed
-    )
+    vram = _vram_guard(device, args)
 
     iterator = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
 
     for idx, (municipalities, targets, num_pixels_list, years) in iterator:
-            targets = targets.to(device).float()
-            total_loss = 0.0
-            num_municipalities = len(municipalities)
-            batch_has_gradients = (
-                False  # Track if any gradients were accumulated in this batch
-            )
+        vram.before_batch()
 
-            optimizer.zero_grad()
+        targets = targets.to(device).float()
+        total_loss = 0.0
+        num_municipalities = len(municipalities)
+        batch_has_gradients = (
+            False  # Track if any gradients were accumulated in this batch
+        )
 
-            for muni_idx, municipality_code in enumerate(municipalities):
-                num_pixels = num_pixels_list[muni_idx]
-                target = targets[muni_idx : muni_idx + 1].to(device).float()
+        optimizer.zero_grad()
 
-                # Debug: Check target values
-                if torch.isnan(target).any() or torch.isinf(target).any():
-                    print(
-                        f"  ❌ DEBUG: Municipality {municipality_code} has invalid target: {target}"
-                    )
-                    continue
-                # Note: Negative targets are normal after normalization, so we don't warn about them
+        for muni_idx, municipality_code in enumerate(municipalities):
+            chunk_size = vram.chunk_size
+            chunks_per_grad = vram.effective_chunks_per_grad()
 
-                dataset = dataloader.dataset
-                pixel_acc = MunicipalityPixelAccumulator(aggregation)
-                chunk_idx = 0
-                total_chunks = (
-                    num_pixels + MAX_PIXEL_BATCH_SIZE - 1
-                ) // MAX_PIXEL_BATCH_SIZE
+            num_pixels = num_pixels_list[muni_idx]
+            target = targets[muni_idx : muni_idx + 1].to(device).float()
 
-                # Skip municipalities with zero pixels
-                if total_chunks == 0 or num_pixels == 0:
-                    print(
-                        f"  ⚠️  Warning: Municipality {municipality_code} has 0 pixels, skipping"
-                    )
-                    continue
-
-                # Get year for this municipality (if multi-year mode)
-                year = years[muni_idx] if years[muni_idx] is not None else None
-                chunk_source = iter_municipality_pixel_chunks(
-                    dataset,
-                    municipality_code,
-                    year=year,
-                    chunk_size=MAX_PIXEL_BATCH_SIZE,
+            # Debug: Check target values
+            if torch.isnan(target).any() or torch.isinf(target).any():
+                print(
+                    f"  ❌ DEBUG: Municipality {municipality_code} has invalid target: {target}"
                 )
-                for pixel_chunk in chunk_source:
-                    unpacked = unpack_pixel_chunk(pixel_chunk)
-                    if unpacked is None:
-                        continue
+                continue
+            # Note: Negative targets are normal after normalization, so we don't warn about them
 
-                    chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
+            dataset = dataloader.dataset
+            pixel_acc = MunicipalityPixelAccumulator(aggregation)
+            chunk_idx = 0
+            total_chunks = (num_pixels + chunk_size - 1) // chunk_size
 
-                    # Debug: Check input data for NaN/Inf
-                    if torch.isnan(chunk_x).any() or torch.isinf(chunk_x).any():
-                        print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid input data (x)"
-                        )
-                        print(
-                            f"      X: min={chunk_x.min().item():.4f}, max={chunk_x.max().item():.4f}, NaN={torch.isnan(chunk_x).sum().item()}, Inf={torch.isinf(chunk_x).sum().item()}"
-                        )
-                        continue
-                    if torch.isnan(chunk_mask).any() or torch.isinf(chunk_mask).any():
-                        print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid mask"
-                        )
-                        continue
-                    if torch.isnan(chunk_doy).any() or torch.isinf(chunk_doy).any():
-                        print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid DOY"
-                        )
-                        continue
-                    if (
-                        torch.isnan(chunk_weight).any()
-                        or torch.isinf(chunk_weight).any()
-                    ):
-                        print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid weight"
-                        )
-                        continue
+            # Skip municipalities with zero pixels
+            if total_chunks == 0 or num_pixels == 0:
+                print(
+                    f"  ⚠️  Warning: Municipality {municipality_code} has 0 pixels, skipping"
+                )
+                continue
 
-                    municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
+            # Get year for this municipality (if multi-year mode)
+            year = years[muni_idx] if years[muni_idx] is not None else None
+            chunk_source = iter_municipality_pixel_chunks(
+                dataset,
+                municipality_code,
+                year=year,
+                chunk_size=chunk_size,
+            )
+            for pixel_chunk in chunk_source:
+                unpacked = unpack_pixel_chunk(pixel_chunk)
+                if unpacked is None:
+                    continue
 
-                    # Use bfloat16 for faster computation with Tensor Cores
-                    with autocast("cuda", dtype=torch.bfloat16):
-                        chunk_predictions = model(municipality_X_chunk)
+                chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
 
-                    # Clip predictions to prevent extreme values that could cause overflow
-                    chunk_predictions = torch.clamp(
-                        chunk_predictions, min=-1e4, max=1e4
+                # Debug: Check input data for NaN/Inf
+                if torch.isnan(chunk_x).any() or torch.isinf(chunk_x).any():
+                    print(
+                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid input data (x)"
                     )
+                    print(
+                        f"      X: min={chunk_x.min().item():.4f}, max={chunk_x.max().item():.4f}, NaN={torch.isnan(chunk_x).sum().item()}, Inf={torch.isinf(chunk_x).sum().item()}"
+                    )
+                    continue
+                if torch.isnan(chunk_mask).any() or torch.isinf(chunk_mask).any():
+                    print(
+                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid mask"
+                    )
+                    continue
+                if torch.isnan(chunk_doy).any() or torch.isinf(chunk_doy).any():
+                    print(
+                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid DOY"
+                    )
+                    continue
+                if torch.isnan(chunk_weight).any() or torch.isinf(chunk_weight).any():
+                    print(
+                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid weight"
+                    )
+                    continue
 
-                    # Debug: Check predictions
-                    if (
-                        torch.isnan(chunk_predictions).any()
-                        or torch.isinf(chunk_predictions).any()
-                    ):
-                        print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid predictions"
-                        )
-                        print(
-                            f"      Predictions: min={chunk_predictions.min().item():.4f}, max={chunk_predictions.max().item():.4f}, mean={chunk_predictions.mean().item():.4f}"
-                        )
-                        print(
-                            f"      Input X stats: min={chunk_x.min().item():.4f}, max={chunk_x.max().item():.4f}, mean={chunk_x.mean().item():.4f}"
-                        )
-                        print(
-                            f"      Input shape: {chunk_x.shape}, mask shape: {chunk_mask.shape}"
-                        )
-                        continue
+                municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
 
-                    pixel_acc.add(chunk_predictions)
+                # Use bfloat16 for faster computation with Tensor Cores
+                with autocast("cuda", dtype=torch.bfloat16):
+                    chunk_predictions = model(municipality_X_chunk)
+
+                # Clip predictions to prevent extreme values that could cause overflow
+                chunk_predictions = torch.clamp(chunk_predictions, min=-1e4, max=1e4)
+
+                # Debug: Check predictions
+                if (
+                    torch.isnan(chunk_predictions).any()
+                    or torch.isinf(chunk_predictions).any()
+                ):
+                    print(
+                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid predictions"
+                    )
+                    print(
+                        f"      Predictions: min={chunk_predictions.min().item():.4f}, max={chunk_predictions.max().item():.4f}, mean={chunk_predictions.mean().item():.4f}"
+                    )
+                    print(
+                        f"      Input X stats: min={chunk_x.min().item():.4f}, max={chunk_x.max().item():.4f}, mean={chunk_x.mean().item():.4f}"
+                    )
+                    print(
+                        f"      Input shape: {chunk_x.shape}, mask shape: {chunk_mask.shape}"
+                    )
+                    continue
+
+                pixel_acc.add(chunk_predictions)
+                if pixel_acc.is_extreme():
+                    agg_val = pixel_acc.value()
+                    abs_val = (
+                        torch.abs(agg_val).max().item()
+                        if agg_val is not None
+                        else float("nan")
+                    )
+                    print(
+                        f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme "
+                        f"{aggregation} at chunk {chunk_idx}: {abs_val:.2f}"
+                    )
+                    pixel_acc = MunicipalityPixelAccumulator(aggregation)
+                    break
+
+                chunk_idx += 1
+                chunks_per_grad = vram.effective_chunks_per_grad()
+
+                # Do gradient updates periodically to cap autograd graph depth
+                chunks_in_group = chunk_idx % chunks_per_grad
+                is_last_chunk = chunk_idx == total_chunks
+                should_update = (chunks_in_group == 0) or is_last_chunk
+
+                if should_update and pixel_acc.valid:
                     if pixel_acc.is_extreme():
-                        agg_val = pixel_acc.value()
-                        abs_val = (
-                            torch.abs(agg_val).max().item()
-                            if agg_val is not None
-                            else float("nan")
-                        )
-                        print(
-                            f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme "
-                            f"{aggregation} at chunk {chunk_idx}: {abs_val:.2f}"
-                        )
                         pixel_acc = MunicipalityPixelAccumulator(aggregation)
                         break
 
-                    chunk_idx += 1
-
-                    # Do gradient updates periodically to avoid memory issues
-                    chunks_in_group = chunk_idx % CHUNKS_PER_GRAD_UPDATE
-                    is_last_chunk = chunk_idx == total_chunks
-                    should_update = (chunks_in_group == 0) or is_last_chunk
-
-                    if should_update and pixel_acc.valid:
-                        if pixel_acc.is_extreme():
-                            pixel_acc = MunicipalityPixelAccumulator(aggregation)
-                            break
-
-                        municipality_agg = pixel_acc.value().squeeze()
-                        if municipality_agg.dim() == 0:
-                            municipality_agg = municipality_agg.unsqueeze(0)
-                        elif municipality_agg.dim() > 1:
-                            municipality_agg = municipality_agg.flatten()[0:1]
-
-                        target_normalized = target.squeeze().to(torch.float32)
-                        if target_normalized.dim() == 0:
-                            target_normalized = target_normalized.unsqueeze(0)
-
-                        municipality_agg_normalized = municipality_agg.to(torch.float32)
-                        if target_mean is not None and target_std is not None:
-                            municipality_agg_normalized = (
-                                municipality_agg_normalized - target_mean
-                            ) / target_std
-
-                        fraction_processed = (
-                            pixel_acc.pixel_count / num_pixels
-                            if num_pixels > 0
-                            else 1.0
-                        )
-                        if aggregation == "sum":
-                            expected_partial_target = (
-                                target_normalized * fraction_processed
-                            ).to(torch.float32)
-                        else:
-                            expected_partial_target = target_normalized
-
-                        # Compute loss directly on normalized values
-                        muni_loss = torch.nn.functional.mse_loss(
-                            municipality_agg_normalized, expected_partial_target
-                        )
-
-                        if torch.isnan(muni_loss) or torch.isinf(muni_loss):
-                            print(
-                                f"  ❌ DEBUG: Municipality {municipality_code} has invalid loss: {muni_loss.item()}"
-                            )
-                            print(
-                                f"      Expected partial target: {expected_partial_target.item():.4f}, "
-                                f"Pred: {municipality_agg_normalized.item():.4f}"
-                            )
-                            print(
-                                f"      Chunks: {chunk_idx}/{total_chunks}, Fraction processed: {fraction_processed:.4f}"
-                            )
-                            break
-
-                        # Scale loss by 1/num_updates for gradient accumulation across multiple updates
-                        num_updates = (
-                            total_chunks + CHUNKS_PER_GRAD_UPDATE - 1
-                        ) // CHUNKS_PER_GRAD_UPDATE
-                        update_weight = 1.0 / num_updates if num_updates > 0 else 1.0
-                        scaled_loss = muni_loss * update_weight
-
-                        # Skip backward if loss is invalid
-                        if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
-                            print(
-                                f"  ❌ DEBUG: Skipping backward for municipality {municipality_code} - scaled_loss is invalid: {scaled_loss.item()}"
-                            )
-                            break
-
-                        scaler.scale(scaled_loss).backward()
-                        batch_has_gradients = (
-                            True  # Mark that gradients were accumulated
-                        )
-
-                        pixel_acc.detach()
-
-                        # Continue processing remaining chunks (don't exit loop early)
-                        # Only break if this was the last chunk
-                        if is_last_chunk:
-                            break
-                        continue
-
-                if pixel_acc.valid and chunk_idx > 0 and not pixel_acc.is_extreme():
                     municipality_agg = pixel_acc.value().squeeze()
                     if municipality_agg.dim() == 0:
                         municipality_agg = municipality_agg.unsqueeze(0)
@@ -556,85 +501,159 @@ def train_epoch_aggregated(
                             municipality_agg_normalized - target_mean
                         ) / target_std
 
-                    final_loss = torch.nn.functional.mse_loss(
-                        municipality_agg_normalized, target_normalized
+                    fraction_processed = (
+                        pixel_acc.pixel_count / num_pixels if num_pixels > 0 else 1.0
+                    )
+                    if aggregation == "sum":
+                        expected_partial_target = (
+                            target_normalized * fraction_processed
+                        ).to(torch.float32)
+                    else:
+                        expected_partial_target = target_normalized
+
+                    # Compute loss directly on normalized values
+                    muni_loss = torch.nn.functional.mse_loss(
+                        municipality_agg_normalized, expected_partial_target
                     )
 
-                    if torch.isnan(final_loss) or torch.isinf(final_loss):
+                    if torch.isnan(muni_loss) or torch.isinf(muni_loss):
                         print(
-                            f"  ❌ DEBUG: Municipality {municipality_code} final loss is invalid: {final_loss.item()}"
+                            f"  ❌ DEBUG: Municipality {municipality_code} has invalid loss: {muni_loss.item()}"
                         )
-                    else:
-                        if target_mean is not None and target_std is not None:
-                            target_denorm = (
-                                target_normalized.item() * target_std + target_mean
-                            )
-                            pred_denorm = (
-                                municipality_agg_normalized.item() * target_std
-                                + target_mean
-                            )
-                        else:
-                            target_denorm = target_normalized.item()
-                            pred_denorm = municipality_agg_normalized.item()
-                        fmt = ".2f" if aggregation == "mean" else ".0f"
-                        timestamp = datetime.now().strftime("%H:%M:%S")
                         print(
-                            f"[{timestamp}] Muni {municipality_code}: "
-                            f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
-                            f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
+                            f"      Expected partial target: {expected_partial_target.item():.4f}, "
+                            f"Pred: {municipality_agg_normalized.item():.4f}"
                         )
-                        total_loss += final_loss.item()
-
-                # Step optimizer after processing all municipalities in the batch
-                # Only if at least one municipality accumulated gradients
-                if (muni_idx + 1) == num_municipalities:
-                    if batch_has_gradients:
-                        has_nan_grad = any(
-                            p.grad is not None and torch.isnan(p.grad).any()
-                            for p in model.parameters()
-                        )
-
-                        if has_nan_grad:
-                            optimizer.zero_grad()
-                        else:
-                            max_grad_norm = 5.0
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                model.parameters(), max_norm=max_grad_norm
-                            )
-                            scaler.step(optimizer)
-                            scaler.update()
-                            optimizer.zero_grad()
-                    else:
-                        # No gradients accumulated in this batch, skip optimizer step
-                        optimizer.zero_grad()
                         print(
-                            f"  ⚠️  DEBUG: Skipping optimizer step for batch {idx} - no valid gradients accumulated"
+                            f"      Chunks: {chunk_idx}/{total_chunks}, Fraction processed: {fraction_processed:.4f}"
                         )
+                        break
 
-            # Calculate average loss only if we have valid municipalities
-            if num_municipalities > 0 and total_loss >= 0:
-                loss_value = total_loss / num_municipalities
-            else:
-                loss_value = 0.0
-                if num_municipalities == 0:
-                    print(f"  ⚠️  DEBUG: No municipalities in batch")
-                elif total_loss < 0:
-                    print(f"  ⚠️  DEBUG: Negative total loss: {total_loss}")
+                    # Scale loss by 1/num_updates for gradient accumulation across multiple updates
+                    num_updates = (
+                        total_chunks + chunks_per_grad - 1
+                    ) // chunks_per_grad
+                    update_weight = 1.0 / num_updates if num_updates > 0 else 1.0
+                    scaled_loss = muni_loss * update_weight
 
-            # Check for NaN or Inf
-            if isinstance(loss_value, float) and (
-                loss_value != loss_value or abs(loss_value) == float("inf")
-            ):
-                print(f"  ❌ DEBUG: Batch loss is invalid: {loss_value}")
-                print(
-                    f"      Total loss: {total_loss}, Num municipalities: {num_municipalities}"
+                    # Skip backward if loss is invalid
+                    if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
+                        print(
+                            f"  ❌ DEBUG: Skipping backward for municipality {municipality_code} - scaled_loss is invalid: {scaled_loss.item()}"
+                        )
+                        break
+
+                    scaler.scale(scaled_loss).backward()
+                    batch_has_gradients = True  # Mark that gradients were accumulated
+
+                    pixel_acc.start_new_grad_segment()
+                    vram.after_backward()
+                    del municipality_X_chunk, chunk_predictions, unpacked
+                    if is_last_chunk:
+                        break
+                    continue
+
+                del municipality_X_chunk, chunk_predictions, unpacked
+
+            if pixel_acc.valid and chunk_idx > 0 and not pixel_acc.is_extreme():
+                municipality_agg = pixel_acc.value().squeeze()
+                if municipality_agg.dim() == 0:
+                    municipality_agg = municipality_agg.unsqueeze(0)
+                elif municipality_agg.dim() > 1:
+                    municipality_agg = municipality_agg.flatten()[0:1]
+
+                target_normalized = target.squeeze().to(torch.float32)
+                if target_normalized.dim() == 0:
+                    target_normalized = target_normalized.unsqueeze(0)
+
+                municipality_agg_normalized = municipality_agg.to(torch.float32)
+                if target_mean is not None and target_std is not None:
+                    municipality_agg_normalized = (
+                        municipality_agg_normalized - target_mean
+                    ) / target_std
+
+                final_loss = torch.nn.functional.mse_loss(
+                    municipality_agg_normalized, target_normalized
                 )
-                loss_value = 0.0
 
-            if hasattr(iterator, "set_description"):
-                iterator.set_description(f"train loss={loss_value:.2f}")
-            losses.update(loss_value, len(municipalities))
+                if torch.isnan(final_loss) or torch.isinf(final_loss):
+                    print(
+                        f"  ❌ DEBUG: Municipality {municipality_code} final loss is invalid: {final_loss.item()}"
+                    )
+                else:
+                    if target_mean is not None and target_std is not None:
+                        target_denorm = (
+                            target_normalized.item() * target_std + target_mean
+                        )
+                        pred_denorm = (
+                            municipality_agg_normalized.item() * target_std
+                            + target_mean
+                        )
+                    else:
+                        target_denorm = target_normalized.item()
+                        pred_denorm = municipality_agg_normalized.item()
+                    fmt = ".2f" if aggregation == "mean" else ".0f"
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    print(
+                        f"[{timestamp}] Muni {municipality_code}: "
+                        f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
+                        f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
+                    )
+                    total_loss += final_loss.item()
+
+            # Step optimizer after processing all municipalities in the batch
+            # Only if at least one municipality accumulated gradients
+            if (muni_idx + 1) == num_municipalities:
+                if batch_has_gradients:
+                    has_nan_grad = any(
+                        p.grad is not None and torch.isnan(p.grad).any()
+                        for p in model.parameters()
+                    )
+
+                    if has_nan_grad:
+                        optimizer.zero_grad()
+                    else:
+                        max_grad_norm = 5.0
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=max_grad_norm
+                        )
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                        vram.after_optimizer_step()
+                else:
+                    # No gradients accumulated in this batch, skip optimizer step
+                    optimizer.zero_grad()
+                    print(
+                        f"  ⚠️  DEBUG: Skipping optimizer step for batch {idx} - no valid gradients accumulated"
+                    )
+
+        # Calculate average loss only if we have valid municipalities
+        if num_municipalities > 0 and total_loss >= 0:
+            loss_value = total_loss / num_municipalities
+        else:
+            loss_value = 0.0
+            if num_municipalities == 0:
+                print(f"  ⚠️  DEBUG: No municipalities in batch")
+            elif total_loss < 0:
+                print(f"  ⚠️  DEBUG: Negative total loss: {total_loss}")
+
+        # Check for NaN or Inf
+        if isinstance(loss_value, float) and (
+            loss_value != loss_value or abs(loss_value) == float("inf")
+        ):
+            print(f"  ❌ DEBUG: Batch loss is invalid: {loss_value}")
+            print(
+                f"      Total loss: {total_loss}, Num municipalities: {num_municipalities}"
+            )
+            loss_value = 0.0
+
+        if hasattr(iterator, "set_description"):
+            iterator.set_description(
+                f"train loss={loss_value:.2f}{vram.status_suffix()}"
+            )
+        losses.update(loss_value, len(municipalities))
 
     return losses.avg
 
@@ -660,70 +679,73 @@ def test_epoch_aggregated(
     target_column = getattr(criterion, "target_column", "production_t")
     all_aggregated_preds = []
     all_targets = []
+    vram = _vram_guard(device, args)
 
     iterator_ctx = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
 
     with torch.no_grad():
         for idx, (municipalities, targets, num_pixels_list, years) in iterator_ctx:
-                targets = targets.to(device).float()
-                predictions_list = []
+            vram.before_batch()
+            chunk_size = vram.chunk_size
+            targets = targets.to(device).float()
+            predictions_list = []
 
-                for muni_idx, municipality_code in enumerate(municipalities):
-                    dataset = dataloader.dataset
-                    pixel_predictions_chunks = []
+            for muni_idx, municipality_code in enumerate(municipalities):
+                dataset = dataloader.dataset
+                pixel_predictions_chunks = []
 
-                    # Get year for this municipality (if multi-year mode)
-                    year = years[muni_idx] if years[muni_idx] is not None else None
-                    chunk_source = iter_municipality_pixel_chunks(
-                        dataset,
-                        municipality_code,
-                        year=year,
-                        chunk_size=MAX_PIXEL_BATCH_SIZE,
-                    )
-                    for pixel_chunk in chunk_source:
-                        unpacked = unpack_pixel_chunk(pixel_chunk)
-                        if unpacked is None:
-                            continue
-
-                        municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
-
-                        with autocast("cuda", dtype=torch.bfloat16):
-                            chunk_predictions = model(municipality_X_chunk)
-                        pixel_predictions_chunks.append(chunk_predictions.cpu())
-
-                    pixel_predictions = torch.cat(pixel_predictions_chunks, dim=0).to(
-                        device
-                    )
-                    predictions_list.append(pixel_predictions)
-
-                # Use bfloat16 for faster computation with Tensor Cores
-                # Note: criterion handles aggregation internally
-                with autocast("cuda", dtype=torch.bfloat16):
-                    loss = criterion(predictions_list, targets, num_pixels_list)
-                losses.update(loss.item(), len(municipalities))
-
-                aggregated_preds = torch.stack(
-                    [aggregate_pixels(pred, aggregation) for pred in predictions_list]
+                # Get year for this municipality (if multi-year mode)
+                year = years[muni_idx] if years[muni_idx] is not None else None
+                chunk_source = iter_municipality_pixel_chunks(
+                    dataset,
+                    municipality_code,
+                    year=year,
+                    chunk_size=chunk_size,
                 )
-                if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
-                    aggregated_preds = aggregated_preds.squeeze(1)
+                for pixel_chunk in chunk_source:
+                    unpacked = unpack_pixel_chunk(pixel_chunk)
+                    if unpacked is None:
+                        continue
 
-                # Normalize predictions first (model outputs raw values, but targets are normalized)
-                # Then denormalize both for metrics computation in original scale
-                if target_mean is not None and target_std is not None:
-                    # Normalize predictions to match normalized targets
-                    aggregated_preds_normalized = (
-                        aggregated_preds - target_mean
-                    ) / target_std
-                    # Now both are in normalized space, denormalize for metrics
-                    aggregated_preds = (
-                        aggregated_preds_normalized * target_std + target_mean
-                    )
-                    targets = targets * target_std + target_mean
+                    municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
 
-                # Convert to float32 before numpy conversion (bfloat16 not supported by NumPy)
-                all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
-                all_targets.append(targets.cpu().numpy())
+                    with autocast("cuda", dtype=torch.bfloat16):
+                        chunk_predictions = model(municipality_X_chunk)
+                    pixel_predictions_chunks.append(chunk_predictions.cpu())
+
+                pixel_predictions = torch.cat(pixel_predictions_chunks, dim=0).to(
+                    device
+                )
+                predictions_list.append(pixel_predictions)
+
+            # Use bfloat16 for faster computation with Tensor Cores
+            # Note: criterion handles aggregation internally
+            with autocast("cuda", dtype=torch.bfloat16):
+                loss = criterion(predictions_list, targets, num_pixels_list)
+            losses.update(loss.item(), len(municipalities))
+
+            aggregated_preds = torch.stack(
+                [aggregate_pixels(pred, aggregation) for pred in predictions_list]
+            )
+            if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
+                aggregated_preds = aggregated_preds.squeeze(1)
+
+            # Normalize predictions first (model outputs raw values, but targets are normalized)
+            # Then denormalize both for metrics computation in original scale
+            if target_mean is not None and target_std is not None:
+                # Normalize predictions to match normalized targets
+                aggregated_preds_normalized = (
+                    aggregated_preds - target_mean
+                ) / target_std
+                # Now both are in normalized space, denormalize for metrics
+                aggregated_preds = (
+                    aggregated_preds_normalized * target_std + target_mean
+                )
+                targets = targets * target_std + target_mean
+
+            # Convert to float32 before numpy conversion (bfloat16 not supported by NumPy)
+            all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
+            all_targets.append(targets.cpu().numpy())
 
         all_aggregated_preds = np.concatenate(all_aggregated_preds)
         all_targets = np.concatenate(all_targets)
