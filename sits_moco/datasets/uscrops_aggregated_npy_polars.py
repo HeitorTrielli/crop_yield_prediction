@@ -131,7 +131,12 @@ class USCropsAggregatedNPY(Dataset):
 
         # Filter by split (skip filter when mode is "all" to use train/valid/test entries)
         if "split" in yield_df.columns and mode != "all":
-            split_mapping = {"train": "train", "valid": "valid", "eval": "eval", "test": "test"}
+            split_mapping = {
+                "train": "train",
+                "valid": "valid",
+                "eval": "eval",
+                "test": "test",
+            }
             target_split = split_mapping.get(mode, mode)
             yield_df = yield_df.filter(pl.col("split") == target_split)
             print(f"Filtered to {target_split} split: {len(yield_df)} rows")
@@ -149,9 +154,7 @@ class USCropsAggregatedNPY(Dataset):
 
         self.split_pairs = set()
         if "year" in yield_df.columns and self.year is None:
-            trip = yield_df.select(
-                [municipality_code_col, "year", yield_col]
-            ).to_dict()
+            trip = yield_df.select([municipality_code_col, "year", yield_col]).to_dict()
             self.yield_map = {}
             for muni_code, year_val, yld in zip(
                 trip[municipality_code_col],
@@ -189,7 +192,9 @@ class USCropsAggregatedNPY(Dataset):
                 raise ValueError(
                     "harvest_years filter requires year=None and a 'year' column in the yield CSV"
                 )
-            print(f"Loaded yield targets for {len(self.yield_map)} municipality entries")
+            print(
+                f"Loaded yield targets for {len(self.yield_map)} municipality entries"
+            )
 
         # Build cached mapping: year -> list of year-dir Paths, or detect "flat" structure
         # Flat = one season folder (e.g. 2022-2023) with municipality subdirs directly inside (no year subdirs)
@@ -203,7 +208,13 @@ class USCropsAggregatedNPY(Dataset):
                 self._year_dirs_by_end_year[int(item.name)].append(item)
             elif "-" in item.name:
                 parts = item.name.split("-")
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and len(parts[0]) == 4 and len(parts[1]) == 4:
+                if (
+                    len(parts) == 2
+                    and parts[0].isdigit()
+                    and parts[1].isdigit()
+                    and len(parts[0]) == 4
+                    and len(parts[1]) == 4
+                ):
                     _y1, y2 = int(parts[0]), int(parts[1])
                     # Harvest year = second year; imagery for that season lives under Y1-Y2/
                     self._year_dirs_by_end_year[y2].append(item)
@@ -264,14 +275,16 @@ class USCropsAggregatedNPY(Dataset):
                             except Exception:
                                 missing_municipalities.append(muni_code)
                     else:
-                        pairs_for_muni = [(m, y) for m, y in self.split_pairs if m == muni_code]
+                        pairs_for_muni = [
+                            (m, y) for m, y in self.split_pairs if m == muni_code
+                        ]
                         if not pairs_for_muni:
                             continue
                         try:
                             data = np.load(muni_npy_file, mmap_mode="r")
                             num_pixels = len(data)
                             if num_pixels > 0:
-                                for (m, y) in pairs_for_muni:
+                                for m, y in pairs_for_muni:
                                     municipality_pixel_counts[(m, y)] = num_pixels
                                     municipality_years[(m, y)] = y
                         except Exception:
@@ -307,11 +320,16 @@ class USCropsAggregatedNPY(Dataset):
                                 found = True
                         except Exception as e:
                             if len(missing_municipalities) < 3:
-                                print(f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}")
+                                print(
+                                    f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}"
+                                )
                             missing_municipalities.append(muni_code)
                 else:
                     for year, year_dir in self._year_dir_tuples:
-                        if self.split_pairs and (muni_code, year) not in self.split_pairs:
+                        if (
+                            self.split_pairs
+                            and (muni_code, year) not in self.split_pairs
+                        ):
                             continue
                         muni_npy_file = year_dir / muni_code / f"{muni_code}.npy"
                         if not muni_npy_file.exists():
@@ -327,7 +345,9 @@ class USCropsAggregatedNPY(Dataset):
                                     found = True
                             except Exception as e:
                                 if len(missing_municipalities) < 3:
-                                    print(f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}")
+                                    print(
+                                        f"  ⚠️  Warning: Could not read {muni_npy_file}: {e}"
+                                    )
                                 continue
                 if not found:
                     missing_municipalities.append(muni_code)
@@ -367,7 +387,7 @@ class USCropsAggregatedNPY(Dataset):
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
         self.npy_cache = OrderedDict()
-        self.npy_cache_max_size = 50
+        self.npy_cache_max_size = 20
 
     @property
     def is_single_season(self):
@@ -478,14 +498,17 @@ class USCropsAggregatedNPY(Dataset):
         if muni_npy_file is None:
             return  # No .npy found for this (municipality, year)
 
-        if muni_npy_file not in self.npy_cache:
-            if len(self.npy_cache) >= self.npy_cache_max_size:
-                self.npy_cache.popitem(last=False)
-            self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
+        if self.npy_cache_max_size <= 0:
+            municipality_data = np.load(muni_npy_file, mmap_mode="r")
+        else:
+            if muni_npy_file not in self.npy_cache:
+                if len(self.npy_cache) >= self.npy_cache_max_size:
+                    self.npy_cache.popitem(last=False)
+                self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
 
-        # LRU: move to end so this file is evicted last
-        self.npy_cache.move_to_end(muni_npy_file)
-        municipality_data = self.npy_cache[muni_npy_file]
+            # LRU: move to end so this file is evicted last
+            self.npy_cache.move_to_end(muni_npy_file)
+            municipality_data = self.npy_cache[muni_npy_file]
         if len(municipality_data) == 0:
             return
 
@@ -566,9 +589,16 @@ class USCropsAggregatedNPY(Dataset):
             result = [None] * N
             for k, indices in by_len.items():
                 stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
-                tuples_list = self._transform_chunk(stacked)
+                batch_x, batch_mask, batch_doy, batch_weight = self._transform_chunk(
+                    stacked
+                )
                 for j, i in enumerate(indices):
-                    result[i] = tuples_list[j]
+                    result[i] = (
+                        batch_x[j],
+                        batch_mask[j],
+                        batch_doy[j],
+                        batch_weight[j],
+                    )
             yield [r for r in result if r is not None]
 
     def __len__(self):
