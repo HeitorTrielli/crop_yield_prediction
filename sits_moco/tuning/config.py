@@ -18,7 +18,7 @@ OBJECTIVES = {
 
 SEARCH_STRATEGIES = ("grid", "random")
 
-BOOL_PARAMS = frozenset({"rc", "interp", "no_compile", "overwrite_run", "disable_vram_guard"})
+BOOL_PARAMS = frozenset({"rc", "interp", "no_compile", "overwrite_run"})
 
 INT_PARAMS = frozenset(
     {
@@ -34,7 +34,6 @@ INT_PARAMS = frozenset(
         "model_n_layers",
         "model_d_inner",
         "pixel_chunk_size",
-        "min_pixel_chunk_size",
     }
 )
 
@@ -44,9 +43,6 @@ FLOAT_PARAMS = frozenset(
         "weight_decay",
         "sample_ratio",
         "model_dropout",
-        "vram_warn_fraction",
-        "vram_critical_fraction",
-        "vram_min_free_gb",
     }
 )
 

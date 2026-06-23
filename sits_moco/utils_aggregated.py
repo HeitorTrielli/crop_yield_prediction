@@ -4,38 +4,55 @@ Utilities for aggregated regression: pixel-level predictions → municipality-le
 
 from __future__ import annotations
 
+import gc
 from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from cuda_memory import CudaMemoryGuard
 from datasets.pixel_chunk import (
     iter_municipality_pixel_chunks,
     prepare_chunk_on_device,
     unpack_pixel_chunk,
 )
 
-# Pixels per forward pass (~11 GB VRAM at 1024 on a clean GPU; use 512 if sharing with desktop apps)
-MAX_PIXEL_BATCH_SIZE = 5120
+# Pixels per forward pass
+MAX_PIXEL_BATCH_SIZE = 45000
 
 # Max consecutive chunk forwards before backward; lower = less VRAM, more backward calls
-CHUNKS_PER_GRAD_UPDATE = 10
+CHUNKS_PER_GRAD_UPDATE = 1
 
 
-def _vram_guard(device, args) -> CudaMemoryGuard:
-    chunk_size = getattr(args, "pixel_chunk_size", None) or MAX_PIXEL_BATCH_SIZE
-    return CudaMemoryGuard(
-        device,
-        enabled=not getattr(args, "disable_vram_guard", False),
-        initial_chunk_size=chunk_size,
-        initial_chunks_per_grad=CHUNKS_PER_GRAD_UPDATE,
-        min_chunk_size=getattr(args, "min_pixel_chunk_size", 128),
-        warn_used_fraction=getattr(args, "vram_warn_fraction", 0.82),
-        critical_used_fraction=getattr(args, "vram_critical_fraction", 0.90),
-        min_free_gb=getattr(args, "vram_min_free_gb", 1.5),
-    )
+def _pixel_chunk_size(args) -> int:
+    return getattr(args, "pixel_chunk_size", None) or MAX_PIXEL_BATCH_SIZE
+
+
+def _prefetch_depth(args) -> int:
+    """Background CPU threads preparing upcoming pixel chunks (0 = disabled)."""
+    return max(0, int(getattr(args, "prefetch_chunks", 2)))
+
+
+def _chunk_debug_syncs(args) -> bool:
+    """Per-chunk GPU NaN/Inf checks (--quiet-training disables these, not muni logs)."""
+    return not getattr(args, "quiet_training", False)
+
+
+def _pipeline_h2d(args, device: torch.device) -> bool:
+    """Overlap H2D copies with GPU compute (same numerics as sync transfer)."""
+    if device.type != "cuda" or getattr(args, "disable_pipeline_h2d", False):
+        return False
+    # Needs quiet mode so we skip per-chunk CPU tensor debug checks.
+    return _chunk_debug_syncs(args) is False
+
+
+def _batch_vram_cleanup(device: torch.device) -> None:
+    """gc + empty_cache after each dataloader batch."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
 
 
 TARGET_SPECS = {
@@ -346,13 +363,19 @@ def train_epoch_aggregated(
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
     scaler = GradScaler("cuda")
-    vram = _vram_guard(device, args)
+    chunk_debug_syncs = _chunk_debug_syncs(args)
+    chunk_size = _pixel_chunk_size(args)
+    chunks_per_grad = CHUNKS_PER_GRAD_UPDATE
 
-    iterator = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
+    pbar = tqdm(
+        total=len(dataloader),
+        desc="Train",
+        unit="batch",
+        leave=True,
+        dynamic_ncols=True,
+    )
 
-    for idx, (municipalities, targets, num_pixels_list, years) in iterator:
-        vram.before_batch()
-
+    for idx, (municipalities, targets, num_pixels_list, years) in enumerate(dataloader):
         targets = targets.to(device).float()
         total_loss = 0.0
         num_municipalities = len(municipalities)
@@ -361,11 +384,12 @@ def train_epoch_aggregated(
         )
 
         optimizer.zero_grad()
+        batch_total = len(dataloader)
+        pbar.write(
+            f"── batch {idx + 1}/{batch_total} ({num_municipalities} muni) ──"
+        )
 
         for muni_idx, municipality_code in enumerate(municipalities):
-            chunk_size = vram.chunk_size
-            chunks_per_grad = vram.effective_chunks_per_grad()
-
             num_pixels = num_pixels_list[muni_idx]
             target = targets[muni_idx : muni_idx + 1].to(device).float()
 
@@ -391,45 +415,46 @@ def train_epoch_aggregated(
 
             # Get year for this municipality (if multi-year mode)
             year = years[muni_idx] if years[muni_idx] is not None else None
+            use_pipeline_h2d = _pipeline_h2d(args, device)
             chunk_source = iter_municipality_pixel_chunks(
                 dataset,
                 municipality_code,
                 year=year,
                 chunk_size=chunk_size,
+                prefetch_depth=_prefetch_depth(args),
+                device=device,
+                pipeline_h2d=use_pipeline_h2d,
             )
-            for pixel_chunk in chunk_source:
-                unpacked = unpack_pixel_chunk(pixel_chunk)
-                if unpacked is None:
-                    continue
+            for chunk_item in chunk_source:
+                if use_pipeline_h2d:
+                    municipality_X_chunk = chunk_item
+                else:
+                    unpacked = chunk_item
+                    chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
 
-                chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
+                    if chunk_debug_syncs:
+                        if torch.isnan(chunk_x).any() or torch.isinf(chunk_x).any():
+                            print(
+                                f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid input data (x)"
+                            )
+                            continue
+                        if torch.isnan(chunk_mask).any() or torch.isinf(chunk_mask).any():
+                            print(
+                                f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid mask"
+                            )
+                            continue
+                        if torch.isnan(chunk_doy).any() or torch.isinf(chunk_doy).any():
+                            print(
+                                f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid DOY"
+                            )
+                            continue
+                        if torch.isnan(chunk_weight).any() or torch.isinf(chunk_weight).any():
+                            print(
+                                f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid weight"
+                            )
+                            continue
 
-                # Debug: Check input data for NaN/Inf
-                if torch.isnan(chunk_x).any() or torch.isinf(chunk_x).any():
-                    print(
-                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid input data (x)"
-                    )
-                    print(
-                        f"      X: min={chunk_x.min().item():.4f}, max={chunk_x.max().item():.4f}, NaN={torch.isnan(chunk_x).sum().item()}, Inf={torch.isinf(chunk_x).sum().item()}"
-                    )
-                    continue
-                if torch.isnan(chunk_mask).any() or torch.isinf(chunk_mask).any():
-                    print(
-                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid mask"
-                    )
-                    continue
-                if torch.isnan(chunk_doy).any() or torch.isinf(chunk_doy).any():
-                    print(
-                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid DOY"
-                    )
-                    continue
-                if torch.isnan(chunk_weight).any() or torch.isinf(chunk_weight).any():
-                    print(
-                        f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid weight"
-                    )
-                    continue
-
-                municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
+                    municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
 
                 # Use bfloat16 for faster computation with Tensor Cores
                 with autocast("cuda", dtype=torch.bfloat16):
@@ -437,43 +462,29 @@ def train_epoch_aggregated(
 
                 # Clip predictions to prevent extreme values that could cause overflow
                 chunk_predictions = torch.clamp(chunk_predictions, min=-1e4, max=1e4)
+                chunk_predictions = torch.nan_to_num(
+                    chunk_predictions, nan=0.0, posinf=1e4, neginf=-1e4
+                )
 
-                # Debug: Check predictions
-                if (
+                if chunk_debug_syncs and (
                     torch.isnan(chunk_predictions).any()
                     or torch.isinf(chunk_predictions).any()
                 ):
                     print(
                         f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid predictions"
                     )
-                    print(
-                        f"      Predictions: min={chunk_predictions.min().item():.4f}, max={chunk_predictions.max().item():.4f}, mean={chunk_predictions.mean().item():.4f}"
-                    )
-                    print(
-                        f"      Input X stats: min={chunk_x.min().item():.4f}, max={chunk_x.max().item():.4f}, mean={chunk_x.mean().item():.4f}"
-                    )
-                    print(
-                        f"      Input shape: {chunk_x.shape}, mask shape: {chunk_mask.shape}"
-                    )
                     continue
 
                 pixel_acc.add(chunk_predictions)
-                if pixel_acc.is_extreme():
-                    agg_val = pixel_acc.value()
-                    abs_val = (
-                        torch.abs(agg_val).max().item()
-                        if agg_val is not None
-                        else float("nan")
-                    )
+                if chunk_debug_syncs and pixel_acc.is_extreme():
                     print(
                         f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme "
-                        f"{aggregation} at chunk {chunk_idx}: {abs_val:.2f}"
+                        f"{aggregation} at chunk {chunk_idx}"
                     )
                     pixel_acc = MunicipalityPixelAccumulator(aggregation)
                     break
 
                 chunk_idx += 1
-                chunks_per_grad = vram.effective_chunks_per_grad()
 
                 # Do gradient updates periodically to cap autograd graph depth
                 chunks_in_group = chunk_idx % chunks_per_grad
@@ -481,7 +492,11 @@ def train_epoch_aggregated(
                 should_update = (chunks_in_group == 0) or is_last_chunk
 
                 if should_update and pixel_acc.valid:
-                    if pixel_acc.is_extreme():
+                    if chunk_debug_syncs and pixel_acc.is_extreme():
+                        print(
+                            f"  ⚠️  DEBUG: Municipality {municipality_code} extreme "
+                            f"{aggregation} at chunk {chunk_idx}/{total_chunks}, skipping backward"
+                        )
                         pixel_acc = MunicipalityPixelAccumulator(aggregation)
                         break
 
@@ -547,15 +562,21 @@ def train_epoch_aggregated(
                     batch_has_gradients = True  # Mark that gradients were accumulated
 
                     pixel_acc.start_new_grad_segment()
-                    vram.after_backward()
-                    del municipality_X_chunk, chunk_predictions, unpacked
+                    del municipality_X_chunk, chunk_predictions
                     if is_last_chunk:
                         break
                     continue
 
-                del municipality_X_chunk, chunk_predictions, unpacked
+                del municipality_X_chunk, chunk_predictions
 
-            if pixel_acc.valid and chunk_idx > 0 and not pixel_acc.is_extreme():
+            if chunk_idx == 0 and num_pixels > 0:
+                print(
+                    f"  ⚠️  Muni {municipality_code}: no pixel chunks loaded "
+                    f"(year={year}, pixels={num_pixels})",
+                    flush=True,
+                )
+
+            if pixel_acc.valid and chunk_idx > 0:
                 municipality_agg = pixel_acc.value().squeeze()
                 if municipality_agg.dim() == 0:
                     municipality_agg = municipality_agg.unsqueeze(0)
@@ -592,14 +613,14 @@ def train_epoch_aggregated(
                     else:
                         target_denorm = target_normalized.item()
                         pred_denorm = municipality_agg_normalized.item()
+                    total_loss += final_loss.item()
                     fmt = ".2f" if aggregation == "mean" else ".0f"
                     timestamp = datetime.now().strftime("%H:%M:%S")
-                    print(
+                    pbar.write(
                         f"[{timestamp}] Muni {municipality_code}: "
                         f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
                         f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
                     )
-                    total_loss += final_loss.item()
 
             # Step optimizer after processing all municipalities in the batch
             # Only if at least one municipality accumulated gradients
@@ -621,7 +642,6 @@ def train_epoch_aggregated(
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
-                        vram.after_optimizer_step()
                 else:
                     # No gradients accumulated in this batch, skip optimizer step
                     optimizer.zero_grad()
@@ -649,12 +669,18 @@ def train_epoch_aggregated(
             )
             loss_value = 0.0
 
-        if hasattr(iterator, "set_description"):
-            iterator.set_description(
-                f"train loss={loss_value:.2f}{vram.status_suffix()}"
+        if not batch_has_gradients:
+            pbar.write(
+                f"  ⚠️  batch {idx + 1}: no gradients "
+                f"({num_municipalities} municipalities, chunk_size={chunk_size})"
             )
-        losses.update(loss_value, len(municipalities))
 
+        pbar.set_description(f"train loss={loss_value:.2f}")
+        pbar.update(1)
+        losses.update(loss_value, len(municipalities))
+        _batch_vram_cleanup(device)
+
+    pbar.close()
     return losses.avg
 
 
@@ -679,14 +705,12 @@ def test_epoch_aggregated(
     target_column = getattr(criterion, "target_column", "production_t")
     all_aggregated_preds = []
     all_targets = []
-    vram = _vram_guard(device, args)
+    chunk_size = _pixel_chunk_size(args)
 
     iterator_ctx = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
 
     with torch.no_grad():
         for idx, (municipalities, targets, num_pixels_list, years) in iterator_ctx:
-            vram.before_batch()
-            chunk_size = vram.chunk_size
             targets = targets.to(device).float()
             predictions_list = []
 
@@ -696,18 +720,21 @@ def test_epoch_aggregated(
 
                 # Get year for this municipality (if multi-year mode)
                 year = years[muni_idx] if years[muni_idx] is not None else None
+                use_pipeline_h2d = _pipeline_h2d(args, device)
                 chunk_source = iter_municipality_pixel_chunks(
                     dataset,
                     municipality_code,
                     year=year,
                     chunk_size=chunk_size,
+                    prefetch_depth=_prefetch_depth(args),
+                    device=device,
+                    pipeline_h2d=use_pipeline_h2d,
                 )
-                for pixel_chunk in chunk_source:
-                    unpacked = unpack_pixel_chunk(pixel_chunk)
-                    if unpacked is None:
-                        continue
-
-                    municipality_X_chunk = prepare_chunk_on_device(unpacked, device)
+                for chunk_item in chunk_source:
+                    if use_pipeline_h2d:
+                        municipality_X_chunk = chunk_item
+                    else:
+                        municipality_X_chunk = prepare_chunk_on_device(chunk_item, device)
 
                     with autocast("cuda", dtype=torch.bfloat16):
                         chunk_predictions = model(municipality_X_chunk)
@@ -723,6 +750,7 @@ def test_epoch_aggregated(
             with autocast("cuda", dtype=torch.bfloat16):
                 loss = criterion(predictions_list, targets, num_pixels_list)
             losses.update(loss.item(), len(municipalities))
+            _batch_vram_cleanup(device)
 
             aggregated_preds = torch.stack(
                 [aggregate_pixels(pred, aggregation) for pred in predictions_list]
