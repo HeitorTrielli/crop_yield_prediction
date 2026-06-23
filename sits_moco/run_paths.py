@@ -3,13 +3,18 @@ Standard directory layout for model training runs.
 
 Layout::
 
-    {logdir}/{run_name}/
+    {logdir}/{experiment_name}/{feature_layout}/
         training/      model_best.pth, checkpoint_epoch_*.pth, trainlog.csv, config.json
         predictions/   CSV outputs from predict_yield.py and related scripts
         figures/
             intramunicipal_heatmap/   pixel-level yield / NDVI heatmaps
             municipal_heatmaps/       state/municipality choropleth maps
 
+Legacy runs (before feature-layout subfolders) may still live at::
+
+    {logdir}/{experiment_name}/training/ ...
+
+``run_dir_from_path`` resolves both layouts.
 """
 
 from __future__ import annotations
@@ -18,17 +23,38 @@ import json
 from pathlib import Path
 from typing import Any
 
+from datasets.feature_layout import normalize_feature_layout
+
 TRAINING_SUBDIR = "training"
 FIGURES_SUBDIR = "figures"
 PREDICTIONS_SUBDIR = "predictions"
 INTRAMUNICIPAL_HEATMAP_SUBDIR = "intramunicipal_heatmap"
 MUNICIPAL_HEATMAPS_SUBDIR = "municipal_heatmaps"
+_RUN_SUBDIRS = frozenset({TRAINING_SUBDIR, FIGURES_SUBDIR, PREDICTIONS_SUBDIR})
+
+
+def experiment_dir(logdir: Path | str, experiment_name: str) -> Path:
+    """Top-level run folder shared across feature layouts (e.g. Productivity_..._Seed27)."""
+    return Path(logdir) / experiment_name
+
+
+def run_dir_for_experiment(
+    logdir: Path | str,
+    experiment_name: str,
+    feature_layout: str,
+) -> Path:
+    """Layout root: {logdir}/{experiment_name}/{feature_layout}/."""
+    layout = normalize_feature_layout(feature_layout)
+    return experiment_dir(logdir, experiment_name) / layout
 
 
 def run_dir_from_path(path: Path | str) -> Path:
-    """Resolve the run root from a checkpoint path or any file inside a run."""
+    """Resolve the layout root from a checkpoint path or any file inside a run."""
     p = Path(path).resolve()
     if p.is_file():
+        p = p.parent
+    elif p.suffix == ".pth":
+        # Checkpoint path may not exist yet during dry-runs / path planning.
         p = p.parent
     if p.name == TRAINING_SUBDIR:
         return p.parent
@@ -38,6 +64,9 @@ def run_dir_from_path(path: Path | str) -> Path:
         return p.parent
     if p.parent.name in (INTRAMUNICIPAL_HEATMAP_SUBDIR, MUNICIPAL_HEATMAPS_SUBDIR):
         return p.parent.parent.parent
+    # Legacy: checkpoint passed as experiment_dir/training/checkpoint.pth
+    if p.name in _RUN_SUBDIRS:
+        return p.parent
     return p
 
 
