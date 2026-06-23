@@ -1,0 +1,145 @@
+"""Load and validate tuning study YAML configs."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+OBJECTIVES = {
+    "val_loss": {"mode": "min", "column": "valloss"},
+    "val_r2": {"mode": "max", "column": "r2"},
+    "val_rmse": {"mode": "min", "column": "rmse"},
+    "test_r2": {"mode": "max", "column": "r2", "log": "testlog"},
+    "test_loss": {"mode": "min", "column": "testloss", "log": "testlog"},
+}
+
+SEARCH_STRATEGIES = ("grid", "random")
+
+BOOL_PARAMS = frozenset({"rc", "interp", "no_compile", "overwrite_run", "disable_vram_guard"})
+
+INT_PARAMS = frozenset(
+    {
+        "epochs",
+        "batchsize",
+        "workers",
+        "sequencelength",
+        "warmup_epochs",
+        "seed",
+        "early_stop_patience",
+        "model_d_model",
+        "model_n_head",
+        "model_n_layers",
+        "model_d_inner",
+        "pixel_chunk_size",
+        "min_pixel_chunk_size",
+    }
+)
+
+FLOAT_PARAMS = frozenset(
+    {
+        "learning_rate",
+        "weight_decay",
+        "sample_ratio",
+        "model_dropout",
+        "vram_warn_fraction",
+        "vram_critical_fraction",
+        "vram_min_free_gb",
+    }
+)
+
+
+def _require_mapping(obj: Any, name: str) -> dict:
+    if not isinstance(obj, dict):
+        raise ValueError(f"{name} must be a mapping, got {type(obj).__name__}")
+    return obj
+
+
+def load_study_config(path: Path | str) -> dict:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Study config not found: {path}")
+
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    cfg = _require_mapping(raw, "study config root")
+
+    name = cfg.get("name")
+    if not name or not isinstance(name, str):
+        raise ValueError("Study config must include a non-empty string 'name'")
+
+    objective = cfg.get("objective", "val_r2")
+    if objective not in OBJECTIVES:
+        choices = ", ".join(sorted(OBJECTIVES))
+        raise ValueError(f"Unknown objective {objective!r}; expected one of: {choices}")
+
+    base = _require_mapping(cfg.get("base"), "base")
+    search = _require_mapping(cfg.get("search", {}), "search")
+    strategy = search.get("strategy", "grid")
+    if strategy not in SEARCH_STRATEGIES:
+        raise ValueError(f"search.strategy must be one of {SEARCH_STRATEGIES}, got {strategy!r}")
+
+    parameters = search.get("parameters", {})
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValueError("search.parameters must be a mapping")
+
+    n_trials = search.get("n_trials")
+    if strategy == "random":
+        if n_trials is None or int(n_trials) < 1:
+            raise ValueError("random search requires search.n_trials >= 1")
+    elif parameters:
+        for pname, spec in parameters.items():
+            if not isinstance(spec, dict):
+                raise ValueError(f"Parameter {pname!r} spec must be a mapping")
+            ptype = spec.get("type", "choice")
+            if ptype == "choice" and "values" not in spec:
+                raise ValueError(f"Parameter {pname!r}: choice requires 'values'")
+
+    output_dir = cfg.get("output_dir", "./results/tuning")
+    training_script = cfg.get("training_script", "main_yield_regression_polars.py")
+    seed_offset = int(cfg.get("seed_offset", 0))
+
+    return {
+        "name": name,
+        "objective": objective,
+        "objective_spec": OBJECTIVES[objective],
+        "base": deepcopy(base),
+        "search": {
+            "strategy": strategy,
+            "n_trials": int(n_trials) if n_trials is not None else None,
+            "parameters": deepcopy(parameters or {}),
+            "seed": int(search.get("seed", 42)),
+        },
+        "output_dir": str(output_dir),
+        "training_script": str(training_script),
+        "seed_offset": seed_offset,
+        "config_path": str(path.resolve()),
+    }
+
+
+def merge_trial_params(base: dict, sampled: dict) -> dict:
+    """Deep-merge sampled search params onto base config."""
+    merged = deepcopy(base)
+    for key, value in sampled.items():
+        merged[key] = value
+    return merged
+
+
+def coerce_param_types(params: dict) -> dict:
+    """Cast trial params to expected Python types for CLI building."""
+    out = deepcopy(params)
+    for key, value in out.items():
+        if key in BOOL_PARAMS:
+            out[key] = bool(value)
+        elif key in INT_PARAMS and value is not None:
+            out[key] = int(value)
+        elif key in FLOAT_PARAMS and value is not None:
+            out[key] = float(value)
+        elif key == "schedule" and value is not None:
+            if isinstance(value, str):
+                out[key] = [int(x.strip()) for x in value.split(",") if x.strip()]
+            else:
+                out[key] = [int(x) for x in value]
+    return out

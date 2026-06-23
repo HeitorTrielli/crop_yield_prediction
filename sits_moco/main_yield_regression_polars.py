@@ -24,7 +24,13 @@ from torch.utils.data import DataLoader
 from datasets.feature_layout import feature_layout_choices
 from datasets.uscrops_aggregated_npy_polars import USCropsAggregatedNPY
 from models.weight_init import weight_init_regression
-from run_paths import ensure_run_layout, load_training_sessions, trainlog_path
+from run_paths import (
+    ensure_run_layout,
+    experiment_dir,
+    load_training_sessions,
+    run_dir_for_experiment,
+    trainlog_path,
+)
 from utils import (
     AverageMeter,
     adjust_learning_rate,
@@ -266,6 +272,42 @@ def parse_args():
             "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy). "
             "See datasets/feature_layout.py to add layouts (e.g. ET)."
         ),
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=30,
+        help="Stop training after this many epochs without val-loss improvement (default: 30)",
+    )
+    parser.add_argument(
+        "--model-d-model",
+        type=int,
+        default=128,
+        help="STNet transformer width d_model (default: 128)",
+    )
+    parser.add_argument(
+        "--model-n-head",
+        type=int,
+        default=16,
+        help="STNet transformer attention heads (default: 16)",
+    )
+    parser.add_argument(
+        "--model-n-layers",
+        type=int,
+        default=1,
+        help="STNet transformer encoder layers (default: 1)",
+    )
+    parser.add_argument(
+        "--model-d-inner",
+        type=int,
+        default=128,
+        help="STNet transformer FFN inner dim (default: 128)",
+    )
+    parser.add_argument(
+        "--model-dropout",
+        type=float,
+        default=0.2,
+        help="STNet dropout probability (default: 0.2)",
     )
     args = parser.parse_args()
 
@@ -511,6 +553,17 @@ def cli_optimizer_hparams(args) -> dict:
     }
 
 
+def model_kwargs_from_args(args) -> dict:
+    """STNetRegression constructor kwargs from CLI."""
+    return {
+        "d_model": int(args.model_d_model),
+        "n_head": int(args.model_n_head),
+        "n_layers": int(args.model_n_layers),
+        "d_inner": int(args.model_d_inner),
+        "dropout": float(args.model_dropout),
+    }
+
+
 def optimizer_hparams_changed(ck: dict | None, args) -> bool:
     if ck is None:
         return False
@@ -665,11 +718,17 @@ def train(args):
         f"Model input_dim={input_dim} (--feature-layout {args.feature_layout}; "
         "see datasets/feature_layout.py)"
     )
+    model_kw = model_kwargs_from_args(args)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
+        **model_kw,
     ).to(device)
+    print(
+        "Model architecture: "
+        + ", ".join(f"{k}={v}" for k, v in model_kw.items())
+    )
 
     print(
         f"Initialized {model.modelname}: Total trainable parameters: {get_ntrainparams(model)}"
@@ -742,7 +801,10 @@ def train(args):
             print(f"   Error: {str(e)[:200]}...")
             # Continue with uncompiled model
 
-    run_dir = Path(args.logdir) / model.modelname
+    run_dir = run_dir_for_experiment(
+        args.logdir, model.modelname, args.feature_layout
+    )
+    experiment_dir_path = experiment_dir(args.logdir, model.modelname)
     training_dir_path, figures_dir_path, predictions_dir_path = ensure_run_layout(
         run_dir
     )
@@ -754,7 +816,8 @@ def train(args):
             "Use a different --seed (or other run name), pass --pretrained to resume, "
             "or pass --overwrite-run to start fresh."
         )
-    print(f"Run directory: {run_dir}")
+    print(f"Experiment directory: {experiment_dir_path}")
+    print(f"Run directory ({args.feature_layout}): {run_dir}")
     print(f"  training:    {training_dir_path}")
     print(f"  predictions: {predictions_dir_path}")
     print(f"  figures:     {figures_dir_path}")
@@ -922,8 +985,9 @@ def train(args):
         args,
         computed={
             "model_run_name": model.modelname,
-            "input_dim": int(input_dim),
+            "experiment_dir": str(experiment_dir_path.resolve()),
             "feature_layout": args.feature_layout,
+            "input_dim": int(input_dim),
             "target": args.target,
             "yield_target_column": args.target_column,
             "municipality_aggregation": args.aggregation,
@@ -941,6 +1005,8 @@ def train(args):
             "imagery_years_available": imagery_years_available,
             "imagery_years_used": sorted(args.harvest_years_set),
             "split_design": split_design,
+            "model_kwargs": model_kwargs_from_args(args),
+            "early_stop_patience": int(args.early_stop_patience),
             "epoch_plan": {
                 "start_epoch": int(start_epoch),
                 "end_epoch_exclusive": int(args.epochs),
@@ -948,6 +1014,7 @@ def train(args):
             },
         },
         run_paths={
+            "experiment_dir": experiment_dir_path,
             "run_dir": run_dir,
             "training_dir": training_dir_path,
             "predictions_dir": predictions_dir_path,
@@ -1049,9 +1116,10 @@ def train(args):
             )
             print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
 
-        if not_improved_count >= 30:
+        if not_improved_count >= args.early_stop_patience:
             print(
-                "\nValidation performance didn't improve for 30 epochs. Training stops."
+                f"\nValidation performance didn't improve for "
+                f"{args.early_stop_patience} epochs. Training stops."
             )
             break
 

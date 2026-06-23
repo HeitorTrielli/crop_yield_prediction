@@ -1,0 +1,70 @@
+# Phase-1 tuning study for productivity (t/ha) — 16-trial grid (training hyperparams).
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_baseline.yaml --list-trials
+#
+# Dry-run:
+#   python run_tuning_study.py run tuning/studies/productivity_baseline.yaml --dry-run
+#
+# Run (resumable):
+#   python run_tuning_study.py run tuning/studies/productivity_baseline.yaml --skip-completed
+#
+# Architecture search: see productivity_random.yaml
+
+name: productivity_baseline
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral
+  datapath: files/npy
+  yield_csv: files/pam_soy_pr_2019_2025.csv
+  logdir: ./results
+  seed: 27
+  epochs: 45
+  workers: 4
+  sequencelength: 45
+  sample_ratio: 1.0
+  rc: false
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 15
+  model_d_model: 128
+  model_n_head: 8
+  model_n_layers: 1
+  model_d_inner: 256
+  model_dropout: 0.2
+
+search:
+  strategy: grid
+
+  parameters:
+    learning_rate:
+      type: choice
+      values: [1.0e-5, 5.0e-6]
+
+    weight_decay:
+      type: choice
+      values: [1.0e-4, 5.0e-4]
+
+    batchsize:
+      type: choice
+      values: [4, 8]
+
+    schedule:
+      type: choice
+      values:
+        - null
+        - [25, 35]
+
+    rc:
+      type: choice
+      values: [false, true]
+
+    sample_ratio:
+      type: choice
+      values: [1.0, 0.8]
