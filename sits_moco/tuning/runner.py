@@ -64,10 +64,6 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "seed": ("--seed",),
     "schedule": ("--schedule",),
     "pixel_chunk_size": ("--pixel-chunk-size",),
-    "min_pixel_chunk_size": ("--min-pixel-chunk-size",),
-    "vram_warn_fraction": ("--vram-warn-fraction",),
-    "vram_critical_fraction": ("--vram-critical-fraction",),
-    "vram_min_free_gb": ("--vram-min-free-gb",),
 }
 
 

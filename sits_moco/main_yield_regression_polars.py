@@ -175,39 +175,37 @@ def parse_args():
         help="Disable torch.compile (recommended on WSL to avoid orphan compile workers)",
     )
     parser.add_argument(
-        "--disable-vram-guard",
-        action="store_true",
-        help="Disable automatic VRAM throttling during train/valid",
-    )
-    parser.add_argument(
         "--pixel-chunk-size",
         type=int,
         default=None,
-        help="Initial pixels per GPU forward pass (default: 512; auto-reduced under VRAM pressure)",
+        help="Pixels per GPU forward pass (default: 45000)",
     )
     parser.add_argument(
-        "--min-pixel-chunk-size",
+        "--prefetch-chunks",
         type=int,
-        default=128,
-        help="Smallest pixel chunk size when VRAM guard throttles (default: 128)",
+        default=2,
+        metavar="N",
+        help=(
+            "Prefetch N upcoming pixel chunks on a CPU thread while the GPU runs "
+            "(default: 2). Overlaps .npy read + transform + stack with forward/backward. "
+            "Uses a small amount of RAM, not VRAM. Set 0 to disable."
+        ),
     )
     parser.add_argument(
-        "--vram-warn-fraction",
-        type=float,
-        default=0.82,
-        help="Start VRAM cleanup above this fraction of total GPU memory (default: 0.82)",
+        "--quiet-training",
+        action="store_true",
+        help=(
+            "Skip per-chunk GPU NaN/Inf sync checks during training (faster). "
+            "Municipality summary lines and the epoch progress bar are kept."
+        ),
     )
     parser.add_argument(
-        "--vram-critical-fraction",
-        type=float,
-        default=0.90,
-        help="Aggressively throttle above this fraction (default: 0.90)",
-    )
-    parser.add_argument(
-        "--vram-min-free-gb",
-        type=float,
-        default=1.5,
-        help="Treat VRAM as critical when free memory drops below this many GB (default: 1.5)",
+        "--disable-pipeline-h2d",
+        action="store_true",
+        help=(
+            "Disable CUDA-stream overlap for host→device pixel-chunk copies "
+            "(default: enabled on CUDA when --quiet-training)."
+        ),
     )
     parser.add_argument(
         "--datapath", type=str, default=None, help="path to dataset root directory"
@@ -656,6 +654,18 @@ def train(args):
     )
     print(
         f"Target: {args.target} ({args.target_column}, {args.aggregation} over pixels)"
+    )
+    from utils_aggregated import CHUNKS_PER_GRAD_UPDATE, MAX_PIXEL_BATCH_SIZE
+
+    pixel_chunk = args.pixel_chunk_size or MAX_PIXEL_BATCH_SIZE
+    print(
+        "Training throughput settings: "
+        f"pixel_chunk_size={pixel_chunk}, "
+        f"chunks_per_grad={CHUNKS_PER_GRAD_UPDATE}, "
+        f"prefetch_chunks={getattr(args, 'prefetch_chunks', 2)}, "
+        f"batchsize={args.batchsize}, "
+        f"quiet_training={getattr(args, 'quiet_training', False)}, "
+        f"pipeline_h2d={str(getattr(args, 'device', 'cpu')).startswith('cuda') and getattr(args, 'quiet_training', False) and not getattr(args, 'disable_pipeline_h2d', False)}"
     )
 
     print("=> creating dataloader (Polars-optimized)")
