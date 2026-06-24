@@ -18,7 +18,7 @@ from datasets.pixel_chunk import (
 )
 
 # Pixels per forward pass
-MAX_PIXEL_BATCH_SIZE = 40000
+MAX_PIXEL_BATCH_SIZE = 30000
 
 # Max consecutive chunk forwards before backward; lower = less VRAM, more backward calls
 CHUNKS_PER_GRAD_UPDATE = 1
@@ -52,7 +52,6 @@ def _batch_vram_cleanup(device: torch.device) -> None:
         return
     gc.collect()
     torch.cuda.empty_cache()
-    torch.cuda.synchronize(device)
 
 
 TARGET_SPECS = {

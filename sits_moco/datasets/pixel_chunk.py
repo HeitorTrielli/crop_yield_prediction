@@ -100,7 +100,9 @@ class GpuH2DPipelineIterator:
 
     def _transfer(self, unpacked: BatchChunk) -> BatchChunk:
         with torch.cuda.stream(self._h2d_stream):
-            return prepare_chunk_on_device(unpacked, self._device)
+            # Pinned host pages on 30k+ px chunks can exhaust locked RAM and freeze WSL;
+            # side-stream copies still overlap with default-stream compute.
+            return prepare_chunk_on_device(unpacked, self._device, pin_host=False)
 
     def _load_next(self) -> None:
         try:
@@ -196,7 +198,9 @@ def move_batched_chunk_to_device(
     )
 
 
-def prepare_chunk_on_device(unpacked, device: torch.device) -> BatchChunk:
+def prepare_chunk_on_device(
+    unpacked, device: torch.device, *, pin_host: bool = True
+) -> BatchChunk:
     chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
     if chunk_x.dim() == 2:
         chunk_x = chunk_x.unsqueeze(0)
@@ -209,5 +213,5 @@ def prepare_chunk_on_device(unpacked, device: torch.device) -> BatchChunk:
         chunk_doy,
         chunk_weight,
         device,
-        non_blocking=device.type == "cuda",
+        non_blocking=pin_host and device.type == "cuda",
     )
