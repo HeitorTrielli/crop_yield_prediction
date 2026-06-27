@@ -106,9 +106,27 @@ def best_epoch_metrics(
     return result
 
 
-def trial_row(trial_id: str, params: dict, outcome: dict) -> dict[str, Any]:
+def trial_row(
+    trial_id: str,
+    params: dict,
+    outcome: dict,
+    *,
+    started_at_utc: str | None = None,
+    finished_at_utc: str | None = None,
+) -> dict[str, Any]:
     """Flatten trial params + outcome into one CSV-friendly row."""
     row: dict[str, Any] = {"trial_id": trial_id, "status": outcome.get("status")}
+    if started_at_utc is not None:
+        row["started_at_utc"] = started_at_utc
+    if finished_at_utc is not None:
+        row["finished_at_utc"] = finished_at_utc
+    if started_at_utc and finished_at_utc:
+        try:
+            start_dt = pd.Timestamp(started_at_utc)
+            finish_dt = pd.Timestamp(finished_at_utc)
+            row["duration_seconds"] = max(0.0, (finish_dt - start_dt).total_seconds())
+        except (TypeError, ValueError):
+            pass
     for k, v in sorted(params.items()):
         if isinstance(v, (list, tuple)):
             row[f"param_{k}"] = ",".join(str(x) for x in v)

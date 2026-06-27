@@ -159,8 +159,8 @@ def parse_args():
     apply_run_config_to_args(args, run_config)
     if args.yield_csv is None:
         args.yield_csv = YIELD_CSV
-    args.datapath = Path(args.datapath)
-    args.yield_csv = Path(args.yield_csv)
+    args.datapath = Path(args.datapath).expanduser()
+    args.yield_csv = Path(args.yield_csv).expanduser()
     if args.feature_layout is not None:
         normalize_feature_layout(args.feature_layout)
 
@@ -480,9 +480,7 @@ def main():
                     "No valid predictions with ground truth for metric computation"
                 )
 
-            metrics = regression_metrics(
-                y_pred, y_true, target_column=target_column
-            )
+            metrics = regression_metrics(y_pred, y_true, target_column=target_column)
             unit = target_unit
             print(f"\n{'='*60}")
             print(f"EVALUATION METRICS ({len(y_pred)} municipalities)")
@@ -507,9 +505,7 @@ def main():
                 )
                 results_df["abs_error"] = np.abs(results_df["error"])
                 results_df.to_csv(args.output_csv, index=False)
-                print(
-                    "\n✓ Updated CSV with actual_yield, error, and abs_error columns"
-                )
+                print("\n✓ Updated CSV with actual_yield, error, and abs_error columns")
     else:
         print("\n⚠️  No predictions generated!")
 

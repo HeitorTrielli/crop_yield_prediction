@@ -18,7 +18,9 @@ OBJECTIVES = {
 
 SEARCH_STRATEGIES = ("grid", "random")
 
-BOOL_PARAMS = frozenset({"rc", "interp", "no_compile", "overwrite_run"})
+BOOL_PARAMS = frozenset(
+    {"rc", "interp", "no_compile", "overwrite_run", "quiet_training", "disable_pipeline_h2d"}
+)
 
 INT_PARAMS = frozenset(
     {
@@ -34,6 +36,7 @@ INT_PARAMS = frozenset(
         "model_n_layers",
         "model_d_inner",
         "pixel_chunk_size",
+        "prefetch_chunks",
     }
 )
 

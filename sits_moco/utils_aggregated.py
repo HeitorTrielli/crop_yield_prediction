@@ -5,6 +5,7 @@ Utilities for aggregated regression: pixel-level predictions → municipality-le
 from __future__ import annotations
 
 import gc
+import time
 from datetime import datetime
 
 import numpy as np
@@ -41,6 +42,43 @@ def _pipeline_h2d(args, device: torch.device) -> bool:
         return False
     # Needs quiet mode so we skip per-chunk CPU tensor debug checks.
     return _chunk_debug_syncs(args) is False
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _log_training(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _format_epoch_batch_bar(
+    *,
+    prefix: str,
+    loss_value: float,
+    batch_idx: int,
+    batch_total: int,
+    epoch_start: float,
+    batch_start: float,
+) -> str:
+    """One-line batch summary (printed once per batch, not a live tqdm bar)."""
+    done = batch_idx + 1
+    pct = 100.0 * done / batch_total if batch_total else 100.0
+    epoch_elapsed = time.perf_counter() - epoch_start
+    batch_elapsed = time.perf_counter() - batch_start
+    avg_batch = epoch_elapsed / done if done else batch_elapsed
+    remaining = avg_batch * max(batch_total - done, 0)
+    return (
+        f"{prefix} loss={loss_value:.2f}: "
+        f"{done}/{batch_total} ({pct:.0f}%) "
+        f"[{_format_duration(epoch_elapsed)}<{_format_duration(remaining)}, "
+        f"{batch_elapsed:.1f}s/batch]"
+    )
 
 
 def _batch_vram_cleanup(device: torch.device) -> None:
@@ -351,7 +389,6 @@ def train_epoch_aggregated(
 ):
     """Training epoch: process municipalities, sum pixel predictions, compare to targets."""
     from torch.amp import GradScaler, autocast
-    from tqdm import tqdm
 
     from utils import AverageMeter
 
@@ -363,15 +400,11 @@ def train_epoch_aggregated(
     chunk_size = _pixel_chunk_size(args)
     chunks_per_grad = CHUNKS_PER_GRAD_UPDATE
 
-    pbar = tqdm(
-        total=len(dataloader),
-        desc="Train",
-        unit="batch",
-        leave=True,
-        dynamic_ncols=True,
-    )
+    batch_total = len(dataloader)
+    epoch_start = time.perf_counter()
 
     for idx, (municipalities, targets, num_pixels_list, years) in enumerate(dataloader):
+        batch_start = time.perf_counter()
         targets = targets.to(device).float()
         total_loss = 0.0
         num_municipalities = len(municipalities)
@@ -380,10 +413,7 @@ def train_epoch_aggregated(
         )
 
         optimizer.zero_grad()
-        batch_total = len(dataloader)
-        pbar.write(
-            f"── batch {idx + 1}/{batch_total} ({num_municipalities} muni) ──"
-        )
+        _log_training(f"── batch {idx + 1}/{batch_total} ({num_municipalities} muni) ──")
 
         for muni_idx, municipality_code in enumerate(municipalities):
             num_pixels = num_pixels_list[muni_idx]
@@ -434,7 +464,10 @@ def train_epoch_aggregated(
                                 f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid input data (x)"
                             )
                             continue
-                        if torch.isnan(chunk_mask).any() or torch.isinf(chunk_mask).any():
+                        if (
+                            torch.isnan(chunk_mask).any()
+                            or torch.isinf(chunk_mask).any()
+                        ):
                             print(
                                 f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid mask"
                             )
@@ -444,7 +477,10 @@ def train_epoch_aggregated(
                                 f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid DOY"
                             )
                             continue
-                        if torch.isnan(chunk_weight).any() or torch.isinf(chunk_weight).any():
+                        if (
+                            torch.isnan(chunk_weight).any()
+                            or torch.isinf(chunk_weight).any()
+                        ):
                             print(
                                 f"  ❌ DEBUG: Municipality {municipality_code} chunk {chunk_idx} has invalid weight"
                             )
@@ -612,7 +648,7 @@ def train_epoch_aggregated(
                     total_loss += final_loss.item()
                     fmt = ".2f" if aggregation == "mean" else ".0f"
                     timestamp = datetime.now().strftime("%H:%M:%S")
-                    pbar.write(
+                    _log_training(
                         f"[{timestamp}] Muni {municipality_code}: "
                         f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
                         f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
@@ -666,17 +702,24 @@ def train_epoch_aggregated(
             loss_value = 0.0
 
         if not batch_has_gradients:
-            pbar.write(
+            _log_training(
                 f"  ⚠️  batch {idx + 1}: no gradients "
                 f"({num_municipalities} municipalities, chunk_size={chunk_size})"
             )
 
-        pbar.set_description(f"train loss={loss_value:.2f}")
-        pbar.update(1)
+        _log_training(
+            _format_epoch_batch_bar(
+                prefix="train",
+                loss_value=loss_value,
+                batch_idx=idx,
+                batch_total=batch_total,
+                epoch_start=epoch_start,
+                batch_start=batch_start,
+            )
+        )
         losses.update(loss_value, len(municipalities))
         _batch_vram_cleanup(device)
 
-    pbar.close()
     return losses.avg
 
 
@@ -691,7 +734,6 @@ def test_epoch_aggregated(
 ):
     """Test/validation epoch."""
     from torch.amp import autocast
-    from tqdm import tqdm
 
     from utils import AverageMeter
 
@@ -702,11 +744,14 @@ def test_epoch_aggregated(
     all_aggregated_preds = []
     all_targets = []
     chunk_size = _pixel_chunk_size(args)
-
-    iterator_ctx = tqdm(enumerate(dataloader), total=len(dataloader), leave=True)
+    batch_total = len(dataloader)
+    epoch_start = time.perf_counter()
 
     with torch.no_grad():
-        for idx, (municipalities, targets, num_pixels_list, years) in iterator_ctx:
+        for idx, (municipalities, targets, num_pixels_list, years) in enumerate(
+            dataloader
+        ):
+            batch_start = time.perf_counter()
             targets = targets.to(device).float()
             predictions_list = []
 
@@ -730,7 +775,9 @@ def test_epoch_aggregated(
                     if use_pipeline_h2d:
                         municipality_X_chunk = chunk_item
                     else:
-                        municipality_X_chunk = prepare_chunk_on_device(chunk_item, device)
+                        municipality_X_chunk = prepare_chunk_on_device(
+                            chunk_item, device
+                        )
 
                     with autocast("cuda", dtype=torch.bfloat16):
                         chunk_predictions = model(municipality_X_chunk)
@@ -745,8 +792,19 @@ def test_epoch_aggregated(
             # Note: criterion handles aggregation internally
             with autocast("cuda", dtype=torch.bfloat16):
                 loss = criterion(predictions_list, targets, num_pixels_list)
-            losses.update(loss.item(), len(municipalities))
+            loss_value = loss.item()
+            losses.update(loss_value, len(municipalities))
             _batch_vram_cleanup(device)
+            _log_training(
+                _format_epoch_batch_bar(
+                    prefix="val",
+                    loss_value=loss_value,
+                    batch_idx=idx,
+                    batch_total=batch_total,
+                    epoch_start=epoch_start,
+                    batch_start=batch_start,
+                )
+            )
 
             aggregated_preds = torch.stack(
                 [aggregate_pixels(pred, aggregation) for pred in predictions_list]

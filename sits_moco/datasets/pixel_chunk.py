@@ -118,8 +118,14 @@ class GpuH2DPipelineIterator:
     def __next__(self) -> BatchChunk:
         if self._ready is None:
             raise StopIteration
-        torch.cuda.current_stream(self._device).wait_stream(self._h2d_stream)
+        default_stream = torch.cuda.current_stream(self._device)
+        default_stream.wait_stream(self._h2d_stream)
         batch = self._ready
+        # Next H2D copy may start before the default stream finishes forward on
+        # ``batch``; record_stream prevents the caching allocator from reusing
+        # this storage while it is still read on the default stream.
+        for t in batch:
+            t.record_stream(default_stream)
         self._load_next()
         return batch
 

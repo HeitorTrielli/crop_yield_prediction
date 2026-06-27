@@ -31,7 +31,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from run_paths import model_best_in_run, predictions_dir, run_dir_from_path
+from run_paths import model_best_in_run, predictions_dir, resolve_checkpoint_path, run_dir_from_path
 
 
 def harvest_to_year_range(harvest_year: int) -> str:
@@ -183,6 +183,8 @@ def main() -> None:
 
     if args.checkpoint is None:
         args.checkpoint = model_best_in_run(default_run)
+    else:
+        args.checkpoint = resolve_checkpoint_path(args.checkpoint)
     if not args.checkpoint.is_file():
         raise SystemExit(f"Checkpoint not found: {args.checkpoint}")
 

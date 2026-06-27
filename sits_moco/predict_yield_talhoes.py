@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Predict yield at talhão (plot) level by summing pixel predictions inside each plot polygon.
+Predict yield at talhão (plot) level by aggregating pixel predictions inside each plot polygon
+(sum for total production, mean for productivity / t/ha).
 
 Uses the same STNet checkpoint and .npy inputs as predict_yield.py, but assigns pixels to
 talhões via daily municipal TIFF georeferencing (same row-major order as preprocess_daily_to_npy).
@@ -719,7 +720,11 @@ def main() -> None:
     model, input_dim, feature_layout, aggregation = load_model(
         args.checkpoint, device, args.sequencelength, args.feature_layout
     )
-    print(f"Model loaded (input_dim={input_dim}, pixel aggregation={aggregation})")
+    target, _, _, target_unit = resolve_inference_target(run_config, None)
+    print(
+        f"Model loaded (input_dim={input_dim}, pixel aggregation={aggregation}, "
+        f"target={target}, unit={target_unit})"
+    )
     print("Mode: talhão-only (infer pixels inside plot polygons only)")
     if args.reproject_tiffs:
         print("Valid-pixel mask: reproject each daily TIFF (slow)")
@@ -831,20 +836,34 @@ def main() -> None:
         area = out["area_ha"]
         valid_area = area.notna() & (area > 0)
         has_fc = out["forecast"].notna()
-        out["baseline_tons"] = np.where(
-            valid_area & out["baseline_prod_max"].notna(),
-            out["baseline_prod_max"] * area / 1000.0,
-            np.nan,
-        )
-        out["forecast_t_ha"] = np.where(
-            valid_area & has_fc,
-            out["forecast"] / area,
-            np.nan,
-        )
         out["baseline_t_ha"] = out["baseline_prod_max"] / 1000.0
-        out["error"] = out["forecast"] - out["baseline_tons"]
+        if aggregation == "mean":
+            out["forecast_t_ha"] = out["forecast"]
+            out["baseline_tons"] = np.where(
+                valid_area & out["baseline_prod_max"].notna(),
+                out["baseline_t_ha"] * area,
+                np.nan,
+            )
+            out["error_t_ha"] = out["forecast_t_ha"] - out["baseline_t_ha"]
+            out["error"] = np.where(
+                valid_area & has_fc & out["baseline_tons"].notna(),
+                out["forecast_t_ha"] * area - out["baseline_tons"],
+                np.nan,
+            )
+        else:
+            out["baseline_tons"] = np.where(
+                valid_area & out["baseline_prod_max"].notna(),
+                out["baseline_prod_max"] * area / 1000.0,
+                np.nan,
+            )
+            out["forecast_t_ha"] = np.where(
+                valid_area & has_fc,
+                out["forecast"] / area,
+                np.nan,
+            )
+            out["error"] = out["forecast"] - out["baseline_tons"]
+            out["error_t_ha"] = out["forecast_t_ha"] - out["baseline_t_ha"]
         out["abs_error"] = out["error"].abs()
-        out["error_t_ha"] = out["forecast_t_ha"] - out["baseline_t_ha"]
         out["abs_error_t_ha"] = out["error_t_ha"].abs()
 
     out = out.sort_values(["geo_cod", "talhao_id"])
@@ -858,37 +877,42 @@ def main() -> None:
     )
 
     if "baseline_prod_max" in out.columns:
-        m = (
-            out["forecast"].notna()
-            & out["baseline_tons"].notna()
+        m_ha = (
+            out["forecast_t_ha"].notna()
+            & out["baseline_t_ha"].notna()
             & (out["n_pixels"] > 0)
         )
-        if m.any():
-            sub = out.loc[m]
-            metrics_t = regression_metrics(
-                sub["forecast"].values,
-                sub["baseline_tons"].values,
+        if m_ha.any():
+            sub_ha = out.loc[m_ha]
+            metrics_ha = regression_metrics(
+                sub_ha["forecast_t_ha"].values,
+                sub_ha["baseline_t_ha"].values,
             )
             print(
-                f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):"
+                f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):"
             )
-            print(f"  RMSE: {metrics_t['rmse']:.2f}")
-            print(f"  MAE:  {metrics_t['mae']:.2f}")
-            print(f"  R²:   {metrics_t['r2']:.4f}")
+            print(f"  RMSE: {metrics_ha['rmse']:.2f}")
+            print(f"  MAE:  {metrics_ha['mae']:.2f}")
+            print(f"  R²:   {metrics_ha['r2']:.4f}")
 
-            m_ha = m & out["forecast_t_ha"].notna() & out["baseline_t_ha"].notna()
-            if m_ha.any():
-                sub_ha = out.loc[m_ha]
-                metrics_ha = regression_metrics(
-                    sub_ha["forecast_t_ha"].values,
-                    sub_ha["baseline_t_ha"].values,
+        if aggregation != "mean":
+            m = (
+                out["forecast"].notna()
+                & out["baseline_tons"].notna()
+                & (out["n_pixels"] > 0)
+            )
+            if m.any():
+                sub = out.loc[m]
+                metrics_t = regression_metrics(
+                    sub["forecast"].values,
+                    sub["baseline_tons"].values,
                 )
                 print(
-                    f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):"
+                    f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):"
                 )
-                print(f"  RMSE: {metrics_ha['rmse']:.2f}")
-                print(f"  MAE:  {metrics_ha['mae']:.2f}")
-                print(f"  R²:   {metrics_ha['r2']:.4f}")
+                print(f"  RMSE: {metrics_t['rmse']:.2f}")
+                print(f"  MAE:  {metrics_t['mae']:.2f}")
+                print(f"  R²:   {metrics_t['r2']:.4f}")
 
     if failed:
         print(f"\nFailed/skipped {len(failed)} talhões (missing .npy or TIFFs)")
