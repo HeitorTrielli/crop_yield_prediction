@@ -63,11 +63,27 @@ def _load_trials_jsonl(path: Path) -> list[dict]:
     return records
 
 
+def _latest_trial_records(path: Path) -> dict[str, dict]:
+    """Last jsonl line per trial_id wins (handles reruns and dry-runs)."""
+    latest: dict[str, dict] = {}
+    for rec in _load_trials_jsonl(path):
+        trial_id = rec.get("trial_id")
+        if trial_id:
+            latest[trial_id] = rec
+    return latest
+
+
+def _trial_run_succeeded(rec: dict) -> bool:
+    if rec.get("status") == "dry_run":
+        return False
+    outcome = rec.get("outcome") or {}
+    return outcome.get("returncode", 1) == 0 and outcome.get("status") == "ok"
+
+
 def _update_summary(study_dir: Path) -> pd.DataFrame:
     trials_path = study_dir / "trials.jsonl"
-    records = _load_trials_jsonl(trials_path)
     rows = []
-    for rec in records:
+    for rec in _latest_trial_records(trials_path).values():
         rows.append(
             trial_row(
                 rec.get("trial_id", ""),
@@ -110,19 +126,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Strategy: {cfg['search']['strategy']} -> {len(trials)} trial(s)")
     print(f"Output: {study_dir.resolve()}")
 
-    completed_ids = set()
-    if args.skip_completed:
-        for rec in _load_trials_jsonl(study_dir / "trials.jsonl"):
-            if rec.get("status") == "completed":
-                completed_ids.add(rec.get("trial_id"))
+    succeeded_ids = set()
+    if args.skip_completed and not args.rerun_all:
+        for trial_id, rec in _latest_trial_records(study_dir / "trials.jsonl").items():
+            if _trial_run_succeeded(rec):
+                succeeded_ids.add(trial_id)
 
     training_script = Path(cfg["training_script"])
     repo_root = REPO_ROOT
 
     for i, sampled in enumerate(trials, start=1):
         trial_id = _trial_id(i)
-        if trial_id in completed_ids:
-            print(f"\n[{trial_id}] skip (already completed)")
+        if trial_id in succeeded_ids:
+            print(f"\n[{trial_id}] skip (already succeeded)")
             continue
 
         merged = merge_trial_params(cfg["base"], sampled)
@@ -300,7 +316,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="Execute tuning study")
     p_run.add_argument("config", type=Path, help="Path to study YAML")
     p_run.add_argument("--dry-run", action="store_true", help="Print commands without training")
-    p_run.add_argument("--skip-completed", action="store_true", help="Skip trials already in trials.jsonl")
+    p_run.add_argument(
+        "--skip-completed",
+        action="store_true",
+        help="Skip trials whose latest run succeeded (outcome status ok)",
+    )
+    p_run.add_argument(
+        "--rerun-all",
+        action="store_true",
+        help="Run every trial even if a previous run succeeded (e.g. after recipe change)",
+    )
     p_run.add_argument("--max-trials", type=int, default=None, help="Limit number of trials to run")
     p_run.set_defaults(func=cmd_run)
 

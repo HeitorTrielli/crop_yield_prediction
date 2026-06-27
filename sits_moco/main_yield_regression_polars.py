@@ -196,7 +196,7 @@ def parse_args():
         action="store_true",
         help=(
             "Skip per-chunk GPU NaN/Inf sync checks during training (faster). "
-            "Municipality summary lines and the epoch progress bar are kept."
+            "Municipality summary lines and one batch progress line per completed batch are kept."
         ),
     )
     parser.add_argument(
@@ -310,8 +310,8 @@ def parse_args():
     args = parser.parse_args()
 
     args.dataset = "USCropsAggregatedNPY"
-    args.datapath = Path(args.datapath) if args.datapath else DATAPATH
-    args.yield_csv = Path(args.yield_csv) if args.yield_csv else YIELD_CSV
+    args.datapath = Path(args.datapath).expanduser() if args.datapath else DATAPATH
+    args.yield_csv = Path(args.yield_csv).expanduser() if args.yield_csv else YIELD_CSV
     args.target_column, args.aggregation, args.target_unit = resolve_target(args.target)
 
     # WSL/Linux convenience: convert Windows absolute paths (e.g. C:\...) to /mnt/c/...
@@ -735,10 +735,7 @@ def train(args):
         max_seq_len=args.sequencelength,
         **model_kw,
     ).to(device)
-    print(
-        "Model architecture: "
-        + ", ".join(f"{k}={v}" for k, v in model_kw.items())
-    )
+    print("Model architecture: " + ", ".join(f"{k}={v}" for k, v in model_kw.items()))
 
     print(
         f"Initialized {model.modelname}: Total trainable parameters: {get_ntrainparams(model)}"
@@ -811,9 +808,7 @@ def train(args):
             print(f"   Error: {str(e)[:200]}...")
             # Continue with uncompiled model
 
-    run_dir = run_dir_for_experiment(
-        args.logdir, model.modelname, args.feature_layout
-    )
+    run_dir = run_dir_for_experiment(args.logdir, model.modelname, args.feature_layout)
     experiment_dir_path = experiment_dir(args.logdir, model.modelname)
     training_dir_path, figures_dir_path, predictions_dir_path = ensure_run_layout(
         run_dir
@@ -867,7 +862,9 @@ def train(args):
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             apply_cli_optimizer_settings(optimizer, args)
             loaded_optimizer = True
-            print("  ✓ Loaded optimizer state (Adam momentum); CLI lr/weight_decay applied")
+            print(
+                "  ✓ Loaded optimizer state (Adam momentum); CLI lr/weight_decay applied"
+            )
             cli_opt = cli_optimizer_hparams(args)
             if optimizer_hparams_changed(ck_optimizer_hparams, args):
                 print(

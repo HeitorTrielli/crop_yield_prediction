@@ -21,18 +21,23 @@ base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
   feature_layout: spectral
-  datapath: files/npy
+  datapath: ~/files/npy
   yield_csv: files/pam_soy_pr_2019_2025.csv
   logdir: ./results
   seed: 27
   epochs: 45
   workers: 4
   sequencelength: 45
+  batchsize: 8
   sample_ratio: 1.0
   rc: false
-  no_compile: true
+  warmup_epochs: 0
+  no_compile: false
   overwrite_run: true
   early_stop_patience: 15
+  pixel_chunk_size: 16000
+  prefetch_chunks: 2
+  quiet_training: true
   model_d_model: 128
   model_n_head: 8
   model_n_layers: 1
@@ -50,10 +55,6 @@ search:
     weight_decay:
       type: choice
       values: [1.0e-4, 5.0e-4]
-
-    batchsize:
-      type: choice
-      values: [4, 8]
 
     schedule:
       type: choice

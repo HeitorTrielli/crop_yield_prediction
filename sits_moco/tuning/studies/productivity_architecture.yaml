@@ -9,8 +9,11 @@
 # Preview:
 #   python run_tuning_study.py show tuning/studies/productivity_architecture.yaml --list-trials
 #
-# Dry-run one trial (no GPU):
-#   python run_tuning_study.py run tuning/studies/productivity_architecture.yaml --dry-run --max-trials 1
+# Run (resumable; skips only successful trials):
+#   python run_tuning_study.py run tuning/studies/productivity_architecture.yaml --skip-completed
+#
+# After changing base recipe (LR, epochs, …), rerun all trials:
+#   python run_tuning_study.py run tuning/studies/productivity_architecture.yaml --rerun-all
 
 name: productivity_architecture
 
@@ -23,23 +26,28 @@ base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
   feature_layout: spectral
-  datapath: files/npy
+  datapath: ~/files/npy
   yield_csv: files/pam_soy_pr_2019_2025.csv
   logdir: ./results
   seed: 27
-  epochs: 45
+  epochs: 100
   workers: 4
   sequencelength: 45
-  batchsize: 4
-  learning_rate: 1.0e-5
+  batchsize: 8
+  # 5e-5 base (half of 1e-4); schedule 0.1x at epochs 10 and 30.
+  # → ep 0–9: 5e-5, 10–29: 5e-6, 30–99: 5e-7
+  learning_rate: 5.0e-5
   weight_decay: 1.0e-4
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [25, 35]
-  no_compile: true
+  schedule: [10, 30]
+  no_compile: false
   overwrite_run: true
-  early_stop_patience: 15
+  early_stop_patience: 30
+  pixel_chunk_size: 16000
+  prefetch_chunks: 2
+  quiet_training: true
   # Seed27 default was n_layers=1, d_model=128, d_inner=128, n_head=16, dropout=0.2
   model_n_layers: 1
 
