@@ -39,6 +39,37 @@ def _trial_id(index: int) -> str:
     return f"trial_{index:03d}"
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+
+def _duration_seconds(started: str | None, finished: str | None) -> float | None:
+    if not started or not finished:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(started)
+        finish_dt = datetime.fromisoformat(finished)
+        return max(0.0, (finish_dt - start_dt).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def _print_trial_finished(trial_id: str, finished: str, started: str | None) -> None:
+    duration = _duration_seconds(started, finished)
+    duration_msg = f" ({_format_duration(duration)})" if duration is not None else ""
+    print(f"[{trial_id}] finished at {finished}{duration_msg}")
+
+
 def _save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -89,6 +120,8 @@ def _update_summary(study_dir: Path) -> pd.DataFrame:
                 rec.get("trial_id", ""),
                 rec.get("params") or {},
                 rec.get("outcome") or {},
+                started_at_utc=rec.get("started_at_utc"),
+                finished_at_utc=rec.get("finished_at_utc"),
             )
         )
     df = pd.DataFrame(rows)
@@ -154,6 +187,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_dir = predict_run_dir(merged, logdir=merged.get("logdir", "./results"))
         print(f"[{trial_id}] expected run_dir: {run_dir}")
 
+        started = _utc_now_iso()
+        print(f"[{trial_id}] started at {started}")
+
         if args.dry_run:
             outcome = run_trial_subprocess(
                 merged,
@@ -162,18 +198,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                 dry_run=True,
             )
             print(f"[{trial_id}] argv: {' '.join(outcome['argv'])}")
+            finished = _utc_now_iso()
+            _print_trial_finished(trial_id, finished, started)
             record = {
                 "trial_id": trial_id,
                 "status": "dry_run",
                 "params": merged,
                 "sampled": sampled,
                 "outcome": outcome,
-                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+                "started_at_utc": started,
+                "finished_at_utc": finished,
             }
             _append_jsonl(study_dir / "trials.jsonl", record)
             continue
 
-        started = datetime.now(timezone.utc).isoformat()
         proc_outcome = run_trial_subprocess(
             merged,
             training_script=training_script,
@@ -203,6 +241,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             else:
                 print(f"[{trial_id}] finished but metrics status={metrics.get('status')}")
 
+        finished = _utc_now_iso()
+        _print_trial_finished(trial_id, finished, started)
         record = {
             "trial_id": trial_id,
             "status": "completed",
@@ -210,7 +250,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "sampled": sampled,
             "outcome": outcome,
             "started_at_utc": started,
-            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "finished_at_utc": finished,
         }
         _append_jsonl(study_dir / "trials.jsonl", record)
 
@@ -271,6 +311,9 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
         c
         for c in (
             "trial_id",
+            "started_at_utc",
+            "finished_at_utc",
+            "duration_seconds",
             "objective_value",
             "best_epoch",
             "val_r2",
