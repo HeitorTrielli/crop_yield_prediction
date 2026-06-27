@@ -22,7 +22,7 @@ output_dir: ./results/tuning
 base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
-  feature_layout: spectral
+  feature_layout: spectral_xavier
   datapath: files/npy
   yield_csv: files/pam_soy_pr_2019_2025.csv
   logdir: ./results
@@ -30,13 +30,13 @@ base:
   epochs: 45
   workers: 4
   sequencelength: 45
-  batchsize: 4
-  learning_rate: 1.0e-5
+  batchsize: 64
+  learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [25, 35]
+  schedule: [15, 40]
   no_compile: true
   overwrite_run: true
   early_stop_patience: 15

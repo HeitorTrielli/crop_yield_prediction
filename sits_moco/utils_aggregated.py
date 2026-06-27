@@ -17,10 +17,7 @@ from datasets.pixel_chunk import (
     unpack_pixel_chunk,
 )
 
-# Pixels per forward pass
-MAX_PIXEL_BATCH_SIZE = 30000
-
-# Max consecutive chunk forwards before backward; lower = less VRAM, more backward calls
+MAX_PIXEL_BATCH_SIZE = 40000
 CHUNKS_PER_GRAD_UPDATE = 1
 
 
