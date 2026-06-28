@@ -76,6 +76,8 @@ class USCropsAggregatedNPY(Dataset):
         harvest_years: Optional[Iterable[int]] = None,
         feature_layout: str = "spectral",
         target_column: str = "production_t",
+        npy_cache_size: int = 20,
+        npy_defer_copy: bool = True,  # ignored; always deferred (kept for API compat)
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -387,7 +389,7 @@ class USCropsAggregatedNPY(Dataset):
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
         self.npy_cache = OrderedDict()
-        self.npy_cache_max_size = 20
+        self.npy_cache_max_size = int(npy_cache_size)
 
     @property
     def is_single_season(self):
@@ -457,6 +459,48 @@ class USCropsAggregatedNPY(Dataset):
         """Vectorized transform (delegates to PixelTransform — same as training)."""
         return self.pixel_transform.transform_chunk(chunk_arr)
 
+    def _resolve_load_year(self, municipality_code, year=None):
+        """Return the harvest year used to locate a municipality .npy file."""
+        if year is None and self._flat_season:
+            return self.year if self.year is not None else 2023
+        if year is None:
+            if self.year is not None:
+                return self.year
+            if self.use_multi_year:
+                for y, _ in self._year_dir_tuples:
+                    if self._resolve_npy_path(municipality_code, y) is not None:
+                        return y
+                return None
+            if municipality_code in self.municipality_years:
+                return self.municipality_years[municipality_code]
+            for y, _ in self._year_dir_tuples:
+                if self._resolve_npy_path(municipality_code, y) is not None:
+                    return y
+            return None
+        return year
+
+    def mmap_municipality(self, municipality_code, year=None):
+        """Memory-map a municipality .npy array (LRU-cached). Returns None if missing."""
+        year = self._resolve_load_year(municipality_code, year)
+        if year is None:
+            return None
+        muni_npy_file = self._resolve_npy_path(municipality_code, year)
+        if muni_npy_file is None:
+            return None
+
+        if self.npy_cache_max_size <= 0:
+            municipality_data = np.load(muni_npy_file, mmap_mode="r")
+        else:
+            if muni_npy_file not in self.npy_cache:
+                if len(self.npy_cache) >= self.npy_cache_max_size:
+                    self.npy_cache.popitem(last=False)
+                self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
+            self.npy_cache.move_to_end(muni_npy_file)
+            municipality_data = self.npy_cache[muni_npy_file]
+        if len(municipality_data) == 0:
+            return None
+        return municipality_data
+
     def load_pixels_from_municipality(
         self, municipality_code, year=None, chunk_size=10000
     ):
@@ -467,56 +511,14 @@ class USCropsAggregatedNPY(Dataset):
             year: Year to load (required if use_multi_year=True, optional otherwise)
             chunk_size: Number of pixels per chunk
         """
-        # Determine which year to use
-        if year is None and self._flat_season:
-            # One season folder (e.g. 2020-2021/4100103/4100103.npy); year is only for yield lookup
-            year = self.year if self.year is not None else 2023
-        elif year is None:
-            if self.year is not None:
-                year = self.year
-            elif self.use_multi_year:
-                # Fallback: try each year (cached) until we find a file
-                for y, _ in self._year_dir_tuples:
-                    if self._resolve_npy_path(municipality_code, y) is not None:
-                        year = y
-                        break
-                if year is None:
-                    return  # No file found
-            else:
-                # Single-year mode: use stored year
-                if municipality_code in self.municipality_years:
-                    year = self.municipality_years[municipality_code]
-                else:
-                    for y, _ in self._year_dir_tuples:
-                        if self._resolve_npy_path(municipality_code, y) is not None:
-                            year = y
-                            break
-                    if year is None:
-                        return  # No file found
-
-        muni_npy_file = self._resolve_npy_path(municipality_code, year)
-        if muni_npy_file is None:
-            return  # No .npy found for this (municipality, year)
-
-        if self.npy_cache_max_size <= 0:
-            municipality_data = np.load(muni_npy_file, mmap_mode="r")
-        else:
-            if muni_npy_file not in self.npy_cache:
-                if len(self.npy_cache) >= self.npy_cache_max_size:
-                    self.npy_cache.popitem(last=False)
-                self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
-
-            # LRU: move to end so this file is evicted last
-            self.npy_cache.move_to_end(muni_npy_file)
-            municipality_data = self.npy_cache[muni_npy_file]
-        if len(municipality_data) == 0:
+        municipality_data = self.mmap_municipality(municipality_code, year=year)
+        if municipality_data is None:
             return
 
         num_pixels = len(municipality_data)
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
-            chunk_arr = np.asarray(municipality_data[start:end], dtype=np.float32)
-            yield self._transform_chunk(chunk_arr)
+            yield self._transform_chunk(municipality_data[start:end])
 
     def load_pixels_from_municipality_with_periods(
         self, municipality_code, year, num_periods, chunk_size=400, reference_date=None

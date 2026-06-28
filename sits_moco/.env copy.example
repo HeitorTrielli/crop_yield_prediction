@@ -1,0 +1,5 @@
+# Copy to .env and adjust paths for your machine:
+#   cp .env.example .env
+
+# Root folder with season subdirs, e.g. ~/sits_moco_data/npy/2020-2021/4109401/4109401.npy
+SITS_MOCO_DATAPATH=~/sits_moco_data/npy

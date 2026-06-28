@@ -89,6 +89,8 @@ class PixelTransform:
 
     def transform_chunk(self, chunk_arr: np.ndarray) -> BatchChunk:
         """Return (x, mask, doy, weight) each [N, T, ...] — batched, no per-pixel list."""
+        if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
+            chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
         n, t, _ = chunk_arr.shape
         x, weight, doy = self.features_from_chunk(chunk_arr)
         fdim = self.input_feature_dim

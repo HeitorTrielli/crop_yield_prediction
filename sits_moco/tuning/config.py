@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from env_config import resolve_datapath
+
 OBJECTIVES = {
     "val_loss": {"mode": "min", "column": "valloss"},
     "val_r2": {"mode": "max", "column": "r2"},
@@ -19,7 +21,21 @@ OBJECTIVES = {
 SEARCH_STRATEGIES = ("grid", "random")
 
 BOOL_PARAMS = frozenset(
-    {"rc", "interp", "no_compile", "overwrite_run", "quiet_training", "disable_pipeline_h2d"}
+    {
+        "rc",
+        "interp",
+        "no_compile",
+        "overwrite_run",
+        "quiet_training",
+        "disable_pipeline_h2d",
+        "zero_grad_set_to_none",
+        "skip_batch_empty_cache",
+        "batch_empty_cache",
+        "legacy_zero_grad",
+        "dataloader_persistent_workers",
+        "h2d_pin_host",
+        "no_dataloader_pin_memory",
+    }
 )
 
 INT_PARAMS = frozenset(
@@ -37,6 +53,9 @@ INT_PARAMS = frozenset(
         "model_d_inner",
         "pixel_chunk_size",
         "prefetch_chunks",
+        "dataloader_prefetch_factor",
+        "npy_cache_size",
+        "chunks_per_grad",
     }
 )
 
@@ -54,6 +73,12 @@ def _require_mapping(obj: Any, name: str) -> dict:
     if not isinstance(obj, dict):
         raise ValueError(f"{name} must be a mapping, got {type(obj).__name__}")
     return obj
+
+
+def _apply_env_datapath(base: dict) -> None:
+    """Set base['datapath'] from .env when omitted in study YAML."""
+    override = base.get("datapath")
+    base["datapath"] = str(resolve_datapath(override))
 
 
 def load_study_config(path: Path | str) -> dict:
@@ -75,6 +100,7 @@ def load_study_config(path: Path | str) -> dict:
         raise ValueError(f"Unknown objective {objective!r}; expected one of: {choices}")
 
     base = _require_mapping(cfg.get("base"), "base")
+    _apply_env_datapath(base)
     search = _require_mapping(cfg.get("search", {}), "search")
     strategy = search.get("strategy", "grid")
     if strategy not in SEARCH_STRATEGIES:

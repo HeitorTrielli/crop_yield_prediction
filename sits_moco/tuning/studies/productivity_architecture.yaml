@@ -26,16 +26,15 @@ base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
   feature_layout: spectral_xavier
-  datapath: files/npy
   yield_csv: files/pam_soy_pr_2019_2025.csv
   logdir: ./results
   seed: 27
   epochs: 100
-  workers: 4
+  workers: 20
   sequencelength: 45
   batchsize: 64
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-4
+  learning_rate: 1.0e-3
+  weight_decay: 5.0e-4
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
@@ -43,8 +42,8 @@ base:
   no_compile: true
   overwrite_run: true
   early_stop_patience: 30
-  pixel_chunk_size: 16000
-  prefetch_chunks: 2
+  pixel_chunk_size: 25000
+  prefetch_chunks: 20
   quiet_training: true
   # Seed27 default was n_layers=1, d_model=128, d_inner=128, n_head=16, dropout=0.2
   model_n_layers: 1

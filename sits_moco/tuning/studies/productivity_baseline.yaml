@@ -18,10 +18,10 @@ objective: val_r2
 output_dir: ./results/tuning
 
 base:
+  # datapath: SITS_MOCO_DATAPATH in .env (see .env.example)
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
   feature_layout: spectral
-  datapath: ~/files/npy
   yield_csv: files/pam_soy_pr_2019_2025.csv
   logdir: ./results
   seed: 27
@@ -31,18 +31,28 @@ base:
   batchsize: 8
   sample_ratio: 1.0
   rc: false
+  interp: false
   warmup_epochs: 0
   no_compile: false
   overwrite_run: true
   early_stop_patience: 15
-  pixel_chunk_size: 16000
-  prefetch_chunks: 2
+  # Production runtime (~454k px/s benchmark, Jun 2026)
   quiet_training: true
+  pixel_chunk_size: 16000
+  prefetch_chunks: 16
+  chunks_per_grad: 2
+  zero_grad_set_to_none: true
+  skip_batch_empty_cache: true
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 16
+  npy_cache_size: 20
   model_d_model: 128
   model_n_head: 8
   model_n_layers: 1
   model_d_inner: 256
   model_dropout: 0.2
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
 
 search:
   strategy: grid

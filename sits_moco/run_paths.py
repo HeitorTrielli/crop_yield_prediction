@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from datasets.feature_layout import normalize_feature_layout
+from env_config import resolve_datapath
 
 TRAINING_SUBDIR = "training"
 FIGURES_SUBDIR = "figures"
@@ -246,6 +247,9 @@ def apply_run_config_to_args(
             continue
         val = _config_value(cli, computed, cli_key, computed_key)
         if val is None:
+            if arg_name == "datapath":
+                setattr(args, arg_name, resolve_datapath())
+                continue
             raise ValueError(
                 f"Missing {arg_name!r} in {config_path} and not passed on the command line."
             )

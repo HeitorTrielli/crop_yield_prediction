@@ -27,6 +27,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from env_config import resolve_datapath
+
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -52,8 +54,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--datapath",
         type=Path,
-        default=_ROOT / "files" / "npy",
-        help="NPY root (uses {datapath}/{year-range}/{{muni}}/{{muni}}.npy)",
+        default=None,
+        help="NPY root (default: SITS_MOCO_DATAPATH from .env)",
     )
     p.add_argument(
         "--tiffpath",
@@ -177,6 +179,7 @@ def run_one(
 
 def main() -> None:
     args = parse_args()
+    args.datapath = resolve_datapath(args.datapath)
     default_run = (
         _ROOT / "results" / "Total_20_22_23_Seed6007"
     )

@@ -49,8 +49,9 @@ from utils_aggregated import (
     train_epoch_aggregated,
 )
 
-# Default paths
-DATAPATH = Path(r"files/npy")
+# Default paths (datapath: see SITS_MOCO_DATAPATH in .env)
+from env_config import resolve_datapath
+
 YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
 DEFAULT_REGRESSION_MODEL = "STNetRegression"
 DEFAULT_SEED = 42
@@ -208,7 +209,10 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--datapath", type=str, default=None, help="path to dataset root directory"
+        "--datapath",
+        type=str,
+        default=None,
+        help="path to dataset root directory (default: SITS_MOCO_DATAPATH from .env)",
     )
     parser.add_argument(
         "--yield-csv",
@@ -307,10 +311,50 @@ def parse_args():
         default=0.2,
         help="STNet dropout probability (default: 0.2)",
     )
+    # --- Training runtime (defaults in training_runtime.py; override when debugging) ---
+    parser.add_argument(
+        "--legacy-zero-grad",
+        action="store_true",
+        help="Use optimizer.zero_grad() instead of zero_grad(set_to_none=True)",
+    )
+    parser.add_argument(
+        "--batch-empty-cache",
+        action="store_true",
+        help="gc.collect + cuda.empty_cache after each batch (legacy; slower)",
+    )
+    parser.add_argument(
+        "--dataloader-prefetch-factor",
+        type=int,
+        default=None,
+        help="DataLoader prefetch_factor per worker (default: 4)",
+    )
+    parser.add_argument(
+        "--npy-cache-size",
+        type=int,
+        default=None,
+        help="LRU cache size for mmap'd municipality .npy files (default: 20)",
+    )
+    parser.add_argument(
+        "--no-dataloader-pin-memory",
+        action="store_true",
+        help="DataLoader pin_memory=False (metadata batches only)",
+    )
     args = parser.parse_args()
 
+    from training_runtime import DEFAULTS
+
+    for key, value in DEFAULTS.items():
+        if not hasattr(args, key) or getattr(args, key) is None:
+            setattr(args, key, value)
+    if args.batch_empty_cache:
+        args.skip_batch_empty_cache = False
+
     args.dataset = "USCropsAggregatedNPY"
-    args.datapath = Path(args.datapath).expanduser() if args.datapath else DATAPATH
+    args.datapath = (
+        Path(args.datapath).expanduser()
+        if args.datapath
+        else resolve_datapath()
+    )
     args.yield_csv = Path(args.yield_csv).expanduser() if args.yield_csv else YIELD_CSV
     args.target_column, args.aggregation, args.target_unit = resolve_target(args.target)
 
@@ -661,14 +705,18 @@ def train(args):
     print(
         "Training throughput settings: "
         f"pixel_chunk_size={pixel_chunk}, "
-        f"chunks_per_grad={CHUNKS_PER_GRAD_UPDATE}, "
-        f"prefetch_chunks={getattr(args, 'prefetch_chunks', 2)}, "
+        f"chunks_per_grad={getattr(args, 'chunks_per_grad', CHUNKS_PER_GRAD_UPDATE)}, "
+        f"prefetch_chunks={getattr(args, 'prefetch_chunks', 4)}, "
+        f"workers={args.workers}, "
         f"batchsize={args.batchsize}, "
         f"quiet_training={getattr(args, 'quiet_training', False)}, "
         f"pipeline_h2d={str(getattr(args, 'device', 'cpu')).startswith('cuda') and getattr(args, 'quiet_training', False) and not getattr(args, 'disable_pipeline_h2d', False)}"
     )
 
     print("=> creating dataloader (Polars-optimized)")
+    from training_runtime import dataloader_options_from_args
+
+    dl_opts = dataloader_options_from_args(args)
     traindataloader, train_meta = get_aggregated_dataloader(
         args.datapath,
         args.yield_csv,
@@ -685,6 +733,7 @@ def train(args):
         harvest_years=args.harvest_years_set,
         feature_layout=args.feature_layout,
         target_column=args.target_column,
+        **dl_opts,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
         args.datapath,
@@ -701,6 +750,7 @@ def train(args):
         harvest_years=args.harvest_years_set,
         feature_layout=args.feature_layout,
         target_column=args.target_column,
+        **dl_opts,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
         args.datapath,
@@ -717,6 +767,7 @@ def train(args):
         harvest_years=args.harvest_years_set,
         feature_layout=args.feature_layout,
         target_column=args.target_column,
+        **dl_opts,
     )
 
     print("=> creating model")
@@ -797,8 +848,10 @@ def train(args):
     torch_compiled = False
     if hasattr(torch, "compile") and not args.no_compile:
         try:
-            print("Compiling model with torch.compile() for faster execution...")
-            model = torch.compile(model)
+            from training_runtime import compile_model, compile_mode
+
+            print(f"Compiling model with torch.compile(mode={compile_mode(args)!r})...")
+            model = compile_model(model, args)
             torch_compiled = True
             print("Model compilation successful!")
         except Exception as e:
@@ -1189,6 +1242,11 @@ def get_aggregated_dataloader(
     harvest_years=None,
     feature_layout: str = "spectral",
     target_column: str = "production_t",
+    *,
+    npy_cache_size: int = 20,
+    pin_memory: bool = True,
+    persistent_workers: bool = False,
+    prefetch_factor: int | None = 4,
 ):
     """Create dataloader for aggregated regression (Polars-optimized)."""
     dataset = USCropsAggregatedNPY(
@@ -1207,6 +1265,7 @@ def get_aggregated_dataloader(
         harvest_years=harvest_years,
         feature_layout=feature_layout,
         target_column=target_column,
+        npy_cache_size=npy_cache_size,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0
@@ -1226,15 +1285,19 @@ def get_aggregated_dataloader(
     elif mode == "train":
         shuffle = True  # Use standard shuffle if using all data
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batchsize,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=workers,
-        pin_memory=True,
-        collate_fn=aggregated_collate_fn,
-    )
+    loader_kwargs: dict = {
+        "dataset": dataset,
+        "batch_size": batchsize,
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+        "collate_fn": aggregated_collate_fn,
+    }
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor or 2))
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+    dataloader = DataLoader(**loader_kwargs)
 
     meta = dict(
         ndims=dataset.input_feature_dim,
@@ -1254,6 +1317,9 @@ def set_global_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
+    from training_runtime import enable_cuda_training_kernels
+
+    enable_cuda_training_kernels()
 
 
 def main():

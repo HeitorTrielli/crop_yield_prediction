@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 import torch
 
 BatchChunk = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+TaggedChunk = tuple[int, BatchChunk]
+TaggedGpuChunk = tuple[int, BatchChunk]
 
 
 def is_batched_pixel_chunk(pixel_chunk) -> bool:
@@ -91,9 +94,10 @@ class GpuH2DPipelineIterator:
     synchronous ``prepare_chunk_on_device`` loop.
     """
 
-    def __init__(self, cpu_chunks: Iterator[BatchChunk], device: torch.device):
+    def __init__(self, cpu_chunks: Iterator[BatchChunk], device: torch.device, *, pin_host: bool = False):
         self._cpu_iter = iter(cpu_chunks)
         self._device = device
+        self._pin_host = pin_host
         self._h2d_stream = torch.cuda.Stream(device=device)
         self._ready: BatchChunk | None = None
         self._load_next()
@@ -102,7 +106,7 @@ class GpuH2DPipelineIterator:
         with torch.cuda.stream(self._h2d_stream):
             # Pinned host pages on 30k+ px chunks can exhaust locked RAM and freeze WSL;
             # side-stream copies still overlap with default-stream compute.
-            return prepare_chunk_on_device(unpacked, self._device, pin_host=False)
+            return prepare_chunk_on_device(unpacked, self._device, pin_host=self._pin_host)
 
     def _load_next(self) -> None:
         try:
@@ -130,6 +134,167 @@ class GpuH2DPipelineIterator:
         return batch
 
 
+class TaggedGpuH2DPipelineIterator:
+    """Like GpuH2DPipelineIterator but preserves ``muni_idx`` tags across H2D."""
+
+    def __init__(
+        self,
+        tagged_cpu_chunks: Iterator[TaggedChunk],
+        device: torch.device,
+        *,
+        pin_host: bool = False,
+    ):
+        self._cpu_iter = iter(tagged_cpu_chunks)
+        self._device = device
+        self._pin_host = pin_host
+        self._h2d_stream = torch.cuda.Stream(device=device)
+        self._ready: TaggedGpuChunk | None = None
+        self._load_next()
+
+    def _transfer(self, muni_idx: int, unpacked: BatchChunk) -> TaggedGpuChunk:
+        with torch.cuda.stream(self._h2d_stream):
+            gpu = prepare_chunk_on_device(unpacked, self._device, pin_host=self._pin_host)
+        return muni_idx, gpu
+
+    def _load_next(self) -> None:
+        try:
+            muni_idx, unpacked = next(self._cpu_iter)
+        except StopIteration:
+            self._ready = None
+            return
+        self._ready = self._transfer(muni_idx, unpacked)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> TaggedGpuChunk:
+        if self._ready is None:
+            raise StopIteration
+        default_stream = torch.cuda.current_stream(self._device)
+        default_stream.wait_stream(self._h2d_stream)
+        muni_idx, batch = self._ready
+        for t in batch:
+            t.record_stream(default_stream)
+        self._load_next()
+        return muni_idx, batch
+
+
+def _iter_tagged_chunks_with_mmap_lookahead(
+    dataset,
+    entries: list[tuple[int, object, object]],
+    *,
+    chunk_size: int,
+) -> Iterator[TaggedChunk]:
+    """
+    Transform chunks sequentially while the next municipality .npy is mmap'd on a side thread.
+    """
+    if not entries:
+        return
+
+    def _mmap(entry: tuple[int, object, object]) -> tuple[int, object | None]:
+        muni_idx, municipality_code, year = entry
+        return muni_idx, dataset.mmap_municipality(municipality_code, year=year)
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="npy-mmap") as executor:
+        pending = executor.submit(_mmap, entries[0])
+        for i, _entry in enumerate(entries):
+            muni_idx, municipality_data = pending.result()
+            if i + 1 < len(entries):
+                pending = executor.submit(_mmap, entries[i + 1])
+
+            if municipality_data is None:
+                continue
+            num_pixels = len(municipality_data)
+            for start in range(0, num_pixels, chunk_size):
+                end = min(start + chunk_size, num_pixels)
+                unpacked = unpack_pixel_chunk(
+                    dataset._transform_chunk(municipality_data[start:end])
+                )
+                if unpacked is not None:
+                    yield muni_idx, unpacked
+
+
+def _iter_raw_batch_cpu_chunks(
+    dataset,
+    municipalities,
+    years,
+    num_pixels_list,
+    *,
+    chunk_size: int,
+    skip_muni_indices: set[int] | None = None,
+    mmap_lookahead: bool = False,
+) -> Iterator[TaggedChunk]:
+    """Chain all municipalities in one batch (CPU tensors, tagged by muni index)."""
+    skip = skip_muni_indices or set()
+    entries: list[tuple[int, object, object]] = []
+    for muni_idx, municipality_code in enumerate(municipalities):
+        if muni_idx in skip:
+            continue
+        num_pixels = num_pixels_list[muni_idx]
+        if num_pixels <= 0:
+            continue
+        year = years[muni_idx] if years[muni_idx] is not None else None
+        entries.append((muni_idx, municipality_code, year))
+
+    if mmap_lookahead and len(entries) > 1:
+        yield from _iter_tagged_chunks_with_mmap_lookahead(
+            dataset, entries, chunk_size=chunk_size
+        )
+        return
+
+    for muni_idx, municipality_code, year in entries:
+        raw = dataset.load_pixels_from_municipality(
+            municipality_code, year=year, chunk_size=chunk_size
+        )
+        for pixel_chunk in raw:
+            unpacked = unpack_pixel_chunk(pixel_chunk)
+            if unpacked is not None:
+                yield muni_idx, unpacked
+
+
+def iter_batch_municipality_chunks(
+    dataset,
+    municipalities,
+    years,
+    num_pixels_list,
+    *,
+    chunk_size: int,
+    prefetch_depth: int = 2,
+    device: torch.device | None = None,
+    pipeline_h2d: bool = False,
+    pin_host: bool = False,
+    skip_muni_indices: set[int] | None = None,
+    mmap_lookahead: bool = False,
+) -> Iterator[TaggedChunk | TaggedGpuChunk]:
+    """
+    Yield ``(muni_idx, chunk)`` for a whole dataloader batch.
+
+    Keeps CPU prefetch + H2D pipeline running across municipality boundaries
+    (no idle gap while opening the next .npy file).
+    """
+    stream: Iterator[TaggedChunk] = _iter_raw_batch_cpu_chunks(
+        dataset,
+        municipalities,
+        years,
+        num_pixels_list,
+        chunk_size=chunk_size,
+        skip_muni_indices=skip_muni_indices,
+        mmap_lookahead=mmap_lookahead,
+    )
+    depth = int(prefetch_depth)
+    if depth > 0:
+        stream = PrefetchIterator(stream, max_pending=depth)  # type: ignore[assignment]
+    if (
+        pipeline_h2d
+        and device is not None
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+    ):
+        yield from TaggedGpuH2DPipelineIterator(stream, device, pin_host=pin_host)
+        return
+    yield from stream
+
+
 def _iter_prepared_from_raw(raw_source) -> Iterator[BatchChunk]:
     for pixel_chunk in raw_source:
         unpacked = unpack_pixel_chunk(pixel_chunk)
@@ -146,6 +311,7 @@ def iter_municipality_pixel_chunks(
     prefetch_depth: int = 2,
     device: torch.device | None = None,
     pipeline_h2d: bool = False,
+    pin_host: bool = False,
 ) -> Iterator[BatchChunk]:
     """
     Yield pixel chunks for one municipality.
@@ -170,7 +336,7 @@ def iter_municipality_pixel_chunks(
         and device.type == "cuda"
         and torch.cuda.is_available()
     ):
-        yield from GpuH2DPipelineIterator(prepared, device)
+        yield from GpuH2DPipelineIterator(prepared, device, pin_host=pin_host)
         return
     yield from prepared
 
