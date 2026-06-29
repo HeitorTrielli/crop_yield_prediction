@@ -178,8 +178,8 @@ def parse_args():
     parser.add_argument(
         "--pixel-chunk-size",
         type=int,
-        default=None,
-        help="Pixels per GPU forward pass (default: 45000)",
+        default=16000,
+        help="Pixels per GPU forward pass (default: 16000)",
     )
     parser.add_argument(
         "--prefetch-chunks",
@@ -338,6 +338,12 @@ def parse_args():
         "--no-dataloader-pin-memory",
         action="store_true",
         help="DataLoader pin_memory=False (metadata batches only)",
+    )
+    parser.add_argument(
+        "--chunks-per-grad",
+        type=int,
+        default=1,
+        help="Backward every N pixel chunks (default: 1; >1 retains autograd graphs longer)",
     )
     args = parser.parse_args()
 
@@ -698,19 +704,6 @@ def train(args):
     )
     print(
         f"Target: {args.target} ({args.target_column}, {args.aggregation} over pixels)"
-    )
-    from utils_aggregated import CHUNKS_PER_GRAD_UPDATE, MAX_PIXEL_BATCH_SIZE
-
-    pixel_chunk = args.pixel_chunk_size or MAX_PIXEL_BATCH_SIZE
-    print(
-        "Training throughput settings: "
-        f"pixel_chunk_size={pixel_chunk}, "
-        f"chunks_per_grad={getattr(args, 'chunks_per_grad', CHUNKS_PER_GRAD_UPDATE)}, "
-        f"prefetch_chunks={getattr(args, 'prefetch_chunks', 4)}, "
-        f"workers={args.workers}, "
-        f"batchsize={args.batchsize}, "
-        f"quiet_training={getattr(args, 'quiet_training', False)}, "
-        f"pipeline_h2d={str(getattr(args, 'device', 'cpu')).startswith('cuda') and getattr(args, 'quiet_training', False) and not getattr(args, 'disable_pipeline_h2d', False)}"
     )
 
     print("=> creating dataloader (Polars-optimized)")
@@ -1086,6 +1079,9 @@ def train(args):
     )
 
     print(f"Training {model.modelname}...")
+    from training.pipeline import describe_chunk_pipeline
+
+    print(describe_chunk_pipeline(args, device))
     for epoch in range(start_epoch, args.epochs):
         # Update sampler epoch for different shuffles each epoch
         if hasattr(traindataloader.sampler, "set_epoch"):

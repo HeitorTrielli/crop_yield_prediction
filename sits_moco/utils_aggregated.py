@@ -15,9 +15,6 @@ import torch.nn as nn
 from datasets.pixel_chunk import prepare_chunk_on_device, unpack_pixel_chunk
 from training.accumulator import MunicipalityPixelAccumulator
 
-MAX_PIXEL_BATCH_SIZE = 40000
-CHUNKS_PER_GRAD_UPDATE = 1
-
 
 def _pixel_chunk_size(args) -> int:
     from training.pipeline import pixel_chunk_size

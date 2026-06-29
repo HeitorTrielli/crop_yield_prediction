@@ -30,20 +30,21 @@ base:
   logdir: ./results
   seed: 27
   epochs: 100
-  workers: 20
+  workers: 30
   sequencelength: 45
-  batchsize: 64
+  batchsize: 67
   learning_rate: 1.0e-3
   weight_decay: 5.0e-4
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [15, 40]
+  schedule: [5, 15]
   no_compile: true
   overwrite_run: true
-  early_stop_patience: 30
-  pixel_chunk_size: 25000
-  prefetch_chunks: 20
+  early_stop_patience: 15
+  pixel_chunk_size: 8000
+  prefetch_chunks: 30
+  chunks_per_grad: 24
   quiet_training: true
   # Seed27 default was n_layers=1, d_model=128, d_inner=128, n_head=16, dropout=0.2
   model_n_layers: 1

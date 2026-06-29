@@ -65,6 +65,7 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "schedule": ("--schedule",),
     "pixel_chunk_size": ("--pixel-chunk-size",),
     "prefetch_chunks": ("--prefetch-chunks",),
+    "chunks_per_grad": ("--chunks-per-grad",),
 }
 
 
