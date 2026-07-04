@@ -685,73 +685,132 @@ def load_model(
     return model, input_dim, resolved_layout, aggregation
 
 
-def main() -> None:
-    args, run_config = parse_args()
-    print(
-        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
-    )
-    if args.output_csv is None:
-        args.output_csv = (
-            predictions_dir(run_dir_from_path(args.checkpoint), create=True)
-            / "talhoes_forecasts.csv"
-        )
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+def run_talhao_predictions(
+    *,
+    checkpoint: Path | None,
+    datapath: Path,
+    tiffpath: Path,
+    year_range: str,
+    talhoes_path: Path,
+    talhoes_layer: str = "talhoes_baseline",
+    baseline_csv: Path | None = None,
+    output_csv: Path | None = None,
+    sequencelength: int,
+    chunk_size: int = 2000,
+    device: torch.device | str | None = None,
+    seed: int = 42,
+    feature_layout: str | None = None,
+    municipalities: list[str] | None = None,
+    reproject_tiffs: bool = False,
+    use_mask_cache: bool = True,
+    rc: bool = False,
+    interp: bool = False,
+    model=None,
+    aggregation: str | None = None,
+    run_config: dict | None = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Predict yield per talhão for one harvest season and optionally write a CSV.
 
-    print(f"Loading talhões from {args.talhoes_gpkg} (layer={args.talhoes_layer})...")
-    talhoes = load_talhoes(args.talhoes_gpkg, args.talhoes_layer)
-    print(f"  {len(talhoes)} talhões")
+    When ``model`` is provided, ``checkpoint`` is only used for run metadata
+    (target unit, aggregation) if ``aggregation`` is omitted.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+
+    if checkpoint is not None:
+        checkpoint = resolve_checkpoint_path(checkpoint)
+    if run_config is None and checkpoint is not None:
+        run_config = load_latest_run_config(checkpoint)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if verbose:
+        print(f"Loading talhões from {talhoes_path} (layer={talhoes_layer})...")
+    talhoes = load_talhoes(talhoes_path, talhoes_layer)
+    if verbose:
+        print(f"  {len(talhoes)} talhões")
 
     baseline_agg = None
-    if args.baseline_csv.is_file():
-        harvest_year = harvest_year_from_year_range(args.year_range)
-        print(
-            f"Loading baseline max prod for harvest {harvest_year} "
-            f"from {args.baseline_csv}..."
-        )
-        baseline_agg = load_baseline_agg(args.baseline_csv, args.year_range)
+    if baseline_csv is not None and baseline_csv.is_file():
+        harvest_year = harvest_year_from_year_range(year_range)
+        if verbose:
+            print(
+                f"Loading baseline max prod for harvest {harvest_year} "
+                f"from {baseline_csv}..."
+            )
+        baseline_agg = load_baseline_agg(baseline_csv, year_range)
 
-    if args.municipalities:
-        codes = {str(c) for c in args.municipalities}
+    if municipalities:
+        codes = {str(c) for c in municipalities}
         talhoes = talhoes[talhoes["geo_cod"].astype(str).isin(codes)]
-        print(f"  filtered to {len(talhoes)} talhões in municipalities {sorted(codes)}")
+        if verbose:
+            print(f"  filtered to {len(talhoes)} talhões in municipalities {sorted(codes)}")
 
-    model, input_dim, feature_layout, aggregation = load_model(
-        args.checkpoint, device, args.sequencelength, args.feature_layout
-    )
-    target, _, _, target_unit = resolve_inference_target(run_config, None)
-    print(
-        f"Model loaded (input_dim={input_dim}, pixel aggregation={aggregation}, "
-        f"target={target}, unit={target_unit})"
-    )
-    print("Mode: talhão-only (infer pixels inside plot polygons only)")
-    if args.reproject_tiffs:
-        print("Valid-pixel mask: reproject each daily TIFF (slow)")
-    else:
-        print(
-            "Valid-pixel mask: direct read when grids match, else warp + .keep_mask.npy cache"
+    if model is None:
+        if checkpoint is None:
+            raise ValueError("Either model or checkpoint must be provided")
+        if feature_layout is None:
+            raise ValueError("feature_layout is required when model is not provided")
+        model, input_dim, feature_layout, aggregation = load_model(
+            checkpoint, device, sequencelength, feature_layout
         )
+    else:
+        if feature_layout is None:
+            raise ValueError("feature_layout is required when passing a pre-loaded model")
+        feature_layout = normalize_feature_layout(feature_layout)
+        if aggregation is None:
+            if run_config is None or checkpoint is None:
+                raise ValueError(
+                    "aggregation or (checkpoint + run_config) required with pre-loaded model"
+                )
+            ck = torch.load(checkpoint, map_location=device, weights_only=False)
+            _, _, aggregation, _ = resolve_inference_target(run_config, ck)
+        input_dim = stnet_regression_input_dim_from_state_dict(
+            model.state_dict()
+            if not hasattr(model, "_orig_mod")
+            else model._orig_mod.state_dict()
+        )
+
+    if run_config is not None and checkpoint is not None:
+        ck = torch.load(checkpoint, map_location=device, weights_only=False)
+        target, _, _, target_unit = resolve_inference_target(run_config, ck)
+    else:
+        target, target_unit = "production", "t"
+
+    if verbose:
+        print(
+            f"Model ready (input_dim={input_dim}, pixel aggregation={aggregation}, "
+            f"target={target}, unit={target_unit})"
+        )
+        print("Mode: talhão-only (infer pixels inside plot polygons only)")
+
     pixel_transform = PixelTransform(
-        args.sequencelength,
+        sequencelength,
         feature_layout,
-        randomchoice=args.rc,
-        interp=args.interp,
-        seed=args.seed,
+        randomchoice=rc,
+        interp=interp,
+        seed=seed,
     )
 
     results: list[dict] = []
     failed: list[str] = []
 
     muni_groups = talhoes.groupby(talhoes["geo_cod"].astype(str))
-    for geo_cod, group in tqdm(muni_groups, desc="Municipalities", unit="muni"):
-        npy_path = resolve_muni_npy(args.datapath, geo_cod, args.year_range)
+    for geo_cod, group in tqdm(
+        muni_groups, desc="Talhões", unit="muni", disable=not verbose
+    ):
+        npy_path = resolve_muni_npy(datapath, geo_cod, year_range)
         if npy_path is None:
             for _, row in group.iterrows():
                 failed.append(str(row["talhao_key"]))
             continue
 
-        daily_dir = resolve_daily_tiff_dir(args.tiffpath, geo_cod, args.year_range)
+        daily_dir = resolve_daily_tiff_dir(tiffpath, geo_cod, year_range)
         if daily_dir is None:
             for _, row in group.iterrows():
                 failed.append(str(row["talhao_key"]))
@@ -790,12 +849,12 @@ def main() -> None:
             npy_path,
             daily_tiffs,
             pixel_transform=pixel_transform,
-            chunk_size=args.chunk_size,
+            chunk_size=chunk_size,
             device=device,
             talhao_mask=talhao_union,
             talhao_only=True,
-            reproject_tiffs=args.reproject_tiffs,
-            use_mask_cache=not args.no_mask_cache,
+            reproject_tiffs=reproject_tiffs,
+            use_mask_cache=use_mask_cache,
         )
         if grid_out is None:
             for _, row in group.iterrows():
@@ -821,10 +880,11 @@ def main() -> None:
             results.append(rec)
 
     if not results:
-        print("No forecasts generated.")
-        if failed:
-            print(f"Failed talhões: {len(failed)}")
-        return
+        if verbose:
+            print("No forecasts generated.")
+            if failed:
+                print(f"Failed talhões: {len(failed)}")
+        return pd.DataFrame()
 
     out = pd.DataFrame(results)
     if baseline_agg is not None:
@@ -867,55 +927,96 @@ def main() -> None:
         out["abs_error_t_ha"] = out["error_t_ha"].abs()
 
     out = out.sort_values(["geo_cod", "talhao_id"])
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(args.output_csv, index=False)
-    print(f"\nSaved {len(out)} forecasts to {args.output_csv}")
-    valid = out["forecast"].notna()
-    print(
-        f"  forecast range: {out.loc[valid, 'forecast'].min():.2f} – "
-        f"{out.loc[valid, 'forecast'].max():.2f}"
-    )
+    if output_csv is not None:
+        output_csv = Path(output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(output_csv, index=False)
+        if verbose:
+            print(f"\nSaved {len(out)} forecasts to {output_csv}")
 
-    if "baseline_prod_max" in out.columns:
-        m_ha = (
-            out["forecast_t_ha"].notna()
-            & out["baseline_t_ha"].notna()
-            & (out["n_pixels"] > 0)
-        )
-        if m_ha.any():
-            sub_ha = out.loc[m_ha]
-            metrics_ha = regression_metrics(
-                sub_ha["forecast_t_ha"].values,
-                sub_ha["baseline_t_ha"].values,
-            )
+    if verbose:
+        valid = out["forecast"].notna()
+        if valid.any():
             print(
-                f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):"
+                f"  forecast range: {out.loc[valid, 'forecast'].min():.2f} – "
+                f"{out.loc[valid, 'forecast'].max():.2f}"
             )
-            print(f"  RMSE: {metrics_ha['rmse']:.2f}")
-            print(f"  MAE:  {metrics_ha['mae']:.2f}")
-            print(f"  R²:   {metrics_ha['r2']:.4f}")
 
-        if aggregation != "mean":
-            m = (
-                out["forecast"].notna()
-                & out["baseline_tons"].notna()
+        if "baseline_prod_max" in out.columns:
+            m_ha = (
+                out["forecast_t_ha"].notna()
+                & out["baseline_t_ha"].notna()
                 & (out["n_pixels"] > 0)
             )
-            if m.any():
-                sub = out.loc[m]
-                metrics_t = regression_metrics(
-                    sub["forecast"].values,
-                    sub["baseline_tons"].values,
+            if m_ha.any():
+                sub_ha = out.loc[m_ha]
+                metrics_ha = regression_metrics(
+                    sub_ha["forecast_t_ha"].values,
+                    sub_ha["baseline_t_ha"].values,
                 )
                 print(
-                    f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):"
+                    f"\nMetrics vs AgroIA baseline ({m_ha.sum()} talhões, produtividade t/ha):"
                 )
-                print(f"  RMSE: {metrics_t['rmse']:.2f}")
-                print(f"  MAE:  {metrics_t['mae']:.2f}")
-                print(f"  R²:   {metrics_t['r2']:.4f}")
+                print(f"  RMSE: {metrics_ha['rmse']:.2f}")
+                print(f"  MAE:  {metrics_ha['mae']:.2f}")
+                print(f"  R²:   {metrics_ha['r2']:.4f}")
 
-    if failed:
-        print(f"\nFailed/skipped {len(failed)} talhões (missing .npy or TIFFs)")
+            if aggregation != "mean":
+                m = (
+                    out["forecast"].notna()
+                    & out["baseline_tons"].notna()
+                    & (out["n_pixels"] > 0)
+                )
+                if m.any():
+                    sub = out.loc[m]
+                    metrics_t = regression_metrics(
+                        sub["forecast"].values,
+                        sub["baseline_tons"].values,
+                    )
+                    print(
+                        f"\nMetrics vs AgroIA baseline ({m.sum()} talhões, produção total t):"
+                    )
+                    print(f"  RMSE: {metrics_t['rmse']:.2f}")
+                    print(f"  MAE:  {metrics_t['mae']:.2f}")
+                    print(f"  R²:   {metrics_t['r2']:.4f}")
+
+        if failed:
+            print(f"\nFailed/skipped {len(failed)} talhões (missing .npy or TIFFs)")
+
+    return out
+
+
+def main() -> None:
+    args, run_config = parse_args()
+    print(
+        f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
+    )
+    if args.output_csv is None:
+        args.output_csv = (
+            predictions_dir(run_dir_from_path(args.checkpoint), create=True)
+            / "talhoes_forecasts.csv"
+        )
+    run_talhao_predictions(
+        checkpoint=args.checkpoint,
+        datapath=args.datapath,
+        tiffpath=args.tiffpath,
+        year_range=args.year_range,
+        talhoes_path=args.talhoes_gpkg,
+        talhoes_layer=args.talhoes_layer,
+        baseline_csv=args.baseline_csv,
+        output_csv=args.output_csv,
+        sequencelength=args.sequencelength,
+        chunk_size=args.chunk_size,
+        device=args.device,
+        seed=args.seed,
+        feature_layout=args.feature_layout,
+        municipalities=args.municipalities,
+        reproject_tiffs=args.reproject_tiffs,
+        use_mask_cache=not args.no_mask_cache,
+        rc=args.rc,
+        interp=args.interp,
+        run_config=run_config,
+    )
 
 
 if __name__ == "__main__":

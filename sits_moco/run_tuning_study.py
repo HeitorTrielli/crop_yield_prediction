@@ -5,8 +5,14 @@ Structured hyperparameter tuning for yield/productivity regression.
 Example:
   python run_tuning_study.py run tuning/studies/productivity_baseline.yaml
   python run_tuning_study.py run tuning/studies/productivity_baseline.yaml --dry-run
+  python run_tuning_study.py run tuning/studies/productivity_baseline.yaml --skip-completed
   python run_tuning_study.py summarize tuning/studies/productivity_baseline.yaml
   python run_tuning_study.py leaderboard tuning/studies/productivity_baseline.yaml --top 10
+
+Resuming after an interrupted trial (e.g. trial_007 stopped mid-training):
+  python run_tuning_study.py run tuning/studies/total_adj_architecture.yaml --skip-completed
+  # Skips trials 001-006 (already ok), resumes 007 from checkpoint_epoch_N.pth via --pretrained.
+  # Use --no-resume-incomplete to restart interrupted trials from epoch 1 instead.
 """
 
 from __future__ import annotations
@@ -27,7 +33,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from tuning.collect import best_epoch_metrics, trial_row
 from tuning.config import load_study_config, merge_trial_params
-from tuning.runner import predict_run_dir, run_trial_subprocess
+from tuning.resume import plan_trial_resume
+from tuning.runner import apply_resume_params, predict_run_dir, run_trial_subprocess
 from tuning.search import generate_trials
 
 
@@ -104,6 +111,31 @@ def _latest_trial_records(path: Path) -> dict[str, dict]:
     return latest
 
 
+def _trial_appears_trained(run_dir: Path) -> bool:
+    """True when a run folder has a finished training artifact but tuning never recorded success."""
+    training = run_dir / "training"
+    return (training / "model_best.pth").is_file() and (training / "trainlog.csv").is_file()
+
+
+def _finalize_trial_metrics(
+    run_dir: Path,
+    *,
+    objective: str,
+    objective_spec: dict,
+) -> dict:
+    metrics = best_epoch_metrics(
+        run_dir,
+        objective=objective,
+        objective_spec=objective_spec,
+    )
+    return {
+        "run_dir": str(run_dir.resolve()),
+        "returncode": 0,
+        "finalized_without_training": True,
+        **metrics,
+    }
+
+
 def _trial_run_succeeded(rec: dict) -> bool:
     if rec.get("status") == "dry_run":
         return False
@@ -165,6 +197,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             if _trial_run_succeeded(rec):
                 succeeded_ids.add(trial_id)
 
+    resume_incomplete = args.resume_incomplete and not args.rerun_all
+    if resume_incomplete:
+        print("Resume: enabled (interrupted trials continue from latest checkpoint)")
+    elif not args.rerun_all:
+        print("Resume: disabled (interrupted trials restart from scratch)")
+
     training_script = Path(cfg["training_script"])
     repo_root = REPO_ROOT
 
@@ -190,9 +228,80 @@ def cmd_run(args: argparse.Namespace) -> int:
         started = _utc_now_iso()
         print(f"[{trial_id}] started at {started}")
 
+        resume_plan = None
+        append_log = False
+        train_params = merged
+        if resume_incomplete:
+            resume_plan = plan_trial_resume(
+                run_dir,
+                target_epochs=int(merged.get("epochs", 100)),
+                early_stop_patience=int(merged.get("early_stop_patience", 0)) or None,
+            )
+            if resume_plan is not None:
+                train_params = apply_resume_params(
+                    merged, resume_plan["checkpoint"]
+                )
+                append_log = (trial_dir / "train_stdout.log").is_file()
+                if not args.dry_run:
+                    epoch = resume_plan.get("epoch")
+                    es = resume_plan.get("early_stop") or {}
+                    not_improved = es.get("not_improved_count")
+                    best_ep = es.get("best_epoch")
+                    msg = (
+                        f"[{trial_id}] resume from epoch {epoch} "
+                        f"via {resume_plan['checkpoint']}"
+                    )
+                    if not_improved is not None:
+                        msg += (
+                            f" (trainlog: best epoch {best_ep}, "
+                            f"not_improved={not_improved})"
+                        )
+                    print(msg)
+            elif _trial_appears_trained(run_dir) and not args.dry_run:
+                print(f"[{trial_id}] training artifacts found; collecting metrics only")
+                outcome = _finalize_trial_metrics(
+                    run_dir,
+                    objective=cfg["objective"],
+                    objective_spec=cfg["objective_spec"],
+                )
+                finished = _utc_now_iso()
+                _print_trial_finished(trial_id, finished, started)
+                if outcome.get("status") == "ok":
+                    print(
+                        f"[{trial_id}] OK  {cfg['objective']}={outcome['objective_value']:.6g} "
+                        f"(epoch {outcome['best_epoch']})"
+                    )
+                record = {
+                    "trial_id": trial_id,
+                    "status": "completed",
+                    "params": merged,
+                    "sampled": sampled,
+                    "outcome": outcome,
+                    "started_at_utc": started,
+                    "finished_at_utc": finished,
+                    "resumed_from_checkpoint": None,
+                }
+                _append_jsonl(study_dir / "trials.jsonl", record)
+                df = _update_summary(study_dir)
+                best = _pick_best(df, cfg["objective"], cfg["objective_spec"])
+                if best:
+                    _save_json(study_dir / "best_trial.json", best)
+                continue
+            elif (run_dir / "training" / "trainlog.csv").is_file() and not args.dry_run:
+                print(
+                    f"[{trial_id}] WARNING: trainlog exists but no checkpoint found; "
+                    "starting fresh (earlier epoch weights cannot be restored)"
+                )
+
         if args.dry_run:
+            if resume_plan is not None:
+                epoch = resume_plan.get("epoch")
+                print(
+                    f"[{trial_id}] would resume from epoch {epoch} "
+                    f"via {resume_plan['checkpoint']}"
+                )
             outcome = run_trial_subprocess(
-                merged,
+                train_params,
                 training_script=training_script,
                 repo_root=repo_root,
                 dry_run=True,
@@ -213,10 +322,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             continue
 
         proc_outcome = run_trial_subprocess(
-            merged,
+            train_params,
             training_script=training_script,
             repo_root=repo_root,
             capture_log=trial_dir / "train_stdout.log",
+            append_log=append_log,
         )
 
         if proc_outcome["returncode"] != 0:
@@ -251,6 +361,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             "outcome": outcome,
             "started_at_utc": started,
             "finished_at_utc": finished,
+            "resumed_from_checkpoint": (
+                str(resume_plan["checkpoint"]) if resume_plan else None
+            ),
         }
         _append_jsonl(study_dir / "trials.jsonl", record)
 
@@ -363,6 +476,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-completed",
         action="store_true",
         help="Skip trials whose latest run succeeded (outcome status ok)",
+    )
+    p_run.add_argument(
+        "--resume-incomplete",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Continue interrupted trials from the latest checkpoint under the "
+            "expected run_dir (default: enabled). Use --no-resume-incomplete to "
+            "restart them from epoch 1."
+        ),
     )
     p_run.add_argument(
         "--rerun-all",

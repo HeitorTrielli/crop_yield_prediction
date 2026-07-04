@@ -1,0 +1,68 @@
+# Architecture tuning focused on reducing overfitting (productivity / t/ha).
+#
+# Searches smaller widths, fewer layers, and higher dropout vs Seed27 defaults.
+# Training hyperparams stay fixed; regularization is mostly in model shape + dropout.
+#
+# 36 trials = 3 d_model × 2 n_head × 2 d_inner × 3 dropout × 1 n_layers
+# (n_layers fixed at 1 in base; increase only if you add it to search)
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_architecture.yaml --list-trials
+#
+# Run (resumable; skips successful trials, resumes interrupted ones):
+#   python run_tuning_study.py run tuning/studies/total_adj_architecture.yaml --skip-completed
+#
+# After changing base recipe (LR, epochs, …), rerun all trials:
+#   python run_tuning_study.py run tuning/studies/productivity_architecture.yaml --rerun-all
+
+name: total_adj_architecture
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+# Fixed training recipe (Seed27 baseline). Tune architecture separately from LR/batch.
+base:
+  target: total_adj
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral_xavier
+  yield_csv: files/pam_soy_pr_2019_2025.csv
+  logdir: ./results
+  seed: 27
+  epochs: 100
+  workers: 6
+  sequencelength: 45
+  batchsize: 8
+  learning_rate: 1.0e-4
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [15, 50]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 20
+  pixel_chunk_size: 15000
+  prefetch_chunks: 5
+  quiet_training: true
+  model_n_layers: 1
+
+search:
+  strategy: grid
+
+  parameters:
+    model_d_model:
+      type: choice
+      values: [64, 96, 128]
+
+    model_n_head:
+      type: choice
+      values: [4, 8]
+
+    model_d_inner:
+      type: choice
+      values: [64, 128]
+
+    model_dropout:
+      type: choice
+      values: [0.3, 0.4, 0.5]

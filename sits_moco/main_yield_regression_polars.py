@@ -49,6 +49,11 @@ from utils_aggregated import (
     train_epoch_aggregated,
 )
 
+from training.early_stop import (
+    early_stop_state_from_trainlog,
+    initial_session_optimizer_hparams,
+)
+
 # Default paths (datapath: see SITS_MOCO_DATAPATH in .env)
 from env_config import resolve_datapath
 
@@ -947,12 +952,16 @@ def train(args):
         loaded_not_improved_from_ck = None
         if "not_improved_count" in checkpoint:
             loaded_not_improved_from_ck = int(checkpoint["not_improved_count"])
-            if optimizer_hparams_changed(ck_optimizer_hparams, args):
+            reference_opt = (
+                initial_session_optimizer_hparams(training_dir_path)
+                or ck_optimizer_hparams
+            )
+            if optimizer_hparams_changed(reference_opt, args):
                 not_improved_count = 0
                 not_improved_count_reset = True
                 print(
                     f"  ✓ Reset not_improved_count (checkpoint had {loaded_not_improved_from_ck}) "
-                    "because optimizer hparams changed"
+                    "because optimizer hparams changed vs initial training session"
                 )
             else:
                 not_improved_count = loaded_not_improved_from_ck
@@ -1012,6 +1021,17 @@ def train(args):
                 print(f"  ⚠️  Could not load existing log: {e}, starting fresh")
         else:
             print("  ℹ️  No existing training log found, starting fresh")
+
+        es_state = early_stop_state_from_trainlog(trainlog_file)
+        if es_state is not None:
+            val_loss_min = es_state["val_loss_min"]
+            not_improved_count = es_state["not_improved_count"]
+            print(
+                f"  ✓ Early-stop state from trainlog: best epoch {es_state['best_epoch']}, "
+                f"val_loss_min={val_loss_min:.6g}, "
+                f"not_improved={not_improved_count} "
+                f"(last completed epoch {es_state['last_epoch']})"
+            )
 
         resume_info = {
             "from_checkpoint": str(pretrained_path_resolved),
@@ -1086,102 +1106,113 @@ def train(args):
     )
 
     print(f"Training {model.modelname}...")
-    for epoch in range(start_epoch, args.epochs):
-        # Update sampler epoch for different shuffles each epoch
-        if hasattr(traindataloader.sampler, "set_epoch"):
-            traindataloader.sampler.set_epoch(epoch)
 
-        if args.warmup_epochs > 0:
-            if epoch == 0:
-                lr = args.learning_rate * 0.1
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
-            elif epoch == args.warmup_epochs:
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = args.learning_rate
-
-        if args.schedule is not None:
-            adjust_learning_rate(optimizer, epoch, args)
-
-        train_loss = train_epoch_aggregated(
-            model,
-            optimizer,
-            criterion,
-            traindataloader,
-            device,
-            args,
-            target_mean,
-            target_std,
-        )
-        val_loss, scores = test_epoch_aggregated(
-            model, criterion, valdataloader, device, args, target_mean, target_std
-        )
-
-        scores_msg = ", ".join([f"{k}={v:.4f}" for (k, v) in scores.items()])
+    if (
+        pretrained_checkpoint is not None
+        and not_improved_count >= args.early_stop_patience
+    ):
         print(
-            f"epoch {epoch + 1}: trainloss={train_loss:.4f}, valloss={val_loss:.4f} "
-            + scores_msg
+            f"\nEarly-stop patience ({args.early_stop_patience}) already reached "
+            f"(not_improved={not_improved_count}). Skipping training; testing model_best."
         )
+        epoch = start_epoch - 1
+    else:
+        for epoch in range(start_epoch, args.epochs):
+            # Update sampler epoch for different shuffles each epoch
+            if hasattr(traindataloader.sampler, "set_epoch"):
+                traindataloader.sampler.set_epoch(epoch)
 
-        if val_loss < val_loss_min:
-            not_improved_count = 0
-            save(
+            if args.warmup_epochs > 0:
+                if epoch == 0:
+                    lr = args.learning_rate * 0.1
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
+                elif epoch == args.warmup_epochs:
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = args.learning_rate
+
+            if args.schedule is not None:
+                adjust_learning_rate(optimizer, epoch, args)
+
+            train_loss = train_epoch_aggregated(
                 model,
-                path=best_model_path,
-                criterion=criterion,
-                optimizer_state=optimizer.state_dict(),
-                epoch=epoch + 1,
-                val_loss=val_loss,
-                train_loss=train_loss,
-                val_loss_min=val_loss,
-                not_improved_count=not_improved_count,
-                target_mean=target_mean,
-                target_std=target_std,
-                feature_layout=args.feature_layout,
-                target=args.target,
-                target_column=args.target_column,
-                aggregation=args.aggregation,
+                optimizer,
+                criterion,
+                traindataloader,
+                device,
+                args,
+                target_mean,
+                target_std,
             )
-            val_loss_min = val_loss
-            print(f"lowest val loss in epoch {epoch + 1}\n")
-        else:
-            not_improved_count += 1
-
-        scores["epoch"] = epoch + 1
-        scores["trainloss"] = train_loss
-        scores["valloss"] = val_loss
-        log.append(scores)
-
-        log_df = pd.DataFrame(log).set_index("epoch")
-        log_df.to_csv(training_dir_path / "trainlog.csv", float_format="%.6g")
-
-        if (epoch + 1) % 1 == 0:
-            checkpoint_path = training_dir_path / f"checkpoint_epoch_{epoch + 1}.pth"
-            save(
-                model,
-                path=checkpoint_path,
-                criterion=criterion,
-                optimizer_state=optimizer.state_dict(),
-                epoch=epoch + 1,
-                val_loss=val_loss,
-                train_loss=train_loss,
-                val_loss_min=val_loss_min,
-                not_improved_count=not_improved_count,
-                target_mean=target_mean,
-                target_std=target_std,
-                feature_layout=args.feature_layout,
-                target=args.target,
-                target_column=args.target_column,
-                aggregation=args.aggregation,
+            val_loss, scores = test_epoch_aggregated(
+                model, criterion, valdataloader, device, args, target_mean, target_std
             )
-            print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
 
-        if not_improved_count >= args.early_stop_patience:
+            scores_msg = ", ".join([f"{k}={v:.4f}" for (k, v) in scores.items()])
             print(
-                f"\nValidation performance didn't improve for "
-                f"{args.early_stop_patience} epochs. Training stops."
+                f"epoch {epoch + 1}: trainloss={train_loss:.4f}, valloss={val_loss:.4f} "
+                + scores_msg
             )
-            break
+
+            if val_loss < val_loss_min:
+                not_improved_count = 0
+                save(
+                    model,
+                    path=best_model_path,
+                    criterion=criterion,
+                    optimizer_state=optimizer.state_dict(),
+                    epoch=epoch + 1,
+                    val_loss=val_loss,
+                    train_loss=train_loss,
+                    val_loss_min=val_loss,
+                    not_improved_count=not_improved_count,
+                    target_mean=target_mean,
+                    target_std=target_std,
+                    feature_layout=args.feature_layout,
+                    target=args.target,
+                    target_column=args.target_column,
+                    aggregation=args.aggregation,
+                )
+                val_loss_min = val_loss
+                print(f"lowest val loss in epoch {epoch + 1}\n")
+            else:
+                not_improved_count += 1
+
+            scores["epoch"] = epoch + 1
+            scores["trainloss"] = train_loss
+            scores["valloss"] = val_loss
+            log.append(scores)
+
+            log_df = pd.DataFrame(log).set_index("epoch")
+            log_df.to_csv(training_dir_path / "trainlog.csv", float_format="%.6g")
+
+            if (epoch + 1) % 1 == 0:
+                checkpoint_path = training_dir_path / f"checkpoint_epoch_{epoch + 1}.pth"
+                save(
+                    model,
+                    path=checkpoint_path,
+                    criterion=criterion,
+                    optimizer_state=optimizer.state_dict(),
+                    epoch=epoch + 1,
+                    val_loss=val_loss,
+                    train_loss=train_loss,
+                    val_loss_min=val_loss_min,
+                    not_improved_count=not_improved_count,
+                    target_mean=target_mean,
+                    target_std=target_std,
+                    feature_layout=args.feature_layout,
+                    target=args.target,
+                    target_column=args.target_column,
+                    aggregation=args.aggregation,
+                )
+                print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
+
+            if not_improved_count >= args.early_stop_patience:
+                print(
+                    f"\nValidation performance didn't improve for "
+                    f"{args.early_stop_patience} epochs. Training stops."
+                )
+                break
 
     if epoch == args.epochs - 1:
         print(f"\n{args.epochs} epochs training finished.")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,7 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "datapath": ("--datapath",),
     "yield_csv": ("--yield-csv",),
     "seed": ("--seed",),
+    "pretrained": ("--pretrained",),
     "schedule": ("--schedule",),
     "pixel_chunk_size": ("--pixel-chunk-size",),
     "prefetch_chunks": ("--prefetch-chunks",),
@@ -126,6 +128,17 @@ def predict_run_dir(params: dict, *, logdir: str | Path = "./results") -> Path:
     )
 
 
+def apply_resume_params(
+    params: dict,
+    resume_checkpoint: Path | str,
+) -> dict:
+    """Return a copy of trial params configured to continue an interrupted run."""
+    out = dict(params)
+    out["pretrained"] = str(Path(resume_checkpoint).resolve())
+    out["overwrite_run"] = False
+    return out
+
+
 def run_trial_subprocess(
     params: dict,
     *,
@@ -133,6 +146,7 @@ def run_trial_subprocess(
     repo_root: Path | None = None,
     dry_run: bool = False,
     capture_log: Path | None = None,
+    append_log: bool = False,
 ) -> dict[str, Any]:
     """
     Run one training trial. Returns outcome dict (includes subprocess returncode).
@@ -157,7 +171,13 @@ def run_trial_subprocess(
     stdout_path = capture_log
     if stdout_path is not None:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stdout_path, "w", encoding="utf-8") as log_f:
+        log_mode = "a" if append_log and stdout_path.is_file() else "w"
+        with open(stdout_path, log_mode, encoding="utf-8") as log_f:
+            if log_mode == "a":
+                log_f.write(
+                    f"\n\n=== resumed {datetime.now(timezone.utc).isoformat()} ===\n\n"
+                )
+                log_f.flush()
             proc = subprocess.run(
                 argv,
                 cwd=str(repo_root),
