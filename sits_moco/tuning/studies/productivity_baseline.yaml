@@ -40,7 +40,7 @@ base:
   quiet_training: true
   pixel_chunk_size: 16000
   prefetch_chunks: 16
-  chunks_per_grad: 2
+  chunks_per_grad: 1
   zero_grad_set_to_none: true
   skip_batch_empty_cache: true
   dataloader_persistent_workers: true

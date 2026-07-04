@@ -4,10 +4,10 @@ Training runtime options for I/O, H2D, and VRAM behavior.
 Production defaults (Jun 2026, ~454k px/s on RTX 5090 / WSL, batchsize 32 benchmark):
   cross-muni pixel pipeline + mmap lookahead, prefetch_chunks=4, workers=4,
   skip_batch_empty_cache, zero_grad(set_to_none=True), persistent_workers,
-  dataloader_prefetch_factor=4, pixel_chunk_size=16000, chunks_per_grad=1, TF32.
+  dataloader_prefetch_factor=4, TF32. pixel_chunk_size/chunks_per_grad defaults are CLI-only.
 
 Use --batch-empty-cache / --legacy-zero-grad to restore pre-optimization behavior.
-Rejected: chunks_per_grad>1 on WSL, h2d_pin_host, compile reduce-overhead, 24k/32k chunks.
+Rejected on WSL in benchmarks (not forced): chunks_per_grad>1, h2d_pin_host, compile reduce-overhead, 24k/32k chunks.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ DEFAULTS: dict[str, Any] = {
     "batch_empty_cache": False,
     "legacy_zero_grad": False,
     "prefetch_chunks": 4,
-    "chunks_per_grad": 1,
 }
 
 _CUDAGRAPH_MARK = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)

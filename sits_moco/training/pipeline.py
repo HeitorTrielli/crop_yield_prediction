@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-import sys
-import warnings
-
 import torch
 
 from datasets.pixel_chunk import iter_batch_municipality_chunks
 
-MAX_PIXEL_BATCH_SIZE = 40000
-CHUNKS_PER_GRAD_UPDATE = 1
-
 
 def pixel_chunk_size(args) -> int:
-    return getattr(args, "pixel_chunk_size", None) or MAX_PIXEL_BATCH_SIZE
+    return int(args.pixel_chunk_size)
 
 
 def prefetch_depth(args) -> int:
@@ -31,26 +25,22 @@ def pipeline_h2d(args, device: torch.device) -> bool:
     return chunk_debug_syncs(args) is False
 
 
-def _is_wsl() -> bool:
-    if sys.platform != "linux":
-        return False
-    try:
-        with open("/proc/version", encoding="utf-8") as f:
-            return "microsoft" in f.read().lower()
-    except OSError:
-        return False
-
-
 def effective_chunks_per_grad(args) -> int:
-    """Always 1 in production; clamp >1 on WSL to avoid shared GPU memory spill."""
-    requested = max(1, int(getattr(args, "chunks_per_grad", CHUNKS_PER_GRAD_UPDATE)))
-    if requested > 1 and _is_wsl():
-        warnings.warn(
-            f"chunks_per_grad={requested} disabled on WSL (use 1 to avoid shared GPU memory spill)",
-            stacklevel=2,
-        )
-        return 1
-    return requested
+    return max(1, int(args.chunks_per_grad))
+
+
+def describe_chunk_pipeline(args, device: torch.device) -> str:
+    """Human-readable summary of resolved pixel-chunk settings used in training."""
+    chunk_px = pixel_chunk_size(args)
+    chunks_per_grad = effective_chunks_per_grad(args)
+    return (
+        "Chunk pipeline (active): "
+        f"pixel_chunk_size={chunk_px}, "
+        f"chunks_per_grad={chunks_per_grad}, "
+        f"prefetch_chunks={prefetch_depth(args)}, "
+        f"pipeline_h2d={pipeline_h2d(args, device)}, "
+        f"max_pixels_per_backward={chunk_px * chunks_per_grad}"
+    )
 
 
 def scan_skip_municipalities(

@@ -26,6 +26,7 @@ base:
   early_stop_patience: 15
   pixel_chunk_size: 16000
   prefetch_chunks: 2
+  chunks_per_grad: 1
   quiet_training: true
 
 search:

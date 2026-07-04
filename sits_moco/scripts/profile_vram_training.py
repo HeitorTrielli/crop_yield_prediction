@@ -64,10 +64,8 @@ from profile_vram_utils import (  # noqa: E402
     read_vram,
     summarize_trace,
 )
-from utils_aggregated import (  # noqa: E402
-    CHUNKS_PER_GRAD_UPDATE,
-    MunicipalityPixelAccumulator,
-)
+from training.pipeline import effective_chunks_per_grad  # noqa: E402
+from utils_aggregated import MunicipalityPixelAccumulator  # noqa: E402
 
 
 def _require_cuda() -> torch.device:
@@ -85,6 +83,7 @@ def _build_minimal_args(ns: argparse.Namespace) -> argparse.Namespace:
         ns.datapath = str(resolve_datapath(ns.datapath))
     defaults = {
         "pixel_chunk_size": ns.chunk_size,
+        "chunks_per_grad": 1,
         "prefetch_chunks": ns.prefetch_chunks,
         "quiet_training": ns.quiet_training,
         "disable_pipeline_h2d": ns.disable_pipeline_h2d,
@@ -216,7 +215,7 @@ def run_chunk_training_steps(
     use_pipeline_h2d, chunk_size, prefetch_depth = _chunk_loop_settings(args)
     aggregation = "sum"
     pixel_acc = MunicipalityPixelAccumulator(aggregation)
-    chunks_per_grad = CHUNKS_PER_GRAD_UPDATE
+    chunks_per_grad = effective_chunks_per_grad(args)
     import numpy as np
 
     target = torch.tensor([1000.0], device=device)
