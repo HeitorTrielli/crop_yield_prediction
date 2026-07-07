@@ -98,10 +98,15 @@ def best_epoch_metrics(
             cfg = json.load(f)
         sessions = cfg.get("sessions") or []
         if sessions:
+            computed = (sessions[-1].get("computed") or {})
             result["training_config"] = {
-                "model_kwargs": (sessions[-1].get("computed") or {}).get("model_kwargs"),
+                "model_kwargs": computed.get("model_kwargs"),
                 "cli": sessions[-1].get("cli"),
+                "chunk_pipeline": computed.get("chunk_pipeline"),
             }
+            chunk_pipeline = computed.get("chunk_pipeline") or {}
+            if chunk_pipeline:
+                result["chunk_pipeline"] = chunk_pipeline
 
     return result
 
@@ -152,5 +157,29 @@ def trial_row(
         row["error"] = outcome["error"]
     if outcome.get("returncode") is not None:
         row["returncode"] = outcome["returncode"]
+
+    chunk_pipeline = outcome.get("chunk_pipeline") or {}
+    if chunk_pipeline:
+        row["chunks_per_grad_requested"] = chunk_pipeline.get(
+            "chunks_per_grad_requested"
+        )
+        row["resolved_chunks_per_grad"] = chunk_pipeline.get(
+            "chunks_per_grad_effective"
+        )
+        row["pixel_chunk_size_requested"] = chunk_pipeline.get(
+            "pixel_chunk_size_requested"
+        )
+        row["resolved_pixel_chunk_size"] = chunk_pipeline.get(
+            "pixel_chunk_size_effective"
+        )
+        row["max_pixels_per_backward_requested"] = chunk_pipeline.get(
+            "max_pixels_per_backward_requested"
+        )
+        row["resolved_max_pixels_per_backward"] = chunk_pipeline.get(
+            "max_pixels_per_backward_effective"
+        )
+        row["auto_chunks_per_grad_search_trials"] = len(
+            chunk_pipeline.get("search_trials") or []
+        )
 
     return row

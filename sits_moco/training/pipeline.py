@@ -26,20 +26,35 @@ def pipeline_h2d(args, device: torch.device) -> bool:
 
 
 def effective_chunks_per_grad(args) -> int:
-    return max(1, int(args.chunks_per_grad))
+    from training.vram_adjuster import effective_chunks_per_grad as _effective
+
+    return _effective(args)
 
 
 def describe_chunk_pipeline(args, device: torch.device) -> str:
     """Human-readable summary of resolved pixel-chunk settings used in training."""
     chunk_px = pixel_chunk_size(args)
     chunks_per_grad = effective_chunks_per_grad(args)
+    resolver = getattr(args, "_chunks_per_grad_resolver", None)
+    auto_suffix = ""
+    if resolver is not None and resolver.enabled:
+        from training.vram_adjuster import max_pixels_per_backward
+
+        auto_suffix = (
+            f", auto_chunk_pipeline(requested={resolver.requested}x"
+            f"{resolver.requested_pixel_chunk}, "
+            f"resolved={chunks_per_grad}x{chunk_px}, "
+            f"max_px/back={max_pixels_per_backward(chunks_per_grad, chunk_px):,}, "
+            f"target={resolver.vram_target_frac:.0%})"
+        )
     return (
         "Chunk pipeline (active): "
         f"pixel_chunk_size={chunk_px}, "
-        f"chunks_per_grad={chunks_per_grad}, "
+        f"chunks_per_grad={chunks_per_grad}{auto_suffix}, "
         f"prefetch_chunks={prefetch_depth(args)}, "
         f"pipeline_h2d={pipeline_h2d(args, device)}, "
-        f"max_pixels_per_backward={chunk_px * chunks_per_grad}"
+        f"max_pixels_per_backward={chunk_px * chunks_per_grad}, "
+        f"batch_vram_cleanup={'after each dataloader batch' if chunks_per_grad > 1 else 'default'}"
     )
 
 

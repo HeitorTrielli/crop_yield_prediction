@@ -68,6 +68,19 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "pixel_chunk_size": ("--pixel-chunk-size",),
     "prefetch_chunks": ("--prefetch-chunks",),
     "chunks_per_grad": ("--chunks-per-grad",),
+    "auto_chunks_per_grad_min": ("--auto-chunks-per-grad-min",),
+    "auto_pixel_chunk_size_min": ("--auto-pixel-chunk-size-min",),
+    "auto_pixel_chunk_size_step": ("--auto-pixel-chunk-size-step",),
+    "auto_chunks_per_grad_vram_frac": ("--auto-chunks-per-grad-vram-frac",),
+    "auto_chunks_per_grad_vram_target_frac": (
+        "--auto-chunks-per-grad-vram-target-frac",
+    ),
+    "auto_chunks_per_grad_narrow_threshold": (
+        "--auto-chunks-per-grad-narrow-threshold",
+    ),
+    "auto_chunks_per_grad_refine_radius": (
+        "--auto-chunks-per-grad-refine-radius",
+    ),
 }
 
 

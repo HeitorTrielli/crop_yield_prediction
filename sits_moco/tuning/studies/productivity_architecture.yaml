@@ -30,9 +30,9 @@ base:
   logdir: ./results
   seed: 27
   epochs: 100
-  workers: 30
+  workers: 22
   sequencelength: 45
-  batchsize: 67
+  batchsize: 74
   learning_rate: 1.0e-3
   weight_decay: 5.0e-4
   sample_ratio: 1.0
@@ -42,9 +42,15 @@ base:
   no_compile: true
   overwrite_run: true
   early_stop_patience: 15
-  pixel_chunk_size: 8000
+  pixel_chunk_size: 7000
   prefetch_chunks: 30
-  chunks_per_grad: 24
+  chunks_per_grad: 25
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
   quiet_training: true
   # Seed27 default was n_layers=1, d_model=128, d_inner=128, n_head=16, dropout=0.2
   model_n_layers: 1

@@ -350,6 +350,75 @@ def parse_args():
         default=1,
         help="Backward every N pixel chunks (default: 1; >1 retains autograd graphs longer)",
     )
+    parser.add_argument(
+        "--auto-chunks-per-grad",
+        action="store_true",
+        help=(
+            "At startup, search the largest chunks-per-grad x pixel-chunk-size that "
+            "fits dedicated VRAM (binary search + local refine), then train all "
+            "epochs with that value"
+        ),
+    )
+    parser.add_argument(
+        "--auto-chunks-per-grad-min",
+        type=int,
+        default=1,
+        help="Minimum chunks-per-grad when --auto-chunks-per-grad is enabled (default: 1)",
+    )
+    parser.add_argument(
+        "--auto-chunks-per-grad-vram-frac",
+        type=float,
+        default=0.95,
+        help=(
+            "Hard dedicated VRAM cap during the probe; reject immediately when exceeded "
+            "(default: 0.95)"
+        ),
+    )
+    parser.add_argument(
+        "--auto-chunks-per-grad-vram-target-frac",
+        type=float,
+        default=0.90,
+        help=(
+            "Target dedicated VRAM for the startup probe; search accepts settings at "
+            "or below this fraction (default: 0.90)"
+        ),
+    )
+    parser.add_argument(
+        "--auto-pixel-chunk-size-min",
+        type=int,
+        default=None,
+        help=(
+            "Minimum pixel_chunk_size when auto-tuning the chunk pipeline "
+            "(default: max(1000, requested pixel_chunk_size // 2))"
+        ),
+    )
+    parser.add_argument(
+        "--auto-pixel-chunk-size-step",
+        type=int,
+        default=100,
+        help=(
+            "Step size for pixel_chunk_size during auto chunk pipeline search "
+            "(default: 100)"
+        ),
+    )
+    parser.add_argument(
+        "--auto-chunks-per-grad-narrow-threshold",
+        type=int,
+        default=32,
+        help=(
+            "When the binary search window has this many candidates or fewer, "
+            "probe all of them (default: 32)"
+        ),
+    )
+    parser.add_argument(
+        "--auto-chunks-per-grad-refine-radius",
+        type=int,
+        default=24,
+        help=(
+            "After binary search, probe up to this many candidates on each side "
+            "of the best fit (default: 24)"
+        ),
+    )
     args = parser.parse_args()
 
     from training_runtime import DEFAULTS
@@ -1052,6 +1121,55 @@ def train(args):
             "not_improved_count_reset": not_improved_count_reset,
         }
 
+    def _make_optimizer():
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+
+    if args.auto_chunks_per_grad and args.pretrained is not None:
+        print(
+            "Skipping auto chunks_per_grad probe (pretrained/resume run); "
+            f"using chunks_per_grad={args.chunks_per_grad}"
+        )
+    elif args.auto_chunks_per_grad:
+        from training.vram_adjuster import resolve_chunks_per_grad_before_training
+
+        optimizer = resolve_chunks_per_grad_before_training(
+            args=args,
+            device=device,
+            model=model,
+            optimizer=optimizer,
+            criterion=criterion,
+            traindataloader=traindataloader,
+            target_mean=target_mean,
+            target_std=target_std,
+            make_optimizer=_make_optimizer,
+        )
+
+    chunk_pipeline_config = None
+    resolver = getattr(args, "_chunks_per_grad_resolver", None)
+    if resolver is not None and resolver.enabled:
+        chunk_pipeline_config = resolver.to_config_dict()
+    else:
+        chunk_pipeline_config = {
+            "auto_chunks_per_grad": bool(args.auto_chunks_per_grad),
+            "chunks_per_grad_requested": int(args.chunks_per_grad),
+            "chunks_per_grad_effective": int(args.chunks_per_grad),
+            "pixel_chunk_size_requested": int(args.pixel_chunk_size),
+            "pixel_chunk_size_effective": int(args.pixel_chunk_size),
+            "max_pixels_per_backward_requested": max(
+                1, int(args.chunks_per_grad)
+            )
+            * max(1, int(args.pixel_chunk_size)),
+            "max_pixels_per_backward_effective": max(
+                1, int(args.chunks_per_grad)
+            )
+            * max(1, int(args.pixel_chunk_size)),
+            "search_trials": [],
+        }
+
     imagery_years_available = find_available_years(args.datapath)
     append_training_config_session(
         training_dir_path,
@@ -1080,6 +1198,7 @@ def train(args):
             "split_design": split_design,
             "model_kwargs": model_kwargs_from_args(args),
             "early_stop_patience": int(args.early_stop_patience),
+            "chunk_pipeline": chunk_pipeline_config,
             "epoch_plan": {
                 "start_epoch": int(start_epoch),
                 "end_epoch_exclusive": int(args.epochs),

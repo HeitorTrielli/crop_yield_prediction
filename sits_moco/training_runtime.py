@@ -123,8 +123,24 @@ def _vram_collect_and_empty(device: torch.device) -> None:
 
 
 def batch_vram_cleanup(device: torch.device, args) -> None:
+    """
+    Release GPU memory after one dataloader batch (all municipalities in the batch).
+
+    Not called per backward — only at batch boundaries in train_epoch_aggregated.
+    When chunks_per_grad > 1, always sync + empty_cache so autograd/H2D bookkeeping
+    from multi-chunk backward groups does not inflate reserved VRAM across batches.
+    """
     if device.type != "cuda" or not torch.cuda.is_available():
         return
+
+    from training.vram_adjuster import effective_chunks_per_grad
+
+    chunks_per_grad = effective_chunks_per_grad(args)
+    if chunks_per_grad > 1:
+        torch.cuda.current_stream(device).synchronize()
+        _vram_collect_and_empty(device)
+        return
+
     if _flag(args, "batch_empty_cache"):
         _vram_collect_and_empty(device)
         return

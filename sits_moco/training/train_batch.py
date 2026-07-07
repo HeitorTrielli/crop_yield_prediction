@@ -36,11 +36,16 @@ def process_train_batch(
     chunk_size: int,
     batch_idx: int,
     run_stats: dict | None = None,
-) -> tuple[float, bool]:
+    max_municipalities: int | None = None,
+    vram_probe_state: dict | None = None,
+) -> tuple[float, bool, int]:
     """
     Process municipalities in one optimizer batch.
 
-    Returns ``(total_loss, batch_has_gradients)``.
+    Returns ``(total_loss, batch_has_gradients, municipalities_completed)``.
+
+    When ``vram_probe_state`` is set, checks dedicated VRAM after each chunk and
+    stops as soon as the budget is exceeded or ``min_chunks`` have been processed.
     """
     from torch.amp import autocast
 
@@ -66,6 +71,32 @@ def process_train_batch(
     pixel_acc = None
     year = None
     muni_break = False
+    municipalities_completed = 0
+    stop_after_municipalities = False
+    stop_vram_probe = False
+
+    def _check_vram_probe() -> None:
+        nonlocal stop_vram_probe
+        if vram_probe_state is None or device.type != "cuda":
+            return
+        from training.vram_adjuster import _pressure_peak, read_vram_pressure
+
+        vram_probe_state["chunks"] = int(vram_probe_state.get("chunks", 0)) + 1
+        pressure = read_vram_pressure(device)
+        vram_probe_state["last_pressure"] = pressure
+        peak = vram_probe_state.get("peak_pressure")
+        if peak is None:
+            vram_probe_state["peak_pressure"] = dict(pressure)
+        else:
+            vram_probe_state["peak_pressure"] = _pressure_peak(peak, pressure)
+        if pressure["driver_used_frac"] > float(vram_probe_state["vram_frac"]):
+            vram_probe_state["over_limit"] = True
+            stop_vram_probe = True
+            return
+        min_chunks = int(vram_probe_state.get("min_chunks", 1))
+        if vram_probe_state["chunks"] >= min_chunks:
+            vram_probe_state["complete"] = True
+            stop_vram_probe = True
 
     def _finalize_muni() -> None:
         nonlocal total_loss
@@ -112,13 +143,14 @@ def process_train_batch(
                     target_denorm = target_normalized.item()
                     pred_denorm = municipality_agg_normalized.item()
                 total_loss += final_loss.item()
-                fmt = ".2f" if aggregation == "mean" else ".0f"
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                _log_training(
-                    f"[{timestamp}] Muni {municipality_code}: "
-                    f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
-                    f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
-                )
+                if vram_probe_state is None:
+                    fmt = ".2f" if aggregation == "mean" else ".0f"
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    _log_training(
+                        f"[{timestamp}] Muni {municipality_code}: "
+                        f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
+                        f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
+                    )
 
     def _begin_muni(muni_idx: int) -> None:
         nonlocal current_muni, municipality_code, target, num_pixels, total_chunks
@@ -145,6 +177,9 @@ def process_train_batch(
     )
 
     for stream_muni_idx, chunk_item in chunk_stream:
+        if stop_after_municipalities or stop_vram_probe:
+            break
+
         if stream_muni_idx != current_muni:
             if current_muni >= 0:
                 _finalize_muni()
@@ -296,14 +331,22 @@ def process_train_batch(
             del municipality_X_chunk, chunk_predictions
             if is_last_chunk:
                 muni_break = True
+                municipalities_completed += 1
+                if (
+                    max_municipalities is not None
+                    and municipalities_completed >= max_municipalities
+                ):
+                    stop_after_municipalities = True
+            _check_vram_probe()
             continue
 
         del municipality_X_chunk, chunk_predictions
+        _check_vram_probe()
 
-    if current_muni >= 0:
+    if current_muni >= 0 and not stop_vram_probe:
         _finalize_muni()
 
-    if batch_has_gradients:
+    if batch_has_gradients and vram_probe_state is None:
         has_nan_grad = any(
             p.grad is not None and torch.isnan(p.grad).any() for p in model.parameters()
         )
@@ -318,10 +361,11 @@ def process_train_batch(
             zero_grad(optimizer, args)
             if run_stats is not None:
                 run_stats["optimizer_steps"] = run_stats.get("optimizer_steps", 0) + 1
-    else:
+    elif not batch_has_gradients:
         zero_grad(optimizer, args)
-        print(
-            f"  ⚠️  DEBUG: Skipping optimizer step for batch {batch_idx} - no valid gradients accumulated"
-        )
+        if vram_probe_state is None:
+            print(
+                f"  ⚠️  DEBUG: Skipping optimizer step for batch {batch_idx} - no valid gradients accumulated"
+            )
 
-    return total_loss, batch_has_gradients
+    return total_loss, batch_has_gradients, municipalities_completed

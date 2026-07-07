@@ -35,6 +35,7 @@ BOOL_PARAMS = frozenset(
         "dataloader_persistent_workers",
         "h2d_pin_host",
         "no_dataloader_pin_memory",
+        "auto_chunks_per_grad",
     }
 )
 
@@ -56,6 +57,11 @@ INT_PARAMS = frozenset(
         "dataloader_prefetch_factor",
         "npy_cache_size",
         "chunks_per_grad",
+        "auto_chunks_per_grad_min",
+        "auto_pixel_chunk_size_min",
+        "auto_pixel_chunk_size_step",
+        "auto_chunks_per_grad_narrow_threshold",
+        "auto_chunks_per_grad_refine_radius",
     }
 )
 
@@ -65,6 +71,8 @@ FLOAT_PARAMS = frozenset(
         "weight_decay",
         "sample_ratio",
         "model_dropout",
+        "auto_chunks_per_grad_vram_frac",
+        "auto_chunks_per_grad_vram_target_frac",
     }
 )
 

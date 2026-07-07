@@ -373,7 +373,7 @@ def train_epoch_aggregated(
         zero_grad(optimizer, args)
         _log_training(f"── batch {idx + 1}/{batch_total} ({num_municipalities} muni) ──")
 
-        total_loss, batch_has_gradients = process_train_batch(
+        total_loss, batch_has_gradients, _ = process_train_batch(
             model=model,
             optimizer=optimizer,
             scaler=scaler,
@@ -436,6 +436,76 @@ def train_epoch_aggregated(
         _batch_vram_cleanup(device, args)
 
     return losses.avg
+
+
+def run_training_vram_probe(
+    *,
+    model,
+    optimizer,
+    criterion,
+    dataloader,
+    device,
+    args,
+    target_mean=None,
+    target_std=None,
+    vram_frac: float,
+    probe_min_chunks: int,
+) -> dict:
+    """
+    Process pixel chunks until dedicated VRAM peak is measured under budget.
+
+    Runs long enough to simulate mid-batch training (two backward groups plus
+    prefetch/H2D warmup). Tracks peak dedicated VRAM across chunks; skips the
+    optimizer step so gradients accumulate like a real dataloader batch.
+    """
+    from torch.amp import GradScaler
+
+    from training.train_batch import process_train_batch
+    from training_runtime import zero_grad
+
+    model.train()
+    aggregation = getattr(criterion, "aggregation", "sum")
+    scaler = GradScaler("cuda")
+    chunk_size = _pixel_chunk_size(args)
+    state = {
+        "vram_frac": float(vram_frac),
+        "min_chunks": max(1, int(probe_min_chunks)),
+        "chunks": 0,
+        "over_limit": False,
+        "complete": False,
+        "last_pressure": None,
+        "peak_pressure": None,
+    }
+
+    for batch_idx, (municipalities, targets, num_pixels_list, years) in enumerate(
+        dataloader
+    ):
+        if state["over_limit"] or state["complete"]:
+            break
+
+        zero_grad(optimizer, args)
+        process_train_batch(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            dataset=dataloader.dataset,
+            municipalities=municipalities,
+            targets=targets,
+            num_pixels_list=num_pixels_list,
+            years=years,
+            device=device,
+            args=args,
+            aggregation=aggregation,
+            target_mean=target_mean,
+            target_std=target_std,
+            chunk_size=chunk_size,
+            batch_idx=batch_idx,
+            vram_probe_state=state,
+        )
+        if state["over_limit"] or state["complete"]:
+            break
+
+    return state
 
 
 def test_epoch_aggregated(
