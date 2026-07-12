@@ -63,7 +63,8 @@ class STNetRegression(nn.Module):
             encoder_layer, n_layers, encoder_norm
         )
 
-        # Regression decoder: outputs num_outputs continuous values
+        # Regression decoder: LayerNorm (not BatchNorm) so train/eval use the
+        # same normalization under pixel-chunked, variable-size batches.
         layers = []
         decoder = [d_model, 64, 32, num_outputs]
         for i in range(len(decoder) - 1):
@@ -71,7 +72,7 @@ class STNetRegression(nn.Module):
             if i < (len(decoder) - 2):
                 layers.extend(
                     [
-                        nn.BatchNorm1d(decoder[i + 1]),
+                        nn.LayerNorm(decoder[i + 1]),
                         nn.ReLU(),
                         nn.Dropout(dropout),
                     ]
