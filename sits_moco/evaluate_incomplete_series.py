@@ -37,8 +37,8 @@ from run_paths import (
 from utils_aggregated import (
     aggregation_for_target_column,
     regression_metrics,
-    resolve_inference_target,
     resolve_inference_chunk_size,
+    resolve_inference_target,
     resolve_model_kwargs,
     resolve_pixel_chunk_size,
     stnet_regression_input_dim_from_state_dict,
@@ -159,7 +159,9 @@ def parse_args():
     return args, run_config
 
 
-def inference_args_from_run_config(run_config: dict, *, quiet: bool = True) -> SimpleNamespace:
+def inference_args_from_run_config(
+    run_config: dict, *, quiet: bool = True
+) -> SimpleNamespace:
     """Minimal args namespace for training's chunk prefetch / H2D pipeline."""
     cli = run_config.get("cli") or {}
     return SimpleNamespace(
@@ -219,7 +221,9 @@ def predict_municipality_with_periods(
     """Predict one municipality-year (wrapper around batched inference)."""
     if args is None:
         if run_config is None:
-            raise ValueError("predict_municipality_with_periods needs args or run_config")
+            raise ValueError(
+                "predict_municipality_with_periods needs args or run_config"
+            )
         args = inference_args_from_run_config(run_config)
     if year is None:
         if getattr(dataset, "use_multi_year", False):

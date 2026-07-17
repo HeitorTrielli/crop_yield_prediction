@@ -40,10 +40,7 @@ from datasets import (
     USCropsAggregatedNPY,
     filter_yield_pandas_by_coverage,
 )
-from datasets.feature_layout import (
-    feature_layout_input_dim,
-    normalize_feature_layout,
-)
+from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
 from evaluate_incomplete_series import (
     batched_predict_with_periods,
     inference_args_from_run_config,
@@ -64,8 +61,8 @@ from run_paths import (
 )
 from utils_aggregated import (
     regression_metrics,
-    resolve_inference_target,
     resolve_inference_chunk_size,
+    resolve_inference_target,
     resolve_model_kwargs,
     resolve_pixel_chunk_size,
     stnet_regression_input_dim_from_state_dict,
@@ -236,7 +233,9 @@ def resolve_harvest_years(
         return sorted(int(y) for y in harvest_years)
 
     computed = ctx.run_config.get("computed") or {}
-    from_config = computed.get("harvest_years_set") or computed.get("harvest_years_filter")
+    from_config = computed.get("harvest_years_set") or computed.get(
+        "harvest_years_filter"
+    )
     if from_config:
         return sorted(int(y) for y in from_config)
 
@@ -448,9 +447,7 @@ def run_incomplete_series_evaluation(
         if failed_entries:
             print(f"  Failed entries: {len(failed_entries)}")
 
-        out_dir = (
-            pred_dir if num_periods == 6 else incomplete_root / f"k{num_periods}"
-        )
+        out_dir = pred_dir if num_periods == 6 else incomplete_root / f"k{num_periods}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for harvest_year in harvest_years:
@@ -482,7 +479,9 @@ def run_guarapuava_heatmaps(
 ) -> dict[str, Path]:
     """Full-series and k=1..6 yield heatmaps for one municipality and harvest year."""
     year_range = harvest_to_year_range(holdout_year)
-    season_datapath = datapath / year_range if (datapath / year_range).is_dir() else datapath
+    season_datapath = (
+        datapath / year_range if (datapath / year_range).is_dir() else datapath
+    )
     reference_date = season_start_from_year_range(year_range)
 
     if figures_dir is None:
@@ -554,9 +553,7 @@ def run_guarapuava_heatmaps(
             if ok:
                 from municipality_labels import municipality_output_stem
 
-                stem = municipality_output_stem(
-                    municipality_code, tiff_root=tiffpath
-                )
+                stem = municipality_output_stem(municipality_code, tiff_root=tiffpath)
                 saved["full_heatmap"] = full_dir / f"{stem}_heatmap.png"
                 saved["full_ndvi"] = full_dir / f"{stem}_ndvi_heatmap.png"
         else:
@@ -581,10 +578,10 @@ def run_guarapuava_heatmaps(
             if ok:
                 from municipality_labels import municipality_output_stem
 
-                stem = municipality_output_stem(
-                    municipality_code, tiff_root=tiffpath
+                stem = municipality_output_stem(municipality_code, tiff_root=tiffpath)
+                saved[f"k{num_periods}"] = (
+                    incomplete_dir / f"{stem}_heatmap{suffix}.png"
                 )
-                saved[f"k{num_periods}"] = incomplete_dir / f"{stem}_heatmap{suffix}.png"
 
     return saved
 
