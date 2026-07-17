@@ -13,4 +13,14 @@ def __getattr__(name: str):
         from .uscrops_aggregated_npy_polars import USCropsAggregatedNPY
 
         return USCropsAggregatedNPY
+    if name in {
+        "DEFAULT_MIN_COVERAGE_RATIO",
+        "DEFAULT_MAX_COVERAGE_RATIO",
+        "COVERAGE_RATIO_COL",
+        "filter_yield_df_by_coverage",
+        "filter_yield_pandas_by_coverage",
+    }:
+        from . import uscrops_aggregated_npy_polars as _agg
+
+        return getattr(_agg, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -168,6 +168,73 @@ def aggregation_for_target_column(target_column: str) -> str:
     )
 
 
+_MODEL_KWARG_FIELDS = (
+    ("model_d_model", "d_model", int),
+    ("model_n_head", "n_head", int),
+    ("model_n_layers", "n_layers", int),
+    ("model_d_inner", "d_inner", int),
+    ("model_dropout", "dropout", float),
+)
+
+
+def resolve_model_kwargs(
+    run_config: dict | None = None,
+    checkpoint: dict | None = None,
+) -> dict:
+    """
+    Return STNetRegression constructor kwargs from training config.
+
+    Precedence: computed.model_kwargs > cli model_* fields > {} (class defaults).
+    """
+    _ = checkpoint  # reserved for future checkpoint-side metadata
+    computed = (run_config or {}).get("computed") or {}
+    cli = (run_config or {}).get("cli") or {}
+
+    mk = computed.get("model_kwargs")
+    if mk:
+        return {
+            "d_model": int(mk["d_model"]),
+            "n_head": int(mk["n_head"]),
+            "n_layers": int(mk["n_layers"]),
+            "d_inner": int(mk["d_inner"]),
+            "dropout": float(mk["dropout"]),
+        }
+
+    kwargs: dict = {}
+    for cli_key, ctor_key, caster in _MODEL_KWARG_FIELDS:
+        if cli_key in cli and cli[cli_key] is not None:
+            kwargs[ctor_key] = caster(cli[cli_key])
+    return kwargs
+
+
+def resolve_inference_chunk_size(
+    run_config: dict | None = None,
+    chunk_size: int | None = None,
+) -> int:
+    """
+    Chunk size for forward-only inference.
+
+    Training VRAM is shaped by ``pixel_chunk_size * chunks_per_grad``; without
+    gradients we can use that full width (or any larger ``--chunk-size``).
+    """
+    if chunk_size is not None:
+        return int(chunk_size)
+    cli = (run_config or {}).get("cli") or {}
+    px = cli.get("pixel_chunk_size")
+    if px is not None:
+        cpg = max(int(cli.get("chunks_per_grad") or 1), 1)
+        return int(px) * cpg
+    return 400
+
+
+def resolve_pixel_chunk_size(
+    run_config: dict | None = None,
+    chunk_size: int | None = None,
+) -> int:
+    """Alias for :func:`resolve_inference_chunk_size`."""
+    return resolve_inference_chunk_size(run_config, chunk_size)
+
+
 def aggregate_pixels(predictions: torch.Tensor, aggregation: str) -> torch.Tensor:
     if aggregation == "sum":
         return predictions.sum(dim=0)

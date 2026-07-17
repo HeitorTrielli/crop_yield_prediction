@@ -7,6 +7,7 @@ Loads the model once and produces:
   2. Guarapuava intramunicipal heatmaps (full series + k=1..6) for the holdout year.
   3. Talhão-level evaluation CSVs for each harvest year.
   4. Paraná municipal error choropleth for the holdout year.
+  5. Predicted vs IBGE productivity scatter plots (per harvest year).
 
 Example::
 
@@ -26,7 +27,6 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
 
 from create_pixel_heatmap import (
     reconstruct_spatial_predictions,
@@ -34,14 +34,24 @@ from create_pixel_heatmap import (
     save_yield_heatmap_only,
     season_start_from_year_range,
 )
-from datasets import USCropsAggregatedNPY
+from datasets import (
+    DEFAULT_MAX_COVERAGE_RATIO,
+    DEFAULT_MIN_COVERAGE_RATIO,
+    USCropsAggregatedNPY,
+    filter_yield_pandas_by_coverage,
+)
 from datasets.feature_layout import (
     feature_layout_input_dim,
     normalize_feature_layout,
 )
-from evaluate_incomplete_series import predict_municipality_with_periods
+from evaluate_incomplete_series import (
+    batched_predict_with_periods,
+    inference_args_from_run_config,
+    inference_batch_size_from_run_config,
+)
 from models import STNetRegression
 from plot_municipal_yield_map import plot_choropleth_column
+from plot_productivity_scatter import run_productivity_scatter_for_forecasts
 from predict_yield_talhoes import run_talhao_predictions
 from run_paths import (
     apply_run_config_to_args,
@@ -55,6 +65,9 @@ from run_paths import (
 from utils_aggregated import (
     regression_metrics,
     resolve_inference_target,
+    resolve_inference_chunk_size,
+    resolve_model_kwargs,
+    resolve_pixel_chunk_size,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -85,6 +98,7 @@ class ModelContext:
     seed: int
     rc: bool
     interp: bool
+    target: str
     target_column: str
     aggregation: str
     target_unit: str
@@ -100,6 +114,7 @@ class GenerateResultsOutput:
     guarapuava_heatmaps: dict[str, Path] = field(default_factory=dict)
     talhao_forecasts: dict[int, Path] = field(default_factory=dict)
     municipal_error_map: Path | None = None
+    productivity_scatter_plots: dict[int, dict[str, Path]] = field(default_factory=dict)
 
 
 def load_model_context(
@@ -111,7 +126,7 @@ def load_model_context(
     seed: int | None = None,
     feature_layout: str | None = None,
     device: str | None = None,
-    chunk_size: int = 400,
+    chunk_size: int | None = None,
     reference_date: date | str | None = None,
     rc: bool | None = None,
     interp: bool | None = None,
@@ -148,6 +163,8 @@ def load_model_context(
     if interp is None:
         interp = bool(args.interp)
 
+    chunk_size = resolve_inference_chunk_size(run_config, chunk_size)
+
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -171,10 +188,12 @@ def load_model_context(
             f"Checkpoint feature_layout={ck_fl!r} does not match config {layout!r}."
         )
 
+    model_kw = resolve_model_kwargs(run_config, checkpoint_data)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
+        **model_kw,
     ).to(torch_device)
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
@@ -182,7 +201,7 @@ def load_model_context(
         model.load_state_dict(state_dict, strict=False)
     model.eval()
 
-    _, target_column, aggregation, target_unit = resolve_inference_target(
+    target, target_column, aggregation, target_unit = resolve_inference_target(
         run_config, checkpoint_data
     )
 
@@ -199,6 +218,7 @@ def load_model_context(
         seed=args.seed,
         rc=rc,
         interp=interp,
+        target=target,
         target_column=target_column,
         aggregation=aggregation,
         target_unit=target_unit,
@@ -228,8 +248,19 @@ def resolve_harvest_years(
     return sorted(ydf["year"].dropna().astype(int).unique().tolist())
 
 
-def _load_yield_lookup(yield_csv: Path, target_column: str) -> dict[tuple[str, int], float]:
+def _load_yield_lookup(
+    yield_csv: Path,
+    target_column: str,
+    *,
+    min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+) -> dict[tuple[str, int], float]:
     yield_df = pd.read_csv(yield_csv)
+    yield_df = filter_yield_pandas_by_coverage(
+        yield_df,
+        min_ratio=min_coverage_ratio,
+        max_ratio=max_coverage_ratio,
+    )
     muni_code_col = "municipality_code"
     year_col = "year"
     for col in (muni_code_col, year_col, target_column):
@@ -247,7 +278,15 @@ def _load_yield_lookup(yield_csv: Path, target_column: str) -> dict[tuple[str, i
     }
 
 
-def _build_dataset(ctx: ModelContext, datapath: Path, yield_csv: Path) -> USCropsAggregatedNPY:
+def _build_dataset(
+    ctx: ModelContext,
+    datapath: Path,
+    yield_csv: Path,
+    harvest_years: list[int] | None = None,
+    *,
+    min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+) -> USCropsAggregatedNPY:
     return USCropsAggregatedNPY(
         mode="all",
         root=datapath.resolve(),
@@ -259,6 +298,10 @@ def _build_dataset(ctx: ModelContext, datapath: Path, yield_csv: Path) -> USCrop
         seed=ctx.seed,
         feature_layout=ctx.feature_layout,
         target_column=ctx.target_column,
+        harvest_years=harvest_years,
+        npy_cache_size=128,
+        min_coverage_ratio=min_coverage_ratio,
+        max_coverage_ratio=max_coverage_ratio,
     )
 
 
@@ -301,6 +344,8 @@ def run_incomplete_series_evaluation(
     yield_csv: Path,
     harvest_years: list[int],
     pred_dir: Path | None = None,
+    min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
 ) -> tuple[Path, dict[int, Path], dict[int, dict[int, Path]]]:
     """
     Evaluate k=1..6 incomplete seasons.
@@ -314,12 +359,27 @@ def run_incomplete_series_evaluation(
     incomplete_root = pred_dir / "incomplete_series"
     summary_path = pred_dir / "incomplete_series_evaluation.csv"
 
-    dataset = _build_dataset(ctx, datapath, yield_csv)
+    dataset = _build_dataset(
+        ctx,
+        datapath,
+        yield_csv,
+        harvest_years=harvest_years,
+        min_coverage_ratio=min_coverage_ratio,
+        max_coverage_ratio=max_coverage_ratio,
+    )
     municipality_list = dataset.municipality_list
     if not municipality_list:
         raise RuntimeError("No municipalities found for incomplete-series evaluation")
 
-    yield_lookup = _load_yield_lookup(yield_csv, ctx.target_column)
+    yield_lookup = _load_yield_lookup(
+        yield_csv,
+        ctx.target_column,
+        min_coverage_ratio=min_coverage_ratio,
+        max_coverage_ratio=max_coverage_ratio,
+    )
+
+    inference_args = inference_args_from_run_config(ctx.run_config)
+    inference_batch_size = inference_batch_size_from_run_config(ctx.run_config)
 
     all_results: list[dict] = []
     yield_forecasts_by_year: dict[int, Path] = {}
@@ -332,28 +392,18 @@ def run_incomplete_series_evaluation(
         print(f"Incomplete series: {num_periods} season month(s)")
         print(f"{'=' * 60}")
 
-        predictions: dict[tuple[str, int], float] = {}
-        failed_entries: list = []
-
-        for entry in tqdm(
+        predictions, failed_entries = batched_predict_with_periods(
+            ctx.model,
             municipality_list,
+            dataset,
+            num_periods,
+            ctx.chunk_size,
+            ctx.device,
+            reference_date=ctx.reference_date,
+            args=inference_args,
+            batch_size=inference_batch_size,
             desc=f"Predicting (k={num_periods})",
-        ):
-            municipality_code, year = entry
-            prediction = predict_municipality_with_periods(
-                ctx.model,
-                municipality_code,
-                year,
-                dataset,
-                num_periods,
-                ctx.chunk_size,
-                ctx.device,
-                reference_date=ctx.reference_date,
-            )
-            if prediction is not None:
-                predictions[entry] = prediction
-            else:
-                failed_entries.append(entry)
+        )
 
         y_pred = []
         y_true = []
@@ -634,6 +684,38 @@ def _default_talhoes_path() -> Path:
     return gpkg if gpkg.is_file() else geojson
 
 
+def run_productivity_scatter_plots(
+    ctx: ModelContext,
+    *,
+    yield_forecasts_by_year: dict[int, Path],
+    yield_csv: Path,
+    dpi: int = 150,
+) -> dict[int, dict[str, Path]]:
+    """Predicted vs IBGE productivity scatter plots for each harvest year with forecasts."""
+    if not yield_forecasts_by_year:
+        return {}
+
+    print(f"\n{'=' * 60}")
+    print("Productivity scatter plots (predicted vs IBGE yield_t_ha)")
+    print(f"{'=' * 60}")
+
+    all_saved: dict[int, dict[str, Path]] = {}
+    for harvest_year in sorted(yield_forecasts_by_year):
+        forecasts_csv = Path(yield_forecasts_by_year[harvest_year])
+        if not forecasts_csv.is_file():
+            print(f"  Skipping {harvest_year}: missing {forecasts_csv}")
+            continue
+        print(f"\nHarvest {harvest_year}:")
+        all_saved[harvest_year] = run_productivity_scatter_for_forecasts(
+            forecasts_csv,
+            yield_csv=yield_csv,
+            target=ctx.target,
+            harvest_year=harvest_year,
+            dpi=dpi,
+        )
+    return all_saved
+
+
 def generate_results(
     checkpoint: Path | str,
     *,
@@ -649,7 +731,7 @@ def generate_results(
     seed: int | None = None,
     feature_layout: str | None = None,
     device: str | None = None,
-    chunk_size: int = 400,
+    chunk_size: int | None = None,
     reference_date: date | str | None = None,
     rc: bool | None = None,
     interp: bool | None = None,
@@ -657,8 +739,11 @@ def generate_results(
     skip_guarapuava: bool = False,
     skip_talhoes: bool = False,
     skip_municipal_map: bool = False,
+    skip_productivity_scatter: bool = False,
     map_dpi: int = 150,
     verbose: bool = True,
+    min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
 ) -> GenerateResultsOutput:
     """
     Load one checkpoint and produce all post-training result artifacts.
@@ -693,6 +778,7 @@ def generate_results(
         print(f"Run dir:    {ctx.run_dir}")
         print(f"Harvest years: {years}")
         print(f"Holdout year:  {holdout_year}")
+        print(f"Pixel chunk size: {ctx.chunk_size}")
 
     output = GenerateResultsOutput()
 
@@ -706,6 +792,8 @@ def generate_results(
             datapath=datapath_resolved,
             yield_csv=yield_csv_path,
             harvest_years=years,
+            min_coverage_ratio=min_coverage_ratio,
+            max_coverage_ratio=max_coverage_ratio,
         )
 
     holdout_csv = output.yield_forecasts_by_year.get(holdout_year)
@@ -747,6 +835,14 @@ def generate_results(
             dpi=map_dpi,
         )
 
+    if not skip_productivity_scatter and output.yield_forecasts_by_year:
+        output.productivity_scatter_plots = run_productivity_scatter_plots(
+            ctx,
+            yield_forecasts_by_year=output.yield_forecasts_by_year,
+            yield_csv=yield_csv_path,
+            dpi=map_dpi,
+        )
+
     if verbose:
         print("\n" + "=" * 60)
         print("RESULTS PIPELINE COMPLETE")
@@ -757,6 +853,9 @@ def generate_results(
             print(f"  Yield forecasts {year}: {path}")
         if output.municipal_error_map:
             print(f"  Municipal error map: {output.municipal_error_map}")
+        for year, variants in sorted(output.productivity_scatter_plots.items()):
+            for variant_key, path in sorted(variants.items()):
+                print(f"  Productivity scatter {year} ({variant_key}): {path}")
         for year, path in sorted(output.talhao_forecasts.items()):
             print(f"  Talhões {year}: {path}")
         if output.guarapuava_heatmaps:
@@ -791,7 +890,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--feature-layout", type=str, default=None)
     p.add_argument("-d", "--device", type=str, default=None)
-    p.add_argument("--chunk-size", type=int, default=400)
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Pixels per GPU forward pass (default: pixel_chunk_size * chunks_per_grad from training config)",
+    )
     p.add_argument("--reference-date", type=str, default=None)
     p.add_argument("--rc", action="store_true", default=None)
     p.add_argument("--interp", action="store_true", default=None)
@@ -800,11 +904,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-guarapuava", action="store_true")
     p.add_argument("--skip-talhoes", action="store_true")
     p.add_argument("--skip-municipal-map", action="store_true")
+    p.add_argument("--skip-productivity-scatter", action="store_true")
+    p.add_argument(
+        "--min-coverage-ratio",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE_RATIO,
+        help=(
+            "Keep rows with coverage_ratio >= this (default: no filter). "
+            "Example: --min-coverage-ratio 0.8 --max-coverage-ratio 1.2"
+        ),
+    )
+    p.add_argument(
+        "--max-coverage-ratio",
+        type=float,
+        default=DEFAULT_MAX_COVERAGE_RATIO,
+        help="Keep rows with coverage_ratio <= this (default: no filter)",
+    )
+    p.add_argument(
+        "--no-coverage-filter",
+        action="store_true",
+        help="Do not filter yield CSV rows by coverage_ratio (default behavior)",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    min_cov = None if args.no_coverage_filter else args.min_coverage_ratio
+    max_cov = None if args.no_coverage_filter else args.max_coverage_ratio
     generate_results(
         args.checkpoint,
         datapath=args.datapath,
@@ -827,7 +954,10 @@ def main() -> None:
         skip_guarapuava=args.skip_guarapuava,
         skip_talhoes=args.skip_talhoes,
         skip_municipal_map=args.skip_municipal_map,
+        skip_productivity_scatter=args.skip_productivity_scatter,
         map_dpi=args.map_dpi,
+        min_coverage_ratio=min_cov,
+        max_coverage_ratio=max_cov,
     )
 
 

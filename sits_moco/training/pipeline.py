@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from datasets.pixel_chunk import iter_batch_municipality_chunks
+from datasets.pixel_chunk import iter_batch_municipality_chunks, iter_batch_municipality_period_chunks
 
 
 def pixel_chunk_size(args) -> int:
@@ -29,6 +29,59 @@ def effective_chunks_per_grad(args) -> int:
     from training.vram_adjuster import effective_chunks_per_grad as _effective
 
     return _effective(args)
+
+
+def _chunk_pipeline_has_resolved_sizes(pipe: dict) -> bool:
+    """True if this session recorded a real auto-resolve (probe or prior restore)."""
+    cpg = pipe.get("chunks_per_grad_effective")
+    px = pipe.get("pixel_chunk_size_effective")
+    if cpg is None or px is None:
+        return False
+    trials = pipe.get("search_trials") or []
+    if trials:
+        return True
+    if pipe.get("restored_from_prior_session"):
+        return True
+    req_c = pipe.get("chunks_per_grad_requested")
+    req_p = pipe.get("pixel_chunk_size_requested")
+    if req_c is None or req_p is None:
+        return False
+    # Probe kept requested sizes only if trials exist; without trials, equal
+    # requested/effective usually means a resume that fell back to CLI defaults.
+    return int(cpg) != int(req_c) or int(px) != int(req_p)
+
+
+def restore_auto_chunk_pipeline_from_prior_session(
+    args,
+    training_dir_path,
+) -> dict | None:
+    """
+    On resume/pretrained runs, reuse a prior session's effective chunk sizes.
+
+    Auto VRAM probing is skipped when ``--pretrained`` is set, but the CLI often
+    still carries the *requested* grid (e.g. 15×8000) rather than the resolved
+    pair (e.g. 14×6500). Prefer the latest ``training/config.json`` session that
+    actually probed or restored sizes — not a later resume that only echoed CLI.
+
+    Returns the pipeline dict that was applied, or None if nothing usable was found.
+    """
+    from pathlib import Path
+
+    from run_paths import load_training_sessions
+
+    config_path = Path(training_dir_path) / "config.json"
+    sessions = load_training_sessions(config_path)
+    for session in reversed(sessions):
+        computed = session.get("computed") or {}
+        pipe = computed.get("chunk_pipeline")
+        if not isinstance(pipe, dict):
+            continue
+        if not _chunk_pipeline_has_resolved_sizes(pipe):
+            continue
+        args.chunks_per_grad = int(pipe["chunks_per_grad_effective"])
+        args.pixel_chunk_size = int(pipe["pixel_chunk_size_effective"])
+        return dict(pipe)
+    return None
 
 
 def describe_chunk_pipeline(args, device: torch.device) -> str:
@@ -102,6 +155,41 @@ def iter_training_batch_chunks(
         years,
         num_pixels_list,
         chunk_size=chunk_size,
+        prefetch_depth=prefetch_depth(args),
+        device=device,
+        pipeline_h2d=use_pipeline,
+        pin_host=h2d_pin_host(args),
+        skip_muni_indices=skip,
+        mmap_lookahead=True,
+    )
+
+
+def iter_inference_period_batch_chunks(
+    dataset,
+    municipalities,
+    years,
+    num_pixels_list,
+    chunk_size: int,
+    args,
+    device: torch.device,
+    *,
+    num_periods: int,
+    reference_date,
+    skip_muni_indices: set[int] | None = None,
+):
+    """Yield ``(muni_idx, chunk)`` for incomplete-series inference (same pipeline as training)."""
+    from training_runtime import h2d_pin_host
+
+    skip = skip_muni_indices or set()
+    use_pipeline = pipeline_h2d(args, device)
+    yield from iter_batch_municipality_period_chunks(
+        dataset,
+        municipalities,
+        years,
+        num_pixels_list,
+        chunk_size=chunk_size,
+        num_periods=int(num_periods),
+        reference_date=reference_date,
         prefetch_depth=prefetch_depth(args),
         device=device,
         pipeline_h2d=use_pipeline,

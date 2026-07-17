@@ -8,6 +8,7 @@ Training code loads pixels in chunks on-demand.
 
 from collections import OrderedDict, defaultdict
 from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -40,11 +41,109 @@ def _doy_to_season_month(doy, reference_date):
     return season_cal_months.index(cal) + 1
 
 
+@lru_cache(maxsize=8)
+def _season_month_lut(reference_date: date, max_doy: int = 400) -> np.ndarray:
+    """Lookup table: DOY index → season month (0 = outside 6-month window, else 1..6)."""
+    lut = np.zeros(max_doy + 1, dtype=np.int8)
+    for d in range(1, max_doy + 1):
+        lut[d] = _doy_to_season_month(d, reference_date)
+    return lut
+
+
+def _season_months_from_doys(doys: np.ndarray, reference_date: date) -> np.ndarray:
+    """Vectorized season-month mapping for any-shaped DOY array."""
+    lut = _season_month_lut(reference_date)
+    doy_i = np.asarray(doys, dtype=np.int64)
+    doy_i = np.clip(doy_i, 0, lut.shape[0] - 1)
+    return lut[doy_i]
+
+
+# Default: no coverage filter (use all municipality–year rows).
+# Optional suggested band for S2 footprint vs IBGE planted area:
+#   --min-coverage-ratio 0.8 --max-coverage-ratio 1.2
+DEFAULT_MIN_COVERAGE_RATIO = None
+DEFAULT_MAX_COVERAGE_RATIO = None
+SUGGESTED_MIN_COVERAGE_RATIO = 0.8
+SUGGESTED_MAX_COVERAGE_RATIO = 1.2
+COVERAGE_RATIO_COL = "coverage_ratio"
+
+
+def filter_yield_df_by_coverage(
+    yield_df: pl.DataFrame,
+    *,
+    min_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+    column: str = COVERAGE_RATIO_COL,
+) -> pl.DataFrame:
+    """
+    Keep rows whose ``coverage_ratio`` is inside ``[min_ratio, max_ratio]``.
+
+    If ``min_ratio`` and ``max_ratio`` are both None, returns ``yield_df`` unchanged.
+    If the column is missing while a filter is requested, raises ``ValueError``.
+    """
+    if min_ratio is None and max_ratio is None:
+        return yield_df
+    if column not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {column!r} required for coverage filtering. "
+            "Run scripts/compute_imagery_area_coverage.py to add it, "
+            "or pass --no-coverage-filter."
+        )
+
+    before = len(yield_df)
+    expr = pl.col(column).is_not_null()
+    if min_ratio is not None:
+        expr = expr & (pl.col(column) >= float(min_ratio))
+    if max_ratio is not None:
+        expr = expr & (pl.col(column) <= float(max_ratio))
+    filtered = yield_df.filter(expr)
+    after = len(filtered)
+    lo = "-inf" if min_ratio is None else f"{min_ratio:g}"
+    hi = "+inf" if max_ratio is None else f"{max_ratio:g}"
+    print(
+        f"  Coverage filter {column} in [{lo}, {hi}]: "
+        f"kept {after}/{before} rows (dropped {before - after})"
+    )
+    return filtered
+
+
+def filter_yield_pandas_by_coverage(
+    yield_df,
+    *,
+    min_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+    column: str = COVERAGE_RATIO_COL,
+):
+    """Pandas equivalent of :func:`filter_yield_df_by_coverage`."""
+    if min_ratio is None and max_ratio is None:
+        return yield_df
+    if column not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {column!r} required for coverage filtering. "
+            "Run scripts/compute_imagery_area_coverage.py to add it, "
+            "or pass --no-coverage-filter."
+        )
+    before = len(yield_df)
+    mask = yield_df[column].notna()
+    if min_ratio is not None:
+        mask &= yield_df[column] >= float(min_ratio)
+    if max_ratio is not None:
+        mask &= yield_df[column] <= float(max_ratio)
+    filtered = yield_df.loc[mask].copy()
+    after = len(filtered)
+    lo = "-inf" if min_ratio is None else f"{min_ratio:g}"
+    hi = "+inf" if max_ratio is None else f"{max_ratio:g}"
+    print(
+        f"  Coverage filter {column} in [{lo}, {hi}]: "
+        f"kept {after}/{before} rows (dropped {before - after})"
+    )
+    return filtered
+
+
 def _indices_first_n_months(row, num_periods, reference_date):
     """Return indices of rows in (T, C) where season month is in 1..num_periods (DOY at channel 10)."""
-    doys = row[:, DOY_CHANNEL].astype(np.float64)
-    months = np.array([_doy_to_season_month(d, reference_date) for d in doys])
-    valid = (months >= 1) & (months <= num_periods)
+    season_m = _season_months_from_doys(row[:, DOY_CHANNEL], reference_date)
+    valid = (season_m >= 1) & (season_m <= num_periods)
     return np.nonzero(valid)[0]
 
 
@@ -78,6 +177,8 @@ class USCropsAggregatedNPY(Dataset):
         target_column: str = "production_t",
         npy_cache_size: int = 20,
         npy_defer_copy: bool = True,  # ignored; always deferred (kept for API compat)
+        min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+        max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -99,6 +200,8 @@ class USCropsAggregatedNPY(Dataset):
         self.sequencelength = sequencelength
         self.rc = randomchoice
         self.interp = interp
+        self.min_coverage_ratio = min_coverage_ratio
+        self.max_coverage_ratio = max_coverage_ratio
 
         # Store normalization parameters
         self.target_mean = target_mean if target_mean is not None else 0.0
@@ -129,6 +232,12 @@ class USCropsAggregatedNPY(Dataset):
         # Convert municipality_code to string and filter by split
         yield_df = yield_df.with_columns(
             pl.col(municipality_code_col).cast(pl.Utf8).alias(municipality_code_col)
+        )
+
+        yield_df = filter_yield_df_by_coverage(
+            yield_df,
+            min_ratio=min_coverage_ratio,
+            max_ratio=max_coverage_ratio,
         )
 
         # Filter by split (skip filter when mode is "all" to use train/valid/test entries)
@@ -520,6 +629,53 @@ class USCropsAggregatedNPY(Dataset):
             end = min(start + chunk_size, num_pixels)
             yield self._transform_chunk(municipality_data[start:end])
 
+    def iter_period_pixel_chunks_from_data(
+        self,
+        municipality_data,
+        *,
+        num_periods: int,
+        chunk_size: int,
+        reference_date: date,
+    ):
+        """Yield batched STNet inputs after incomplete-series month filtering."""
+        if len(municipality_data) == 0:
+            return
+
+        season_lut = _season_month_lut(reference_date)
+        num_pixels = len(municipality_data)
+        for start in range(0, num_pixels, chunk_size):
+            end = min(start + chunk_size, num_pixels)
+            chunk_view = municipality_data[start:end]
+            if chunk_view.dtype == np.float32:
+                chunk_arr = np.ascontiguousarray(chunk_view)
+            else:
+                chunk_arr = np.asarray(chunk_view, dtype=np.float32)
+            n_pixels = chunk_arr.shape[0]
+            doy_i = np.clip(
+                chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
+                0,
+                season_lut.shape[0] - 1,
+            )
+            season_m = season_lut[doy_i]
+            valid = (season_m >= 1) & (season_m <= num_periods)
+            filtered: list[np.ndarray | None] = [None] * n_pixels
+            for i in range(n_pixels):
+                idx = np.flatnonzero(valid[i])
+                if idx.size == 0:
+                    continue
+                sub = chunk_arr[i, idx, :]
+                order = np.argsort(sub[:, DOY_CHANNEL], kind="stable")
+                filtered[i] = sub[order]
+            by_len: dict[int, list[int]] = defaultdict(list)
+            for i, sub in enumerate(filtered):
+                if sub is not None:
+                    by_len[sub.shape[0]].append(i)
+            for indices in by_len.values():
+                stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
+                if stacked.shape[0] == 0:
+                    continue
+                yield self._transform_chunk(stacked)
+
     def load_pixels_from_municipality_with_periods(
         self, municipality_code, year, num_periods, chunk_size=400, reference_date=None
     ):
@@ -528,80 +684,19 @@ class USCropsAggregatedNPY(Dataset):
         sorted by DOY. If more than `sequencelength` days remain, the first `sequencelength` (earliest
         in season) are kept. Otherwise the sequence is padded to `sequencelength`.
         reference_date: date where DOY 1 falls (e.g. date(2022, 10, 1)). No random subsampling.
-        Yields lists of 4-tuples (x_pad, mask, doy_pad, weight_pad) like load_pixels_from_municipality.
+        Yields batched 4-tuples (x, mask, doy, weight) like load_pixels_from_municipality.
         """
         if reference_date is None:
             reference_date = date(2022, 10, 1)
-        if year is None and not self._flat_season:
-            if self.year is not None:
-                year = self.year
-            elif self.use_multi_year:
-                for y, _ in self._year_dir_tuples:
-                    if self._resolve_npy_path(municipality_code, y) is not None:
-                        year = y
-                        break
-                if year is None:
-                    return
-            else:
-                if municipality_code in self.municipality_years:
-                    year = self.municipality_years[municipality_code]
-                else:
-                    for y, _ in self._year_dir_tuples:
-                        if self._resolve_npy_path(municipality_code, y) is not None:
-                            year = y
-                            break
-                    if year is None:
-                        return
-        if year is None and self._flat_season:
-            year = 2023  # dummy; path resolution ignores it in flat mode
-
-        muni_npy_file = self._resolve_npy_path(municipality_code, year)
-        if muni_npy_file is None:
+        municipality_data = self.mmap_municipality(municipality_code, year=year)
+        if municipality_data is None:
             return
-
-        if muni_npy_file not in self.npy_cache:
-            if len(self.npy_cache) >= self.npy_cache_max_size:
-                self.npy_cache.popitem(last=False)
-            self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
-        self.npy_cache.move_to_end(muni_npy_file)
-        municipality_data = self.npy_cache[muni_npy_file]
-        if len(municipality_data) == 0:
-            return
-
-        num_pixels = len(municipality_data)
-        for start in range(0, num_pixels, chunk_size):
-            end = min(start + chunk_size, num_pixels)
-            chunk_arr = np.asarray(municipality_data[start:end], dtype=np.float32)
-            N = chunk_arr.shape[0]
-            # All images in first num_periods months (1, 1–2, 1–3, …) per pixel
-            filtered = []
-            for i in range(N):
-                idx = _indices_first_n_months(chunk_arr[i], num_periods, reference_date)
-                if len(idx) == 0:
-                    filtered.append(None)
-                    continue
-                sub = chunk_arr[i, idx, :]
-                doys = sub[:, DOY_CHANNEL].astype(np.float64)
-                sub = sub[np.argsort(doys, kind="stable"), :]
-                filtered.append(sub)
-            by_len = defaultdict(list)
-            for i in range(N):
-                if filtered[i] is not None:
-                    by_len[filtered[i].shape[0]].append(i)
-            result = [None] * N
-            for k, indices in by_len.items():
-                stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
-                batch_x, batch_mask, batch_doy, batch_weight = self._transform_chunk(
-                    stacked
-                )
-                for j, i in enumerate(indices):
-                    result[i] = (
-                        batch_x[j],
-                        batch_mask[j],
-                        batch_doy[j],
-                        batch_weight[j],
-                    )
-            yield [r for r in result if r is not None]
+        yield from self.iter_period_pixel_chunks_from_data(
+            municipality_data,
+            num_periods=num_periods,
+            chunk_size=chunk_size,
+            reference_date=reference_date,
+        )
 
     def __len__(self):
         return len(self.municipality_list)

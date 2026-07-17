@@ -2,6 +2,7 @@
 #
 # Searches smaller widths, fewer layers, and higher dropout vs Seed27 defaults.
 # Training hyperparams stay fixed; regularization is mostly in model shape + dropout.
+# Uses municipality–year pairs with coverage_ratio in [0.8, 1.2] only.
 #
 # 36 trials = 3 d_model × 2 n_head × 2 d_inner × 3 dropout × 1 n_layers
 # (n_layers fixed at 1 in base; increase only if you add it to search)
@@ -25,26 +26,27 @@ output_dir: ./results/tuning
 base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
-  feature_layout: spectral_xavier
-  yield_csv: files/pam_soy_pr_2019_2025.csv
+  feature_layout: spectral
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
   logdir: ./results
-  seed: 27
+  seed: 101010
   epochs: 100
-  workers: 22
+  workers: 5
   sequencelength: 45
-  batchsize: 74
-  learning_rate: 1.0e-3
+  batchsize: 40
+  learning_rate: 5.0e-4
   weight_decay: 5.0e-4
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [5, 15]
+  schedule: [20, 75]
   no_compile: true
   overwrite_run: true
-  early_stop_patience: 15
-  pixel_chunk_size: 7000
-  prefetch_chunks: 30
-  chunks_per_grad: 25
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 15
+  prefetch_chunks: 6
   auto_chunks_per_grad: true
   auto_chunks_per_grad_min: 1
   auto_chunks_per_grad_vram_frac: 0.95
@@ -73,4 +75,4 @@ search:
 
     model_dropout:
       type: choice
-      values: [0.3, 0.4, 0.5]
+      values: [0.3, 0.4]

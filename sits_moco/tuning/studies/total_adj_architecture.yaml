@@ -30,9 +30,9 @@ base:
   logdir: ./results
   seed: 27
   epochs: 100
-  workers: 6
+  workers: 5
   sequencelength: 45
-  batchsize: 8
+  batchsize: 10
   learning_rate: 1.0e-4
   weight_decay: 5.0e-4
   sample_ratio: 1.0
@@ -42,8 +42,9 @@ base:
   no_compile: true
   overwrite_run: true
   early_stop_patience: 20
-  pixel_chunk_size: 15000
-  prefetch_chunks: 5
+  pixel_chunk_size: 5000
+  chunks_per_grad: 5
+  prefetch_chunks: 6
   quiet_training: true
   model_n_layers: 1
 

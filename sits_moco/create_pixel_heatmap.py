@@ -45,6 +45,7 @@ from run_paths import (
 )
 from utils_aggregated import (
     resolve_inference_target,
+    resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -1578,10 +1579,13 @@ def load_stnet_from_checkpoint(
             f"Checkpoint feature_layout={ck_fl!r} does not match config {layout!r}."
         )
 
+    run_config = load_latest_run_config(checkpoint_path)
+    model_kw = resolve_model_kwargs(run_config, checkpoint)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=sequencelength,
+        **model_kw,
     ).to(device)
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
@@ -2079,10 +2083,12 @@ def main():
     # Create model
     print("Creating model...")
     device = torch.device(args.device)
+    model_kw = resolve_model_kwargs(run_config, checkpoint)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
+        **model_kw,
     ).to(device)
 
     # Load model weights

@@ -36,6 +36,7 @@ BOOL_PARAMS = frozenset(
         "h2d_pin_host",
         "no_dataloader_pin_memory",
         "auto_chunks_per_grad",
+        "no_coverage_filter",
     }
 )
 

@@ -22,7 +22,12 @@ from torch.utils.data import DataLoader
 
 # Import Polars version of dataset
 from datasets.feature_layout import feature_layout_choices
-from datasets.uscrops_aggregated_npy_polars import USCropsAggregatedNPY
+from datasets.uscrops_aggregated_npy_polars import (
+    DEFAULT_MAX_COVERAGE_RATIO,
+    DEFAULT_MIN_COVERAGE_RATIO,
+    USCropsAggregatedNPY,
+    filter_yield_df_by_coverage,
+)
 from models.weight_init import weight_init_regression
 from run_paths import (
     ensure_run_layout,
@@ -224,6 +229,30 @@ def parse_args():
         type=str,
         default=None,
         help=f"path to yield CSV (default: {YIELD_CSV})",
+    )
+    parser.add_argument(
+        "--min-coverage-ratio",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE_RATIO,
+        help=(
+            "Keep municipality–year rows with coverage_ratio >= this "
+            "(default: no filter). Requires coverage_ratio in the yield CSV. "
+            "Example band: --min-coverage-ratio 0.8 --max-coverage-ratio 1.2"
+        ),
+    )
+    parser.add_argument(
+        "--max-coverage-ratio",
+        type=float,
+        default=DEFAULT_MAX_COVERAGE_RATIO,
+        help=(
+            "Keep municipality–year rows with coverage_ratio <= this "
+            "(default: no filter). Requires coverage_ratio in the yield CSV."
+        ),
+    )
+    parser.add_argument(
+        "--no-coverage-filter",
+        action="store_true",
+        help="Do not filter yield CSV rows by coverage_ratio (default behavior)",
     )
     parser.add_argument(
         "--target",
@@ -438,14 +467,15 @@ def parse_args():
     args.yield_csv = Path(args.yield_csv).expanduser() if args.yield_csv else YIELD_CSV
     args.target_column, args.aggregation, args.target_unit = resolve_target(args.target)
 
+    if args.no_coverage_filter:
+        args.min_coverage_ratio = None
+        args.max_coverage_ratio = None
+
     # WSL/Linux convenience: convert Windows absolute paths (e.g. C:\...) to /mnt/c/...
-    # This allows passing the same checkpoint path from Windows into WSL.
-    if args.pretrained and os.name != "nt":
-        p = str(args.pretrained)
-        if len(p) >= 3 and p[1:3] == ":\\":
-            wp = PureWindowsPath(p)
-            drive = (wp.drive or "").rstrip(":").lower()
-            args.pretrained = str(Path("/mnt") / drive / Path(*wp.parts[1:]))
+    if args.pretrained:
+        from run_paths import normalize_user_path
+
+        args.pretrained = str(normalize_user_path(args.pretrained))
 
     args.harvest_years_set = {
         int(x.strip()) for x in args.harvest_years.split(",") if x.strip()
@@ -547,7 +577,15 @@ def split_design_for_config(
     }
 
 
-def compute_target_statistics(yield_csv, datapath, target_column, harvest_years=None):
+def compute_target_statistics(
+    yield_csv,
+    datapath,
+    target_column,
+    harvest_years=None,
+    *,
+    min_coverage_ratio=DEFAULT_MIN_COVERAGE_RATIO,
+    max_coverage_ratio=DEFAULT_MAX_COVERAGE_RATIO,
+):
     """
     Compute mean and std of training targets for normalization.
     Only uses training data from years where we have imagery data.
@@ -557,6 +595,9 @@ def compute_target_statistics(yield_csv, datapath, target_column, harvest_years=
         yield_csv: Path to yield CSV file
         datapath: Path to dataset directory (to find available years)
         harvest_years: Optional set of harvest years; intersects with years that have imagery.
+        min_coverage_ratio / max_coverage_ratio: Optional coverage_ratio band
+            (default: None / no filter). Example: 0.8 and 1.2.
+            (None disables that bound; both None disables filtering).
     """
 
     print(f"Computing target statistics from {yield_csv}...")
@@ -564,6 +605,11 @@ def compute_target_statistics(yield_csv, datapath, target_column, harvest_years=
         yield_csv,
         null_values=["-", "", "nan", "NaN", "null", "NULL"],
         infer_schema_length=10000,
+    )
+    yield_df = filter_yield_df_by_coverage(
+        yield_df,
+        min_ratio=min_coverage_ratio,
+        max_ratio=max_coverage_ratio,
     )
 
     yield_col = target_column
@@ -775,6 +821,8 @@ def train(args):
         args.datapath,
         args.target_column,
         harvest_years=args.harvest_years_set,
+        min_coverage_ratio=args.min_coverage_ratio,
+        max_coverage_ratio=args.max_coverage_ratio,
     )
     print(
         f"Target: {args.target} ({args.target_column}, {args.aggregation} over pixels)"
@@ -800,6 +848,8 @@ def train(args):
         harvest_years=args.harvest_years_set,
         feature_layout=args.feature_layout,
         target_column=args.target_column,
+        min_coverage_ratio=args.min_coverage_ratio,
+        max_coverage_ratio=args.max_coverage_ratio,
         **dl_opts,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
@@ -817,6 +867,8 @@ def train(args):
         harvest_years=args.harvest_years_set,
         feature_layout=args.feature_layout,
         target_column=args.target_column,
+        min_coverage_ratio=args.min_coverage_ratio,
+        max_coverage_ratio=args.max_coverage_ratio,
         **dl_opts,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
@@ -834,6 +886,8 @@ def train(args):
         harvest_years=args.harvest_years_set,
         feature_layout=args.feature_layout,
         target_column=args.target_column,
+        min_coverage_ratio=args.min_coverage_ratio,
+        max_coverage_ratio=args.max_coverage_ratio,
         **dl_opts,
     )
 
@@ -1129,10 +1183,30 @@ def train(args):
         )
 
     if args.auto_chunks_per_grad and args.pretrained is not None:
-        print(
-            "Skipping auto chunks_per_grad probe (pretrained/resume run); "
-            f"using chunks_per_grad={args.chunks_per_grad}"
+        from training.pipeline import restore_auto_chunk_pipeline_from_prior_session
+
+        requested_cpg = int(args.chunks_per_grad)
+        requested_px = int(args.pixel_chunk_size)
+        restored_pipe = restore_auto_chunk_pipeline_from_prior_session(
+            args, training_dir_path
         )
+        if restored_pipe is not None:
+            print(
+                "Skipping auto chunks_per_grad probe (pretrained/resume run); "
+                f"restored chunks_per_grad={args.chunks_per_grad}, "
+                f"pixel_chunk_size={args.pixel_chunk_size} "
+                f"from prior session "
+                f"(CLI requested {requested_cpg}x{requested_px})"
+            )
+            args._resume_chunk_pipeline_requested = (requested_cpg, requested_px)
+            args._resume_chunk_pipeline_restored = restored_pipe
+        else:
+            print(
+                "Skipping auto chunks_per_grad probe (pretrained/resume run); "
+                f"no prior chunk_pipeline in config — using CLI "
+                f"chunks_per_grad={args.chunks_per_grad}, "
+                f"pixel_chunk_size={args.pixel_chunk_size}"
+            )
     elif args.auto_chunks_per_grad:
         from training.vram_adjuster import resolve_chunks_per_grad_before_training
 
@@ -1153,20 +1227,24 @@ def train(args):
     if resolver is not None and resolver.enabled:
         chunk_pipeline_config = resolver.to_config_dict()
     else:
+        restored_pipe = getattr(args, "_resume_chunk_pipeline_restored", None)
+        req = getattr(args, "_resume_chunk_pipeline_requested", None)
+        if req is not None:
+            requested_cpg, requested_px = req
+        else:
+            requested_cpg = int(args.chunks_per_grad)
+            requested_px = int(args.pixel_chunk_size)
         chunk_pipeline_config = {
             "auto_chunks_per_grad": bool(args.auto_chunks_per_grad),
-            "chunks_per_grad_requested": int(args.chunks_per_grad),
+            "chunks_per_grad_requested": int(requested_cpg),
             "chunks_per_grad_effective": int(args.chunks_per_grad),
-            "pixel_chunk_size_requested": int(args.pixel_chunk_size),
+            "pixel_chunk_size_requested": int(requested_px),
             "pixel_chunk_size_effective": int(args.pixel_chunk_size),
-            "max_pixels_per_backward_requested": max(
-                1, int(args.chunks_per_grad)
-            )
+            "max_pixels_per_backward_requested": max(1, int(requested_cpg))
+            * max(1, int(requested_px)),
+            "max_pixels_per_backward_effective": max(1, int(args.chunks_per_grad))
             * max(1, int(args.pixel_chunk_size)),
-            "max_pixels_per_backward_effective": max(
-                1, int(args.chunks_per_grad)
-            )
-            * max(1, int(args.pixel_chunk_size)),
+            "restored_from_prior_session": restored_pipe is not None,
             "search_trials": [],
         }
 
@@ -1389,6 +1467,8 @@ def get_aggregated_dataloader(
     feature_layout: str = "spectral",
     target_column: str = "production_t",
     *,
+    min_coverage_ratio=DEFAULT_MIN_COVERAGE_RATIO,
+    max_coverage_ratio=DEFAULT_MAX_COVERAGE_RATIO,
     npy_cache_size: int = 20,
     pin_memory: bool = True,
     persistent_workers: bool = False,
@@ -1412,6 +1492,8 @@ def get_aggregated_dataloader(
         feature_layout=feature_layout,
         target_column=target_column,
         npy_cache_size=npy_cache_size,
+        min_coverage_ratio=min_coverage_ratio,
+        max_coverage_ratio=max_coverage_ratio,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0

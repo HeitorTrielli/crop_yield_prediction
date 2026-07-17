@@ -51,6 +51,7 @@ from run_paths import (
 from utils_aggregated import (
     regression_metrics,
     resolve_inference_target,
+    resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -669,19 +670,20 @@ def load_model(
         raise ValueError(
             f"Checkpoint feature_layout={ck_fl!r} does not match config {resolved_layout!r}"
         )
+    run_config = load_latest_run_config(checkpoint_path)
+    model_kw = resolve_model_kwargs(run_config, checkpoint)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=sequencelength,
+        **model_kw,
     ).to(device)
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
     else:
         model.load_state_dict(state_dict, strict=False)
     model.eval()
-    _, _, aggregation, _ = resolve_inference_target(
-        load_latest_run_config(checkpoint_path), checkpoint
-    )
+    _, _, aggregation, _ = resolve_inference_target(run_config, checkpoint)
     return model, input_dim, resolved_layout, aggregation
 
 
