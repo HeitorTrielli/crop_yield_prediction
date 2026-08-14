@@ -23,8 +23,8 @@ def _normalize_aggregations(
 class MunicipalityPixelAccumulator:
     """Accumulate pixel predictions into a municipality-level sum and/or mean.
 
-    Always stores a running sum (+ count). ``value()`` applies per-output
-    aggregation when ``aggregation`` is a list.
+    Always stores a running sum (+ count) and sum-of-squares (for aux variance).
+    ``value()`` applies per-output aggregation when ``aggregation`` is a list.
     """
 
     def __init__(self, aggregation: str | Sequence[str] = "sum"):
@@ -34,12 +34,16 @@ class MunicipalityPixelAccumulator:
             self.aggregations[0] if len(self.aggregations) == 1 else list(self.aggregations)
         )
         self._sum: torch.Tensor | None = None
+        self._sum_sq: torch.Tensor | None = None
         self.pixel_count = 0
 
     def add(self, chunk_predictions: torch.Tensor) -> None:
-        chunk_sum = chunk_predictions.sum(dim=0).to(torch.float32)
+        preds = chunk_predictions.to(torch.float32)
+        chunk_sum = preds.sum(dim=0)
+        chunk_sum_sq = (preds * preds).sum(dim=0)
         if self._sum is None:
             self._sum = chunk_sum
+            self._sum_sq = chunk_sum_sq
             n_out = int(chunk_sum.numel())
             if len(self.aggregations) == 1 and n_out > 1:
                 # Broadcast a single aggregation mode across all output dims.
@@ -56,7 +60,8 @@ class MunicipalityPixelAccumulator:
                 )
         else:
             self._sum = self._sum + chunk_sum
-        self.pixel_count += int(chunk_predictions.shape[0])
+            self._sum_sq = self._sum_sq + chunk_sum_sq
+        self.pixel_count += int(preds.shape[0])
 
     @property
     def valid(self) -> bool:
@@ -76,9 +81,26 @@ class MunicipalityPixelAccumulator:
                 out[i] = out[i] / count
         return out
 
+    def variance(self) -> torch.Tensor | None:
+        """Population variance of pixel predictions."""
+        if not self.valid or self._sum_sq is None or self.pixel_count < 1:
+            return None
+        n = float(self.pixel_count)
+        mean = self._sum / n
+        var = self._sum_sq / n - mean * mean
+        return torch.clamp(var, min=0.0)
+
+    def std(self) -> torch.Tensor | None:
+        var = self.variance()
+        if var is None:
+            return None
+        return torch.sqrt(var + 1e-12)
+
     def detach(self) -> None:
         if self._sum is not None:
             self._sum = self._sum.detach()
+        if self._sum_sq is not None:
+            self._sum_sq = self._sum_sq.detach()
 
     def start_new_grad_segment(self) -> None:
         """Break the autograd chain after backward while keeping running totals."""

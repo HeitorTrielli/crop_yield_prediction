@@ -4,6 +4,7 @@ End-to-end post-training results pipeline for a single STNet checkpoint.
 Loads the model once and produces:
   1. Incomplete-series municipal evaluation (k=1..6) with per-year forecast CSVs.
      k=6 CSVs are written to predictions/yield_forecasts_{year}.csv (same as predict_yield).
+     Also writes a pooled summary plus one summary per leave-out/holdout year.
   2. Guarapuava intramunicipal heatmaps (full series + k=1..6) for the holdout year.
   3. Talhão-level evaluation CSVs for each harvest year.
   4. Paraná municipal error choropleth for the holdout year.
@@ -106,6 +107,7 @@ class ModelContext:
 @dataclass
 class GenerateResultsOutput:
     incomplete_series_summary: Path | None = None
+    incomplete_series_by_leave_out_year: dict[int, Path] = field(default_factory=dict)
     yield_forecasts_by_year: dict[int, Path] = field(default_factory=dict)
     incomplete_forecasts: dict[int, dict[int, Path]] = field(default_factory=dict)
     guarapuava_heatmaps: dict[str, Path] = field(default_factory=dict)
@@ -247,6 +249,64 @@ def resolve_harvest_years(
     return sorted(ydf["year"].dropna().astype(int).unique().tolist())
 
 
+def resolve_leave_out_years(
+    ctx: ModelContext,
+    holdout_year: int | None = None,
+) -> list[int]:
+    """Leave-out / holdout years from training split_design, else ``holdout_year``."""
+    computed = ctx.run_config.get("computed") or {}
+    split = computed.get("split_design") or {}
+    holdouts = split.get("holdout_years") or computed.get("holdout_years")
+    if holdouts:
+        return sorted(int(y) for y in holdouts)
+    if holdout_year is not None:
+        return [int(holdout_year)]
+    return []
+
+
+def _metrics_row_from_forecasts(
+    year_df: pd.DataFrame,
+    *,
+    num_periods: int,
+    target_column: str,
+) -> dict:
+    """Build one incomplete-series summary row from a year forecasts dataframe."""
+    if year_df.empty or "actual_yield" not in year_df.columns:
+        return {
+            "num_periods": num_periods,
+            "num_municipalities": 0,
+            "rmse": np.nan,
+            "mae": np.nan,
+            "r2": np.nan,
+            "mape": np.nan,
+        }
+
+    pred = pd.to_numeric(year_df["forecast"], errors="coerce")
+    true = pd.to_numeric(year_df["actual_yield"], errors="coerce")
+    mask = np.isfinite(pred) & np.isfinite(true)
+    y_pred = pred[mask].to_numpy(dtype=float)
+    y_true = true[mask].to_numpy(dtype=float)
+    if len(y_pred) == 0:
+        return {
+            "num_periods": num_periods,
+            "num_municipalities": 0,
+            "rmse": np.nan,
+            "mae": np.nan,
+            "r2": np.nan,
+            "mape": np.nan,
+        }
+
+    metrics = regression_metrics(y_pred, y_true, target_column=target_column)
+    return {
+        "num_periods": num_periods,
+        "num_municipalities": int(len(y_pred)),
+        "rmse": metrics["rmse"],
+        "mae": metrics["mae"],
+        "r2": metrics["r2"],
+        "mape": metrics["mape"] if not np.isnan(metrics["mape"]) else None,
+    }
+
+
 def _load_yield_lookup(
     yield_csv: Path,
     target_column: str,
@@ -342,21 +402,30 @@ def run_incomplete_series_evaluation(
     datapath: Path,
     yield_csv: Path,
     harvest_years: list[int],
+    leave_out_years: list[int] | None = None,
     pred_dir: Path | None = None,
     min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
     max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
-) -> tuple[Path, dict[int, Path], dict[int, dict[int, Path]]]:
+) -> tuple[Path, dict[int, Path], dict[int, Path], dict[int, dict[int, Path]]]:
     """
     Evaluate k=1..6 incomplete seasons.
 
     Writes:
       - predictions/incomplete_series/k{k}/yield_forecasts_{year}.csv
       - predictions/yield_forecasts_{year}.csv for k=6 (full series)
-      - predictions/incomplete_series_evaluation.csv
+      - predictions/incomplete_series_evaluation.csv (all harvest years pooled)
+      - predictions/incomplete_series_evaluation_{year}.csv for each leave-out year
     """
     pred_dir = pred_dir or predictions_dir(ctx.run_dir, create=True)
     incomplete_root = pred_dir / "incomplete_series"
     summary_path = pred_dir / "incomplete_series_evaluation.csv"
+    leave_out_years = sorted(
+        {
+            int(y)
+            for y in (leave_out_years or [])
+            if int(y) in set(int(h) for h in harvest_years)
+        }
+    )
 
     dataset = _build_dataset(
         ctx,
@@ -381,6 +450,7 @@ def run_incomplete_series_evaluation(
     inference_batch_size = inference_batch_size_from_run_config(ctx.run_config)
 
     all_results: list[dict] = []
+    leave_out_results: dict[int, list[dict]] = {year: [] for year in leave_out_years}
     yield_forecasts_by_year: dict[int, Path] = {}
     incomplete_forecasts: dict[int, dict[int, Path]] = {
         year: {} for year in harvest_years
@@ -454,18 +524,45 @@ def run_incomplete_series_evaluation(
             year_df = _forecasts_dataframe_for_year(
                 predictions, yield_lookup, harvest_year
             )
-            if year_df.empty:
-                continue
-            csv_path = out_dir / f"yield_forecasts_{harvest_year}.csv"
-            year_df.to_csv(csv_path, index=False)
-            incomplete_forecasts[harvest_year][num_periods] = csv_path
-            if num_periods == 6:
-                yield_forecasts_by_year[harvest_year] = csv_path
+            if not year_df.empty:
+                csv_path = out_dir / f"yield_forecasts_{harvest_year}.csv"
+                year_df.to_csv(csv_path, index=False)
+                incomplete_forecasts[harvest_year][num_periods] = csv_path
+                if num_periods == 6:
+                    yield_forecasts_by_year[harvest_year] = csv_path
+
+            if harvest_year in leave_out_results:
+                row = _metrics_row_from_forecasts(
+                    year_df,
+                    num_periods=num_periods,
+                    target_column=ctx.target_column,
+                )
+                leave_out_results[harvest_year].append(row)
+                print(
+                    f"  Leave-out {harvest_year} (k={num_periods}, "
+                    f"n={row['num_municipalities']}): "
+                    f"RMSE={row['rmse']:.2f}, MAE={row['mae']:.2f}, R²={row['r2']:.4f}"
+                )
 
     summary_df = pd.DataFrame(all_results).sort_values("num_periods")
     summary_df.to_csv(summary_path, index=False)
     print(f"\nSaved incomplete-series summary to {summary_path}")
-    return summary_path, yield_forecasts_by_year, incomplete_forecasts
+
+    leave_out_summaries: dict[int, Path] = {}
+    for year, rows in leave_out_results.items():
+        if not rows:
+            continue
+        year_path = pred_dir / f"incomplete_series_evaluation_{year}.csv"
+        pd.DataFrame(rows).sort_values("num_periods").to_csv(year_path, index=False)
+        leave_out_summaries[year] = year_path
+        print(f"Saved leave-out incomplete-series summary to {year_path}")
+
+    return (
+        summary_path,
+        leave_out_summaries,
+        yield_forecasts_by_year,
+        incomplete_forecasts,
+    )
 
 
 def run_guarapuava_heatmaps(
@@ -770,11 +867,13 @@ def generate_results(
     )
 
     years = resolve_harvest_years(ctx, harvest_years, yield_csv_path)
+    leave_out_years = resolve_leave_out_years(ctx, holdout_year)
     if verbose:
         print(f"Checkpoint: {ctx.checkpoint}")
         print(f"Run dir:    {ctx.run_dir}")
         print(f"Harvest years: {years}")
         print(f"Holdout year:  {holdout_year}")
+        print(f"Leave-out years: {leave_out_years}")
         print(f"Pixel chunk size: {ctx.chunk_size}")
 
     output = GenerateResultsOutput()
@@ -782,6 +881,7 @@ def generate_results(
     if not skip_incomplete_series:
         (
             output.incomplete_series_summary,
+            output.incomplete_series_by_leave_out_year,
             output.yield_forecasts_by_year,
             output.incomplete_forecasts,
         ) = run_incomplete_series_evaluation(
@@ -789,6 +889,7 @@ def generate_results(
             datapath=datapath_resolved,
             yield_csv=yield_csv_path,
             harvest_years=years,
+            leave_out_years=leave_out_years,
             min_coverage_ratio=min_coverage_ratio,
             max_coverage_ratio=max_coverage_ratio,
         )
@@ -846,6 +947,8 @@ def generate_results(
         print("=" * 60)
         if output.incomplete_series_summary:
             print(f"  Incomplete summary: {output.incomplete_series_summary}")
+        for year, path in sorted(output.incomplete_series_by_leave_out_year.items()):
+            print(f"  Incomplete summary (leave-out {year}): {path}")
         for year, path in sorted(output.yield_forecasts_by_year.items()):
             print(f"  Yield forecasts {year}: {path}")
         if output.municipal_error_map:

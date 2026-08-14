@@ -1,0 +1,62 @@
+# Ablation baseline: architecture from productivity_architecture trial_006
+# (best val_r2 ≈ 0.165), with training recipe held fixed.
+#
+# Single trial — reproduce trial_006 as a control for other ablations.
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_trial006_baseline.yaml --list-trials
+#
+# Run (resumable):
+#   python run_tuning_study.py run tuning/studies/productivity_trial006_baseline.yaml --skip-completed
+
+name: productivity_trial006_baseline
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+# Fixed recipe = trial_006 from productivity_architecture (best_trial.json).
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 100
+  workers: 5
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 5.0e-4
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [20, 75]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 15
+  prefetch_chunks: 6
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
+  quiet_training: true
+  # Distinct from productivity_architecture tune_trial_* run dirs
+  suffix_prefix: t6base
+  # trial_006 architecture
+  model_n_layers: 1
+  model_d_model: 96
+  model_n_head: 8
+  model_d_inner: 64
+  model_dropout: 0.3
+
+search:
+  strategy: grid
+  # Empty search → one trial with base params only
+  parameters: {}

@@ -226,11 +226,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             continue
 
         merged = merge_trial_params(cfg["base"], sampled)
-        # Include study name so different studies never reuse the same run_dir
-        # (e.g. both would otherwise write tune_trial_001 and collide).
-        merged["suffix"] = merged.get("suffix") or (
-            f"tune_{_safe_run_tag(cfg['name'])}_{trial_id}"
-        )
+        # Prefer explicit suffix. Else "{suffix_prefix}_{trial_id}".
+        # Default prefix embeds the study name so studies do not share run_dir
+        # (tune_trial_001 collisions). Override with base.suffix_prefix if needed.
+        if not merged.get("suffix"):
+            prefix = str(
+                merged.pop("suffix_prefix", None)
+                or f"tune_{_safe_run_tag(cfg['name'])}"
+            )
+            merged["suffix"] = f"{prefix}_{trial_id}"
+        else:
+            merged.pop("suffix_prefix", None)
         if "seed" in merged:
             merged["seed"] = int(merged["seed"]) + int(cfg.get("seed_offset", 0))
 

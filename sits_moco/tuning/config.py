@@ -74,6 +74,8 @@ FLOAT_PARAMS = frozenset(
         "weight_decay",
         "sample_ratio",
         "model_dropout",
+        "aux_loss_weight",
+        "aux_min_std",
         "auto_chunks_per_grad_vram_frac",
         "auto_chunks_per_grad_vram_target_frac",
         "min_coverage_ratio",
