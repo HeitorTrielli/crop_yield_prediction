@@ -110,6 +110,28 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--bias-correct",
+        action="store_true",
+        help=(
+            "Post-hoc: shift pixel predictions so the municipal mean matches PAM "
+            "yield_t_ha for --year / --year-range (does not change the model). "
+            "Useful for downscaled maps; municipal R² is not a fair metric after this."
+        ),
+    )
+    parser.add_argument(
+        "--bias-correct-mode",
+        type=str,
+        default="shift",
+        choices=("shift", "scale"),
+        help="Bias correction mode when --bias-correct is set (default: shift)",
+    )
+    parser.add_argument(
+        "--yield-csv",
+        type=str,
+        default="files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv",
+        help="PAM CSV used for --bias-correct municipal mean lookup",
+    )
+    parser.add_argument(
         "--figures-subdir",
         type=str,
         default=None,
@@ -2155,6 +2177,37 @@ def main():
             if prediction_map is None:
                 print(f"  ❌ Failed to generate predictions for {municipality_code}{k_label}")
                 continue
+
+            if getattr(args, "bias_correct", False):
+                from bias_correction import correct_prediction_map_to_pam
+                import pandas as pd
+
+                harvest_year = args.year
+                if harvest_year is None and args.year_range and "-" in str(args.year_range):
+                    harvest_year = int(str(args.year_range).split("-")[-1])
+                pam = None
+                try:
+                    ydf = pd.read_csv(args.yield_csv)
+                    ydf["municipality_code"] = ydf["municipality_code"].astype(str)
+                    sub = ydf[ydf["municipality_code"] == str(municipality_code)]
+                    if harvest_year is not None and "year" in sub.columns:
+                        sub = sub[sub["year"].astype(int) == int(harvest_year)]
+                    if len(sub) and "yield_t_ha" in sub.columns:
+                        pam = float(sub["yield_t_ha"].iloc[0])
+                except Exception as exc:
+                    print(f"  ⚠️  bias-correct skipped (PAM lookup failed): {exc}")
+                if pam is not None:
+                    before = float(
+                        np.nanmean(list(prediction_map.values()))
+                    )
+                    prediction_map = correct_prediction_map_to_pam(
+                        prediction_map, pam, mode=args.bias_correct_mode
+                    )
+                    after = float(np.nanmean(list(prediction_map.values())))
+                    print(
+                        f"  bias-correct ({args.bias_correct_mode}): "
+                        f"mean {before:.3f} → {after:.3f} (PAM={pam:.3f})"
+                    )
 
             if incomplete_mode:
                 suffix = f"_k{num_periods}"

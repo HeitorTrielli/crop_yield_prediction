@@ -15,6 +15,11 @@ from training.pipeline import (
     scan_skip_municipalities,
 )
 from training.accumulator import MunicipalityPixelAccumulator
+from training.aux_losses import (
+    pixel_ndvi_proxy,
+    ranking_correlation_loss,
+    variance_hinge_loss,
+)
 from training.log_util import log_training as _log_training
 
 
@@ -57,6 +62,9 @@ def process_train_batch(
     chunk_debug = chunk_debug_syncs(args)
     chunks_per_grad = effective_chunks_per_grad(args)
     use_pipeline_h2d = pipeline_h2d(args, device)
+    aux_loss_type = str(getattr(args, "aux_loss", "none") or "none").lower()
+    aux_loss_weight = float(getattr(args, "aux_loss_weight", 0.0) or 0.0)
+    aux_min_std = float(getattr(args, "aux_min_std", 0.05) or 0.05)
 
     skip_muni_indices = scan_skip_municipalities(
         municipalities, targets, num_pixels_list
@@ -74,6 +82,7 @@ def process_train_batch(
     municipalities_completed = 0
     stop_after_municipalities = False
     stop_vram_probe = False
+    chunk_rank_loss = None
 
     def _check_vram_probe() -> None:
         nonlocal stop_vram_probe
@@ -154,7 +163,7 @@ def process_train_batch(
 
     def _begin_muni(muni_idx: int) -> None:
         nonlocal current_muni, municipality_code, target, num_pixels, total_chunks
-        nonlocal chunk_idx, pixel_acc, year, muni_break
+        nonlocal chunk_idx, pixel_acc, year, muni_break, chunk_rank_loss
         current_muni = muni_idx
         municipality_code = municipalities[muni_idx]
         num_pixels = num_pixels_list[muni_idx]
@@ -164,6 +173,7 @@ def process_train_batch(
         total_chunks = (num_pixels + chunk_size - 1) // chunk_size
         year = years[muni_idx] if years[muni_idx] is not None else None
         muni_break = False
+        chunk_rank_loss = None
 
     chunk_stream = iter_training_batch_chunks(
         dataset,
@@ -241,6 +251,18 @@ def process_train_batch(
             )
             continue
 
+        if aux_loss_type == "rank" and aux_loss_weight > 0:
+            try:
+                proxy = pixel_ndvi_proxy(municipality_X_chunk[0])
+                rank_term = ranking_correlation_loss(chunk_predictions, proxy)
+                chunk_rank_loss = (
+                    rank_term
+                    if chunk_rank_loss is None
+                    else chunk_rank_loss + rank_term
+                )
+            except Exception:
+                pass
+
         pixel_acc.add(chunk_predictions)
         if chunk_debug and pixel_acc.is_extreme():
             print(
@@ -297,23 +319,28 @@ def process_train_batch(
                 municipality_agg_normalized, expected_partial_target
             )
 
+            aux_term = municipality_agg_normalized.new_zeros(())
+            if aux_loss_weight > 0 and aux_loss_type == "variance":
+                std = pixel_acc.std()
+                if std is not None:
+                    aux_term = variance_hinge_loss(std, min_std=aux_min_std)
+            elif (
+                aux_loss_weight > 0
+                and aux_loss_type == "rank"
+                and chunk_rank_loss is not None
+            ):
+                aux_term = chunk_rank_loss
+
             if torch.isnan(muni_loss) or torch.isinf(muni_loss):
                 print(
                     f"  ❌ DEBUG: Municipality {municipality_code} has invalid loss: {muni_loss.item()}"
-                )
-                print(
-                    f"      Expected partial target: {expected_partial_target.item():.4f}, "
-                    f"Pred: {municipality_agg_normalized.item():.4f}"
-                )
-                print(
-                    f"      Chunks: {chunk_idx}/{total_chunks}, Fraction processed: {fraction_processed:.4f}"
                 )
                 muni_break = True
                 continue
 
             num_updates = (total_chunks + chunks_per_grad - 1) // chunks_per_grad
             update_weight = 1.0 / num_updates if num_updates > 0 else 1.0
-            scaled_loss = muni_loss * update_weight
+            scaled_loss = (muni_loss + aux_loss_weight * aux_term) * update_weight
 
             if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
                 print(
@@ -328,6 +355,7 @@ def process_train_batch(
             batch_has_gradients = True
 
             pixel_acc.start_new_grad_segment()
+            chunk_rank_loss = None
             del municipality_X_chunk, chunk_predictions
             if is_last_chunk:
                 muni_break = True

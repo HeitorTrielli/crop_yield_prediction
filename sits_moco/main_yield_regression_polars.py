@@ -345,6 +345,29 @@ def parse_args():
         default=0.2,
         help="STNet dropout probability (default: 0.2)",
     )
+    parser.add_argument(
+        "--aux-loss",
+        type=str,
+        default="none",
+        choices=("none", "variance", "rank"),
+        help=(
+            "Optional within-municipality auxiliary loss on top of aggregated MSE: "
+            "'variance' = hinge if pixel-pred std < --aux-min-std; "
+            "'rank' = 1 - corr(pred, NDVI proxy) on each chunk. Default: none"
+        ),
+    )
+    parser.add_argument(
+        "--aux-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight for --aux-loss relative to municipal MSE (default: 0.1)",
+    )
+    parser.add_argument(
+        "--aux-min-std",
+        type=float,
+        default=0.05,
+        help="Minimum within-muni pixel std (t/ha) for variance aux loss (default: 0.05)",
+    )
     # --- Training runtime (defaults in training_runtime.py; override when debugging) ---
     parser.add_argument(
         "--legacy-zero-grad",

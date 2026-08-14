@@ -23,4 +23,17 @@ def __getattr__(name: str):
         from . import uscrops_aggregated_npy_polars as _agg
 
         return getattr(_agg, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in {
+        "analyze_municipality",
+        "analyze_municipality_histograms",
+        "keep_mask_path",
+        "load_keep_mask",
+        "pixel_passes_temporal_filter",
+        "scan_municipality_grid",
+        "stats_from_grid",
+        "MuniPixelStats",
+        "MuniCoverageGrid",
+    }:
+        from . import pixel_coverage as _pc
+
+        return getattr(_pc, name)
