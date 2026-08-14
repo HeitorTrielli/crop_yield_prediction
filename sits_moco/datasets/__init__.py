@@ -51,3 +51,4 @@ def __getattr__(name: str):
         from . import pixel_coverage as _pc
 
         return getattr(_pc, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
