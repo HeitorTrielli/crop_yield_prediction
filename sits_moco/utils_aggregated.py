@@ -105,16 +105,46 @@ TARGET_SPECS = {
         "unit": "tons",
     },
     "productivity": {"column": "yield_t_ha", "aggregation": "mean", "unit": "t/ha"},
+    # Deviation from per-year train-set mean of yield_t_ha (yield anomaly).
+    # Column is derived at load time; see ensure_productivity_dev_column().
+    "productivity_dev": {
+        "column": "yield_t_ha_dev",
+        "aggregation": "mean",
+        "unit": "t/ha_dev",
+    },
 }
 
 
 def resolve_target(target: str) -> tuple[str, str, str]:
-    """Return (target_column, aggregation, unit) for a registered target name."""
+    """Return (target_column, aggregation, unit) for a target name."""
     spec = TARGET_SPECS.get(target)
     if spec is None:
         choices = ", ".join(TARGET_SPECS)
         raise ValueError(f"Unknown target {target!r}; expected one of: {choices}")
     return spec["column"], spec["aggregation"], spec["unit"]
+
+
+def resolve_target_bundle(target: str) -> dict:
+    """
+    Resolve a training target.
+
+    Returns dict with:
+      target, target_names, target_columns, aggregations, units, num_outputs
+    Lists have length 1; scalar aliases are also set
+    (target_column, aggregation, target_unit).
+    """
+    col, agg, unit = resolve_target(target)
+    return {
+        "target": target,
+        "target_names": [target],
+        "target_columns": [col],
+        "aggregations": [agg],
+        "units": [unit],
+        "num_outputs": 1,
+        "target_column": col,
+        "aggregation": agg,
+        "target_unit": unit,
+    }
 
 
 def resolve_inference_target(
@@ -154,7 +184,7 @@ def resolve_inference_target(
     config_path = run_config.get("config_path", "training/config.json")
     raise ValueError(
         f"Cannot determine training target from {config_path} or checkpoint. "
-        "Re-train with --target total|total_adj|productivity."
+        "Re-train with --target total|total_adj|productivity|productivity_dev."
     )
 
 
@@ -235,12 +265,34 @@ def resolve_pixel_chunk_size(
     return resolve_inference_chunk_size(run_config, chunk_size)
 
 
-def aggregate_pixels(predictions: torch.Tensor, aggregation: str) -> torch.Tensor:
-    if aggregation == "sum":
-        return predictions.sum(dim=0)
-    if aggregation == "mean":
-        return predictions.mean(dim=0)
-    raise ValueError(f"aggregation must be 'sum' or 'mean', got {aggregation!r}")
+def aggregate_pixels(
+    predictions: torch.Tensor,
+    aggregation: str | list[str] | tuple[str, ...] = "sum",
+) -> torch.Tensor:
+    """Aggregate pixel predictions [N, C] → [C] with per-dim sum/mean."""
+    if isinstance(aggregation, str):
+        if aggregation == "sum":
+            return predictions.sum(dim=0)
+        if aggregation == "mean":
+            return predictions.mean(dim=0)
+        raise ValueError(f"aggregation must be 'sum' or 'mean', got {aggregation!r}")
+
+    aggs = list(aggregation)
+    summed = predictions.sum(dim=0)
+    n = float(predictions.shape[0])
+    if len(aggs) == 1:
+        return summed if aggs[0] == "sum" else summed / n
+    if len(aggs) != int(summed.numel()):
+        raise ValueError(
+            f"Got {summed.numel()} prediction dims but {len(aggs)} aggregations"
+        )
+    out = summed.clone()
+    for i, agg in enumerate(aggs):
+        if agg == "mean":
+            out[i] = out[i] / n
+        elif agg != "sum":
+            raise ValueError(f"aggregation must be 'sum' or 'mean', got {agg!r}")
+    return out
 
 
 def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
@@ -312,9 +364,15 @@ def regression_metrics(y_pred, y_true, *, target_column: str = "production_t"):
     r2 = 1 - (ss_res / (ss_tot + 1e-10))
 
     # MAPE: Filter out values where y_true is too small (less than 1% of mean or absolute threshold)
-    # This prevents division by near-zero values that cause MAPE to explode
+    # This prevents division by near-zero values that cause MAPE to explode.
+    # Deviation targets cross zero often — MAPE is usually NaN / unreliable there.
     mean_y_true = np.mean(np.abs(y_true))
-    floor = 0.1 if target_column == "yield_t_ha" else 100.0
+    if target_column == "yield_t_ha":
+        floor = 0.1
+    elif target_column == "yield_t_ha_dev":
+        floor = 0.5
+    else:
+        floor = 100.0
     threshold = max(mean_y_true * 0.01, floor)
     mape_mask = np.abs(y_true) >= threshold
     if mape_mask.sum() > 0:
@@ -329,6 +387,58 @@ def regression_metrics(y_pred, y_true, *, target_column: str = "production_t"):
     return {"rmse": rmse, "mae": mae, "r2": r2, "mape": mape}
 
 
+def _metric_prefix_for_column(target_column: str) -> str:
+    if target_column == "yield_t_ha":
+        return "prod"
+    if target_column == "yield_t_ha_dev":
+        return "prod_dev"
+    if target_column == "production_t_s2_adj":
+        return "total_adj"
+    if target_column == "production_t":
+        return "total"
+    return "out"
+
+
+def regression_metrics_bundle(
+    y_pred,
+    y_true,
+    *,
+    target_columns: str | list[str] | tuple[str, ...],
+):
+    """
+    Metrics for one or more output heads.
+
+    The first column fills rmse/mae/r2/mape for trainlog compatibility.
+    Additional columns add prefixed keys (e.g. r2_total_adj).
+    """
+    if isinstance(target_columns, str):
+        cols = [target_columns]
+    else:
+        cols = list(target_columns)
+
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    y_true = np.asarray(y_true, dtype=np.float64)
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+
+    if y_pred.shape[1] != len(cols):
+        raise ValueError(
+            f"y_pred has {y_pred.shape[1]} dims but {len(cols)} target columns"
+        )
+
+    out: dict = {}
+    for i, col in enumerate(cols):
+        m = regression_metrics(y_pred[:, i], y_true[:, i], target_column=col)
+        if i == 0:
+            out.update(m)
+        prefix = _metric_prefix_for_column(col)
+        for k, v in m.items():
+            out[f"{k}_{prefix}"] = v
+    return out
+
+
 class AggregatedMSELoss(nn.Module):
     """Loss: aggregate pixel predictions per municipality (sum or mean), compare to target."""
 
@@ -337,8 +447,8 @@ class AggregatedMSELoss(nn.Module):
         reduction="mean",
         target_mean=None,
         target_std=None,
-        aggregation: str = "sum",
-        target_column: str = "production_t",
+        aggregation: str | list[str] | tuple[str, ...] = "sum",
+        target_column: str | list[str] | tuple[str, ...] = "production_t",
     ):
         super().__init__()
         self.reduction = reduction
@@ -349,11 +459,24 @@ class AggregatedMSELoss(nn.Module):
         self.aggregation = aggregation
         self.target_column = target_column
 
+    def _norm_stats_tensors(self, ref: torch.Tensor):
+        mean = self.target_mean
+        std = self.target_std
+        if not torch.is_tensor(mean):
+            mean = torch.as_tensor(mean, dtype=ref.dtype, device=ref.device)
+        else:
+            mean = mean.to(device=ref.device, dtype=ref.dtype)
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, dtype=ref.dtype, device=ref.device)
+        else:
+            std = std.to(device=ref.device, dtype=ref.dtype)
+        return mean, std
+
     def forward(self, predictions_list, targets, num_pixels_list=None):
         """
         Args:
             predictions_list: List of tensors, one per municipality [num_pixels, num_outputs]
-            targets: [batch_size] - Municipality-level targets (already normalized if normalize=True)
+            targets: [batch_size] or [batch_size, num_outputs] (already normalized if normalize=True)
         """
         aggregated_predictions = []
         for pred in predictions_list:
@@ -366,11 +489,10 @@ class AggregatedMSELoss(nn.Module):
         if targets.dim() > 1 and targets.size(1) == 1:
             targets = targets.squeeze(1)
 
-        # Normalize predictions if normalization is enabled (targets are already normalized)
         if self.normalize:
-            aggregated = (aggregated - self.target_mean) / self.target_std
+            mean, std = self._norm_stats_tensors(aggregated)
+            aggregated = (aggregated - mean) / std
 
-        # Compute loss directly on normalized values
         loss = self.mse(aggregated, targets)
 
         if self.reduction == "mean":
@@ -600,6 +722,13 @@ def test_epoch_aggregated(
     batch_total = len(dataloader)
     epoch_start = time.perf_counter()
 
+    def _to_stats_tensor(stat, ref: torch.Tensor):
+        if stat is None:
+            return None
+        if not torch.is_tensor(stat):
+            return torch.as_tensor(stat, dtype=ref.dtype, device=ref.device)
+        return stat.to(device=ref.device, dtype=ref.dtype)
+
     with torch.no_grad():
         for idx, (municipalities, targets, num_pixels_list, years) in enumerate(
             dataloader
@@ -641,23 +770,23 @@ def test_epoch_aggregated(
             )
             if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
                 aggregated_preds = aggregated_preds.squeeze(1)
+            if targets.dim() > 1 and targets.size(1) == 1:
+                targets = targets.squeeze(1)
 
             if target_mean is not None and target_std is not None:
-                aggregated_preds_normalized = (
-                    aggregated_preds - target_mean
-                ) / target_std
-                aggregated_preds = (
-                    aggregated_preds_normalized * target_std + target_mean
-                )
-                targets = targets * target_std + target_mean
+                mean_t = _to_stats_tensor(target_mean, aggregated_preds)
+                std_t = _to_stats_tensor(target_std, aggregated_preds)
+                aggregated_preds_normalized = (aggregated_preds - mean_t) / std_t
+                aggregated_preds = aggregated_preds_normalized * std_t + mean_t
+                targets = targets * std_t + mean_t
 
             all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
             all_targets.append(targets.cpu().numpy())
 
         all_aggregated_preds = np.concatenate(all_aggregated_preds)
         all_targets = np.concatenate(all_targets)
-        scores = regression_metrics(
-            all_aggregated_preds, all_targets, target_column=target_column
+        scores = regression_metrics_bundle(
+            all_aggregated_preds, all_targets, target_columns=target_column
         )
 
     return losses.avg, scores

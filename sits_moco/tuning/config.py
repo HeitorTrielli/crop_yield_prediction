@@ -18,7 +18,7 @@ OBJECTIVES = {
     "test_loss": {"mode": "min", "column": "testloss", "log": "testlog"},
 }
 
-SEARCH_STRATEGIES = ("grid", "random")
+SEARCH_STRATEGIES = ("grid", "random", "list")
 
 BOOL_PARAMS = frozenset(
     {
@@ -63,6 +63,8 @@ INT_PARAMS = frozenset(
         "auto_pixel_chunk_size_step",
         "auto_chunks_per_grad_narrow_threshold",
         "auto_chunks_per_grad_refine_radius",
+        "min_images",
+        "min_months",
     }
 )
 
@@ -74,6 +76,12 @@ FLOAT_PARAMS = frozenset(
         "model_dropout",
         "auto_chunks_per_grad_vram_frac",
         "auto_chunks_per_grad_vram_target_frac",
+        "min_coverage_ratio",
+        "max_coverage_ratio",
+        "train_mid_yield_keep_fraction",
+        "train_mid_yield_lo",
+        "train_mid_yield_hi",
+        "train_mid_yield_bin_width",
     }
 )
 
@@ -120,9 +128,16 @@ def load_study_config(path: Path | str) -> dict:
         raise ValueError("search.parameters must be a mapping")
 
     n_trials = search.get("n_trials")
+    explicit_trials = search.get("trials")
     if strategy == "random":
         if n_trials is None or int(n_trials) < 1:
             raise ValueError("random search requires search.n_trials >= 1")
+    elif strategy == "list":
+        if not isinstance(explicit_trials, list) or not explicit_trials:
+            raise ValueError("list search requires a non-empty search.trials list")
+        for i, trial in enumerate(explicit_trials):
+            if not isinstance(trial, dict):
+                raise ValueError(f"search.trials[{i}] must be a mapping")
     elif parameters:
         for pname, spec in parameters.items():
             if not isinstance(spec, dict):
@@ -135,6 +150,11 @@ def load_study_config(path: Path | str) -> dict:
     training_script = cfg.get("training_script", "main_yield_regression_polars.py")
     seed_offset = int(cfg.get("seed_offset", 0))
 
+    moco_raw = cfg.get("moco")
+    moco_cfg = None
+    if moco_raw is not None:
+        moco_cfg = deepcopy(_require_mapping(moco_raw, "moco"))
+
     return {
         "name": name,
         "objective": objective,
@@ -144,12 +164,14 @@ def load_study_config(path: Path | str) -> dict:
             "strategy": strategy,
             "n_trials": int(n_trials) if n_trials is not None else None,
             "parameters": deepcopy(parameters or {}),
+            "trials": deepcopy(explicit_trials) if explicit_trials is not None else None,
             "seed": int(search.get("seed", 42)),
         },
         "output_dir": str(output_dir),
         "training_script": str(training_script),
         "seed_offset": seed_offset,
         "config_path": str(path.resolve()),
+        "moco": moco_cfg,
     }
 
 

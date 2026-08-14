@@ -51,10 +51,16 @@ def generate_trials(search: dict) -> list[dict[str, Any]]:
     """
     Return a list of parameter dicts to merge onto study base config.
 
-    search keys: strategy, n_trials, parameters, seed
+    search keys: strategy, n_trials, parameters, trials, seed
     """
     strategy = search["strategy"]
     parameters: dict = search.get("parameters") or {}
+
+    if strategy == "list":
+        trials = [dict(t) for t in (search.get("trials") or [])]
+        if not trials:
+            raise ValueError("list search requires a non-empty search.trials list")
+        return _filter_invalid_trials(trials, search)
 
     if not parameters:
         return [{}]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -33,9 +34,17 @@ if str(REPO_ROOT) not in sys.path:
 
 from tuning.collect import best_epoch_metrics, trial_row
 from tuning.config import load_study_config, merge_trial_params
+from tuning.moco_ensure import ensure_moco_checkpoint, predict_moco_checkpoint_path
 from tuning.resume import plan_trial_resume
 from tuning.runner import apply_resume_params, predict_run_dir, run_trial_subprocess
 from tuning.search import generate_trials
+from run_paths import ensure_dir
+
+
+def _safe_run_tag(name: str) -> str:
+    """Filesystem-safe short tag for embedding the study name in run suffixes."""
+    tag = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    return tag or "study"
 
 
 def study_output_dir(cfg: dict) -> Path:
@@ -78,13 +87,13 @@ def _print_trial_finished(trial_id: str, finished: str, started: str | None) -> 
 
 
 def _save_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(path.parent, quiet=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def _append_jsonl(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(path.parent, quiet=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -177,10 +186,10 @@ def _pick_best(df: pd.DataFrame, objective: str, spec: dict) -> dict | None:
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = load_study_config(args.config)
     study_dir = study_output_dir(cfg)
-    study_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(study_dir)
 
-    # Snapshot study config
-    shutil.copy2(args.config, study_dir / "study_config.yaml")
+    # Snapshot study config (copyfile: WSL /mnt/c rejects copy2 utime)
+    shutil.copyfile(args.config, study_dir / "study_config.yaml")
 
     trials = generate_trials({**cfg["search"], "base": cfg["base"]})
     if args.max_trials is not None:
@@ -190,6 +199,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Objective: {cfg['objective']} ({cfg['objective_spec']['mode']} {cfg['objective_spec']['column']})")
     print(f"Strategy: {cfg['search']['strategy']} -> {len(trials)} trial(s)")
     print(f"Output: {study_dir.resolve()}")
+    if cfg.get("moco"):
+        print("MoCo: auto-ensure enabled (train matching trunk before each yield trial)")
+    else:
+        print("MoCo: auto-ensure disabled (use base.pretrained if set)")
 
     succeeded_ids = set()
     if args.skip_completed and not args.rerun_all:
@@ -213,12 +226,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             continue
 
         merged = merge_trial_params(cfg["base"], sampled)
-        merged["suffix"] = merged.get("suffix") or f"tune_{trial_id}"
+        # Include study name so different studies never reuse the same run_dir
+        # (e.g. both would otherwise write tune_trial_001 and collide).
+        merged["suffix"] = merged.get("suffix") or (
+            f"tune_{_safe_run_tag(cfg['name'])}_{trial_id}"
+        )
         if "seed" in merged:
             merged["seed"] = int(merged["seed"]) + int(cfg.get("seed_offset", 0))
 
         trial_dir = study_dir / trial_id
-        trial_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(trial_dir)
         _save_json(trial_dir / "params.json", merged)
 
         print(f"\n[{trial_id}] params: {json.dumps(sampled, sort_keys=True)}")
@@ -292,6 +309,57 @@ def cmd_run(args: argparse.Namespace) -> int:
                     f"[{trial_id}] WARNING: trainlog exists but no checkpoint found; "
                     "starting fresh (earlier epoch weights cannot be restored)"
                 )
+
+        # Fresh yield start (not resuming a yield ckpt): ensure matching MoCo exists.
+        moco_cfg = cfg.get("moco")
+        if moco_cfg and resume_plan is None:
+            expected_moco = predict_moco_checkpoint_path(
+                merged, moco_cfg, repo_root=repo_root
+            )
+            if args.dry_run:
+                print(f"[{trial_id}] would ensure MoCo: {expected_moco}")
+                train_params = dict(train_params)
+                train_params["pretrained"] = str(expected_moco)
+                merged["pretrained"] = str(expected_moco)
+            else:
+                try:
+                    moco_ckpt = ensure_moco_checkpoint(
+                        merged,
+                        moco_cfg,
+                        repo_root=repo_root,
+                        dry_run=False,
+                        capture_log=trial_dir / "moco_stdout.log",
+                    )
+                except RuntimeError as exc:
+                    finished = _utc_now_iso()
+                    print(f"[{trial_id}] FAILED MoCo ensure: {exc}")
+                    _print_trial_finished(trial_id, finished, started)
+                    record = {
+                        "trial_id": trial_id,
+                        "status": "completed",
+                        "params": merged,
+                        "sampled": sampled,
+                        "outcome": {
+                            "status": "moco_failed",
+                            "error": str(exc),
+                            "returncode": 1,
+                            "run_dir": str(run_dir.resolve()),
+                        },
+                        "started_at_utc": started,
+                        "finished_at_utc": finished,
+                        "resumed_from_checkpoint": None,
+                    }
+                    _append_jsonl(study_dir / "trials.jsonl", record)
+                    df = _update_summary(study_dir)
+                    best = _pick_best(df, cfg["objective"], cfg["objective_spec"])
+                    if best:
+                        _save_json(study_dir / "best_trial.json", best)
+                    continue
+                print(f"[{trial_id}] MoCo pretrained: {moco_ckpt}")
+                train_params = dict(train_params)
+                train_params["pretrained"] = str(moco_ckpt)
+                merged["pretrained"] = str(moco_ckpt)
+                _save_json(trial_dir / "params.json", merged)
 
         if args.dry_run:
             if resume_plan is not None:

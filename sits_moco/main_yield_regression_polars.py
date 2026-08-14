@@ -25,8 +25,15 @@ from datasets.feature_layout import feature_layout_choices
 from datasets.uscrops_aggregated_npy_polars import (
     DEFAULT_MAX_COVERAGE_RATIO,
     DEFAULT_MIN_COVERAGE_RATIO,
+    DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+    DEFAULT_TRAIN_MID_YIELD_HI,
+    DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+    DEFAULT_TRAIN_MID_YIELD_LO,
+    PRODUCTIVITY_DEV_COL,
     USCropsAggregatedNPY,
+    ensure_productivity_dev_column,
     filter_yield_df_by_coverage,
+    undersample_train_mid_yield_band,
 )
 from models.weight_init import weight_init_regression
 from run_paths import (
@@ -48,7 +55,7 @@ from utils_aggregated import (
     AggregatedMSELoss,
     aggregated_collate_fn,
     regression_metrics,
-    resolve_target,
+    resolve_target_bundle,
     stnet_regression_input_dim_from_state_dict,
     test_epoch_aggregated,
     train_epoch_aggregated,
@@ -73,6 +80,8 @@ DEFAULT_WORKERS = 4
 def target_run_prefix(target: str) -> str:
     if target == "productivity":
         return "Productivity"
+    if target == "productivity_dev":
+        return "ProductivityDev"
     if target == "total_adj":
         return "TotalAdj"
     return "Total"
@@ -255,6 +264,52 @@ def parse_args():
         help="Do not filter yield CSV rows by coverage_ratio (default behavior)",
     )
     parser.add_argument(
+        "--train-mid-yield-keep-fraction",
+        type=float,
+        default=DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+        help=(
+            "Train-only: randomly keep this fraction of rows whose yield_t_ha is in "
+            "[--train-mid-yield-lo, --train-mid-yield-hi), applied per 0.25 t/ha bin "
+            "to preserve shape (default: disabled). Example: 0.52"
+        ),
+    )
+    parser.add_argument(
+        "--train-mid-yield-lo",
+        type=float,
+        default=DEFAULT_TRAIN_MID_YIELD_LO,
+        help="Lower bound (inclusive) for mid-yield train undersample (default: 3.0)",
+    )
+    parser.add_argument(
+        "--train-mid-yield-hi",
+        type=float,
+        default=DEFAULT_TRAIN_MID_YIELD_HI,
+        help="Upper bound (exclusive) for mid-yield train undersample (default: 4.25)",
+    )
+    parser.add_argument(
+        "--train-mid-yield-bin-width",
+        type=float,
+        default=DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+        help="Bin width (t/ha) for mid-yield undersample shape preservation (default: 0.25)",
+    )
+    parser.add_argument(
+        "--min-images",
+        type=int,
+        default=0,
+        help=(
+            "Drop pixels with fewer than this many valid daily images "
+            "(spectral band present; default: 0 = keep all). Example: 10"
+        ),
+    )
+    parser.add_argument(
+        "--min-months",
+        type=int,
+        default=0,
+        help=(
+            "Drop pixels with fewer than this many distinct season months "
+            "with at least one valid image (default: 0 = keep all). Example: 5"
+        ),
+    )
+    parser.add_argument(
         "--target",
         type=str,
         required=True,
@@ -262,7 +317,8 @@ def parse_args():
         help=(
             "Municipality label: 'total' = production_t (tons, sum pixels); "
             "'total_adj' = production_t_s2_adj (tons scaled to S2 coverage, sum pixels); "
-            "'productivity' = yield_t_ha (t/ha, mean pixels)"
+            "'productivity' = yield_t_ha (t/ha, mean pixels); "
+            "'productivity_dev' = yield_t_ha minus per-year train mean (t/ha_dev)"
         ),
     )
     parser.add_argument(
@@ -305,8 +361,9 @@ def parse_args():
         help=(
             "Explicit per-pixel inputs to STNet: "
             "'spectral' = 10 S2 bands only; "
-            "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy). "
-            "See datasets/feature_layout.py to add layouts (e.g. ET)."
+            "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy); "
+            "'spectral_xavier_climate' = rain + cum ETo/Rs/Tmax/Tmin (requires 17-channel .npy). "
+            "See datasets/feature_layout.py."
         ),
     )
     parser.add_argument(
@@ -465,7 +522,15 @@ def parse_args():
         else resolve_datapath()
     )
     args.yield_csv = Path(args.yield_csv).expanduser() if args.yield_csv else YIELD_CSV
-    args.target_column, args.aggregation, args.target_unit = resolve_target(args.target)
+    bundle = resolve_target_bundle(args.target)
+    args.target_names = bundle["target_names"]
+    args.target_columns = bundle["target_columns"]
+    args.aggregations = bundle["aggregations"]
+    args.units = bundle["units"]
+    args.num_outputs = int(bundle["num_outputs"])
+    args.target_column = bundle["target_column"]
+    args.aggregation = bundle["aggregation"]
+    args.target_unit = bundle["target_unit"]
 
     if args.no_coverage_filter:
         args.min_coverage_ratio = None
@@ -585,19 +650,17 @@ def compute_target_statistics(
     *,
     min_coverage_ratio=DEFAULT_MIN_COVERAGE_RATIO,
     max_coverage_ratio=DEFAULT_MAX_COVERAGE_RATIO,
+    train_mid_yield_keep_fraction=DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+    train_mid_yield_lo=DEFAULT_TRAIN_MID_YIELD_LO,
+    train_mid_yield_hi=DEFAULT_TRAIN_MID_YIELD_HI,
+    train_mid_yield_bin_width=DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+    seed=DEFAULT_SEED,
 ):
     """
     Compute mean and std of training targets for normalization.
-    Only uses training data from years where we have imagery data.
-    Automatically excludes test years (marked as 'test' in split column).
-
-    Args:
-        yield_csv: Path to yield CSV file
-        datapath: Path to dataset directory (to find available years)
-        harvest_years: Optional set of harvest years; intersects with years that have imagery.
-        min_coverage_ratio / max_coverage_ratio: Optional coverage_ratio band
-            (default: None / no filter). Example: 0.8 and 1.2.
-            (None disables that bound; both None disables filtering).
+    ``target_column`` may be a single column name or a list of columns.
+    Returns ``(mean, std, productivity_dev_meta)`` — scalars or lists,
+    plus optional metadata when ``yield_t_ha_dev`` is derived in-memory.
     """
 
     print(f"Computing target statistics from {yield_csv}...")
@@ -611,15 +674,43 @@ def compute_target_statistics(
         min_ratio=min_coverage_ratio,
         max_ratio=max_coverage_ratio,
     )
-
-    yield_col = target_column
-    if yield_col not in yield_df.columns:
-        hint = ""
-        if yield_col == "production_t_s2_adj":
-            hint = " Run scripts/compute_imagery_area_coverage.py first."
-        raise ValueError(
-            f"Yield CSV missing {yield_col!r}.{hint} Available: {list(yield_df.columns)}"
+    if harvest_years is not None and "year" in yield_df.columns:
+        hset = sorted({int(y) for y in harvest_years})
+        before_y = len(yield_df)
+        yield_df = yield_df.filter(pl.col("year").is_in(hset))
+        print(
+            f"  Restricted yield CSV to harvest years {hset}: "
+            f"{len(yield_df)}/{before_y} rows"
         )
+    yield_df = undersample_train_mid_yield_band(
+        yield_df,
+        keep_fraction=train_mid_yield_keep_fraction,
+        yield_lo=train_mid_yield_lo,
+        yield_hi=train_mid_yield_hi,
+        bin_width=train_mid_yield_bin_width,
+        seed=int(seed),
+    )
+
+    if isinstance(target_column, (list, tuple)):
+        yield_cols = list(target_column)
+    else:
+        yield_cols = [target_column]
+
+    productivity_dev_meta = None
+    if PRODUCTIVITY_DEV_COL in yield_cols:
+        yield_df, productivity_dev_meta = ensure_productivity_dev_column(
+            yield_df,
+            harvest_years=harvest_years,
+        )
+
+    for yield_col in yield_cols:
+        if yield_col not in yield_df.columns:
+            hint = ""
+            if yield_col == "production_t_s2_adj":
+                hint = " Run scripts/compute_imagery_area_coverage.py first."
+            raise ValueError(
+                f"Yield CSV missing {yield_col!r}.{hint} Available: {list(yield_df.columns)}"
+            )
 
     available_years = find_available_years(datapath)
     if not available_years:
@@ -651,25 +742,28 @@ def compute_target_statistics(
     train_df = train_df.filter(pl.col("split") == "train")
     print(f"  Filtered to train split: {len(train_df)} rows")
 
-    valid_targets = train_df.select(yield_col).drop_nulls()[yield_col].to_list()
-    valid_targets = [float(t) for t in valid_targets if t is not None and t != ""]
+    means = []
+    stds = []
+    for yield_col in yield_cols:
+        valid_targets = train_df.select(yield_col).drop_nulls()[yield_col].to_list()
+        valid_targets = [float(t) for t in valid_targets if t is not None and t != ""]
+        if len(valid_targets) == 0:
+            raise ValueError(f"No valid training targets found for {yield_col!r}!")
+        target_mean = float(np.mean(valid_targets))
+        target_std = float(np.std(valid_targets))
+        if target_std < 1e-6:
+            target_std = 1.0
+            print(f"  ⚠️  Warning: target_std for {yield_col} is very small, using 1.0")
+        print(
+            f"  {yield_col}: mean={target_mean:.2f}, std={target_std:.2f}, "
+            f"min={min(valid_targets):.2f}, max={max(valid_targets):.2f}, n={len(valid_targets)}"
+        )
+        means.append(target_mean)
+        stds.append(target_std)
 
-    if len(valid_targets) == 0:
-        raise ValueError("No valid training targets found!")
-
-    target_mean = float(np.mean(valid_targets))
-    target_std = float(np.std(valid_targets))
-
-    # Avoid division by zero
-    if target_std < 1e-6:
-        target_std = 1.0
-        print("  ⚠️  Warning: target_std is very small, using 1.0")
-
-    print(f"  Target statistics: mean={target_mean:.2f}, std={target_std:.2f}")
-    print(f"  Target range: min={min(valid_targets):.2f}, max={max(valid_targets):.2f}")
-    print(f"  Number of training samples used: {len(valid_targets)}")
-
-    return target_mean, target_std
+    if len(yield_cols) == 1:
+        return means[0], stds[0], productivity_dev_meta
+    return means, stds, productivity_dev_meta
 
 
 def _json_sanitize(obj):
@@ -816,16 +910,23 @@ def train(args):
             "valid/test dataloaders will be empty unless those years are included."
         )
 
-    target_mean, target_std = compute_target_statistics(
+    target_mean, target_std, productivity_dev_meta = compute_target_statistics(
         args.yield_csv,
         args.datapath,
         args.target_column,
         harvest_years=args.harvest_years_set,
         min_coverage_ratio=args.min_coverage_ratio,
         max_coverage_ratio=args.max_coverage_ratio,
+        train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
+        train_mid_yield_lo=args.train_mid_yield_lo,
+        train_mid_yield_hi=args.train_mid_yield_hi,
+        train_mid_yield_bin_width=args.train_mid_yield_bin_width,
+        seed=args.seed,
     )
     print(
-        f"Target: {args.target} ({args.target_column}, {args.aggregation} over pixels)"
+        f"Target: {args.target} "
+        f"(columns={args.target_columns}, aggregations={args.aggregations}, "
+        f"units={args.units}, num_outputs={args.num_outputs})"
     )
 
     print("=> creating dataloader (Polars-optimized)")
@@ -850,6 +951,12 @@ def train(args):
         target_column=args.target_column,
         min_coverage_ratio=args.min_coverage_ratio,
         max_coverage_ratio=args.max_coverage_ratio,
+        min_images=args.min_images,
+        min_months=args.min_months,
+        train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
+        train_mid_yield_lo=args.train_mid_yield_lo,
+        train_mid_yield_hi=args.train_mid_yield_hi,
+        train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         **dl_opts,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
@@ -869,6 +976,12 @@ def train(args):
         target_column=args.target_column,
         min_coverage_ratio=args.min_coverage_ratio,
         max_coverage_ratio=args.max_coverage_ratio,
+        min_images=args.min_images,
+        min_months=args.min_months,
+        train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
+        train_mid_yield_lo=args.train_mid_yield_lo,
+        train_mid_yield_hi=args.train_mid_yield_hi,
+        train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         **dl_opts,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
@@ -888,6 +1001,12 @@ def train(args):
         target_column=args.target_column,
         min_coverage_ratio=args.min_coverage_ratio,
         max_coverage_ratio=args.max_coverage_ratio,
+        min_images=args.min_images,
+        min_months=args.min_months,
+        train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
+        train_mid_yield_lo=args.train_mid_yield_lo,
+        train_mid_yield_hi=args.train_mid_yield_hi,
+        train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         **dl_opts,
     )
 
@@ -903,7 +1022,7 @@ def train(args):
     model_kw = model_kwargs_from_args(args)
     model = STNetRegression(
         input_dim=input_dim,
-        num_outputs=1,
+        num_outputs=int(args.num_outputs),
         max_seq_len=args.sequencelength,
         **model_kw,
     ).to(device)
@@ -917,6 +1036,8 @@ def train(args):
 
     # Load pretrained model weights (will load full state later if resuming)
     pretrained_checkpoint = None
+    moco_weight_init = False
+    moco_init_state = None
     if args.pretrained:
         pretrained_path = Path(args.pretrained)
         print(f"Loading pretrained model from {pretrained_path}")
@@ -924,38 +1045,87 @@ def train(args):
             pretrained_path, map_location=device, weights_only=False
         )
 
-        # Load all weights including decoder (for regression checkpoints)
         pretrain_state = pretrained_checkpoint["model_state"]
         model_dict = model.state_dict()
+        path_looks_moco = "moco" in str(pretrained_path).lower()
+        has_encoder_q = any(k.startswith("encoder_q.") for k in pretrain_state)
+        moco_weight_init = path_looks_moco or has_encoder_q
 
-        state_dict = {k: v for k, v in pretrain_state.items() if k in model_dict.keys()}
-        missing_keys = set(model_dict.keys()) - set(state_dict.keys())
-        unexpected_keys = set(state_dict.keys()) - set(model_dict.keys())
+        if moco_weight_init:
+            # MoCo: remap encoder_q.* → trunk; skip MoCo projection head / PE buffer.
+            # Do not resume epoch/optimizer from the contrastive checkpoint.
+            state_dict = {}
+            skipped_shape = []
+            for k, v in pretrain_state.items():
+                if not k.startswith("encoder_q."):
+                    continue
+                if (
+                    k.startswith("encoder_q.decoder")
+                    or k.startswith("encoder_q.classification")
+                    or k.startswith("encoder_q.position_enc.pe")
+                ):
+                    continue
+                new_k = k[len("encoder_q.") :]
+                if new_k not in model_dict:
+                    continue
+                if tuple(model_dict[new_k].shape) != tuple(v.shape):
+                    skipped_shape.append(
+                        (new_k, tuple(v.shape), tuple(model_dict[new_k].shape))
+                    )
+                    continue
+                state_dict[new_k] = v
 
-        if missing_keys:
+            load_result = model.load_state_dict(state_dict, strict=False)
             print(
-                f"  ⚠️  Missing keys (will use initialized values): {list(missing_keys)[:5]}..."
+                f"  ✓ MoCo encoder init: loaded {len(state_dict)}/{len(model_dict)} "
+                "matching tensors (fresh optimizer/epoch)"
             )
-        if unexpected_keys:
-            print(
-                f"  ⚠️  Unexpected keys (will be ignored): {list(unexpected_keys)[:5]}..."
-            )
-
-        load_result = model.load_state_dict(state_dict, strict=False)
-        if load_result.missing_keys:
-            print(f"  ⚠️  Missing keys after load: {load_result.missing_keys[:5]}...")
-        if load_result.unexpected_keys:
-            print(
-                f"  ⚠️  Unexpected keys after load: {load_result.unexpected_keys[:5]}..."
-            )
-        print(f"  ✓ Loaded {len(state_dict)}/{len(model_dict)} model parameters")
-
-        decoder_keys = [k for k in state_dict.keys() if "decoder" in k]
-        if decoder_keys:
-            print(f"  ✓ Loaded decoder weights: {len(decoder_keys)} parameters")
+            if skipped_shape:
+                print(
+                    f"  ⚠️  Skipped {len(skipped_shape)} tensors due to shape mismatch "
+                    f"(e.g. input_dim / d_model): {skipped_shape[:4]}..."
+                )
+            if load_result.missing_keys:
+                print(
+                    f"  ℹ️  Random init for {len(load_result.missing_keys)} keys "
+                    f"(incl. regression head): {list(load_result.missing_keys)[:5]}..."
+                )
+            pretrained_checkpoint = None  # never treat MoCo ckpt as resume
+            # Snapshot so VRAM probe reinit cannot wipe MoCo encoder weights.
+            moco_init_state = {
+                k: v.detach().clone() for k, v in model.state_dict().items()
+            }
         else:
-            print("  ⚠️  Warning: No decoder weights found in checkpoint!")
+            # Yield / classification resume: load matching keys including decoder
+            state_dict = {
+                k: v for k, v in pretrain_state.items() if k in model_dict.keys()
+            }
+            missing_keys = set(model_dict.keys()) - set(state_dict.keys())
+            unexpected_keys = set(state_dict.keys()) - set(model_dict.keys())
 
+            if missing_keys:
+                print(
+                    f"  ⚠️  Missing keys (will use initialized values): {list(missing_keys)[:5]}..."
+                )
+            if unexpected_keys:
+                print(
+                    f"  ⚠️  Unexpected keys (will be ignored): {list(unexpected_keys)[:5]}..."
+                )
+
+            load_result = model.load_state_dict(state_dict, strict=False)
+            if load_result.missing_keys:
+                print(f"  ⚠️  Missing keys after load: {load_result.missing_keys[:5]}...")
+            if load_result.unexpected_keys:
+                print(
+                    f"  ⚠️  Unexpected keys after load: {load_result.unexpected_keys[:5]}..."
+                )
+            print(f"  ✓ Loaded {len(state_dict)}/{len(model_dict)} model parameters")
+
+            decoder_keys = [k for k in state_dict.keys() if "decoder" in k]
+            if decoder_keys:
+                print(f"  ✓ Loaded decoder weights: {len(decoder_keys)} parameters")
+            else:
+                print("  ⚠️  Warning: No decoder weights found in checkpoint!")
     model.modelname = build_run_name(
         target=args.target,
         model_class_name=model.__class__.__name__,
@@ -1087,13 +1257,25 @@ def train(args):
         ck_target_std = checkpoint.get("target_std")
         normalization_stats_match = None
         ck_target_column = checkpoint.get("target_column")
-        if ck_target_column is not None and ck_target_column != args.target_column:
+        if ck_target_column is not None and list(
+            ck_target_column if isinstance(ck_target_column, (list, tuple)) else [ck_target_column]
+        ) != list(
+            args.target_column
+            if isinstance(args.target_column, (list, tuple))
+            else [args.target_column]
+        ):
             raise ValueError(
                 f"Checkpoint target_column={ck_target_column!r} does not match "
                 f"--target {args.target!r} ({args.target_column!r})"
             )
         ck_aggregation = checkpoint.get("aggregation")
-        if ck_aggregation is not None and ck_aggregation != args.aggregation:
+        if ck_aggregation is not None and list(
+            ck_aggregation if isinstance(ck_aggregation, (list, tuple)) else [ck_aggregation]
+        ) != list(
+            args.aggregation
+            if isinstance(args.aggregation, (list, tuple))
+            else [args.aggregation]
+        ):
             raise ValueError(
                 f"Checkpoint aggregation={ck_aggregation!r} does not match "
                 f"--target {args.target!r} ({args.aggregation!r})"
@@ -1182,7 +1364,11 @@ def train(args):
             weight_decay=args.weight_decay,
         )
 
-    if args.auto_chunks_per_grad and args.pretrained is not None:
+    if (
+        args.auto_chunks_per_grad
+        and args.pretrained is not None
+        and not moco_weight_init
+    ):
         from training.pipeline import restore_auto_chunk_pipeline_from_prior_session
 
         requested_cpg = int(args.chunks_per_grad)
@@ -1210,6 +1396,14 @@ def train(args):
     elif args.auto_chunks_per_grad:
         from training.vram_adjuster import resolve_chunks_per_grad_before_training
 
+        def _weight_reset_after_probe(m):
+            if moco_init_state is not None:
+                m.load_state_dict(moco_init_state, strict=True)
+            else:
+                from training.vram_adjuster import reinitialize_training_weights
+
+                reinitialize_training_weights(m)
+
         optimizer = resolve_chunks_per_grad_before_training(
             args=args,
             device=device,
@@ -1220,7 +1414,10 @@ def train(args):
             target_mean=target_mean,
             target_std=target_std,
             make_optimizer=_make_optimizer,
+            weight_reset_fn=_weight_reset_after_probe,
         )
+        if moco_init_state is not None:
+            print("  ✓ Restored MoCo encoder init after VRAM auto-chunk probe")
 
     chunk_pipeline_config = None
     resolver = getattr(args, "_chunks_per_grad_resolver", None)
@@ -1261,8 +1458,21 @@ def train(args):
             "yield_target_column": args.target_column,
             "municipality_aggregation": args.aggregation,
             "target_unit": args.target_unit,
-            "target_mean": float(target_mean),
-            "target_std": float(target_std),
+            "target_names": list(args.target_names),
+            "num_outputs": int(args.num_outputs),
+            "target_mean": (
+                [float(x) for x in target_mean]
+                if isinstance(target_mean, (list, tuple))
+                else float(target_mean)
+            ),
+            "target_std": (
+                [float(x) for x in target_std]
+                if isinstance(target_std, (list, tuple))
+                else float(target_std)
+            ),
+            "productivity_dev_baseline": productivity_dev_meta,
+            "min_images": int(args.min_images),
+            "min_months": int(args.min_months),
             "num_train_municipalities": len(traindataloader.dataset),
             "num_valid_municipalities": len(valdataloader.dataset),
             "num_test_municipalities": len(testdataloader.dataset),
@@ -1465,10 +1675,16 @@ def get_aggregated_dataloader(
     target_std=None,
     harvest_years=None,
     feature_layout: str = "spectral",
-    target_column: str = "production_t",
+    target_column: str | list[str] | tuple[str, ...] = "production_t",
     *,
     min_coverage_ratio=DEFAULT_MIN_COVERAGE_RATIO,
     max_coverage_ratio=DEFAULT_MAX_COVERAGE_RATIO,
+    min_images: int = 0,
+    min_months: int = 0,
+    train_mid_yield_keep_fraction=DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+    train_mid_yield_lo=DEFAULT_TRAIN_MID_YIELD_LO,
+    train_mid_yield_hi=DEFAULT_TRAIN_MID_YIELD_HI,
+    train_mid_yield_bin_width=DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
     npy_cache_size: int = 20,
     pin_memory: bool = True,
     persistent_workers: bool = False,
@@ -1494,6 +1710,12 @@ def get_aggregated_dataloader(
         npy_cache_size=npy_cache_size,
         min_coverage_ratio=min_coverage_ratio,
         max_coverage_ratio=max_coverage_ratio,
+        min_images=min_images,
+        min_months=min_months,
+        train_mid_yield_keep_fraction=train_mid_yield_keep_fraction,
+        train_mid_yield_lo=train_mid_yield_lo,
+        train_mid_yield_hi=train_mid_yield_hi,
+        train_mid_yield_bin_width=train_mid_yield_bin_width,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0
@@ -1529,10 +1751,11 @@ def get_aggregated_dataloader(
 
     meta = dict(
         ndims=dataset.input_feature_dim,
-        num_outputs=1,
+        num_outputs=int(dataset.num_outputs),
         num_municipalities=len(dataset),
         use_xavier=dataset.use_xavier,
         feature_layout=dataset.feature_layout,
+        target_columns=list(dataset.target_columns),
     )
 
     return dataloader, meta

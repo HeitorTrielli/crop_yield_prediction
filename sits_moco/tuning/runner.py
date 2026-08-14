@@ -10,12 +10,13 @@ from typing import Any
 
 from tuning.config import BOOL_PARAMS, coerce_param_types
 
-from run_paths import run_dir_for_experiment
+from run_paths import ensure_dir, run_dir_for_experiment
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TARGET_PREFIX = {
     "productivity": "Productivity",
+    "productivity_dev": "ProductivityDev",
     "total_adj": "TotalAdj",
     "total": "Total",
 }
@@ -63,6 +64,14 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "datapath": ("--datapath",),
     "yield_csv": ("--yield-csv",),
     "seed": ("--seed",),
+    "min_coverage_ratio": ("--min-coverage-ratio",),
+    "max_coverage_ratio": ("--max-coverage-ratio",),
+    "train_mid_yield_keep_fraction": ("--train-mid-yield-keep-fraction",),
+    "train_mid_yield_lo": ("--train-mid-yield-lo",),
+    "train_mid_yield_hi": ("--train-mid-yield-hi",),
+    "train_mid_yield_bin_width": ("--train-mid-yield-bin-width",),
+    "min_images": ("--min-images",),
+    "min_months": ("--min-months",),
     "pretrained": ("--pretrained",),
     "schedule": ("--schedule",),
     "pixel_chunk_size": ("--pixel-chunk-size",),
@@ -184,7 +193,7 @@ def run_trial_subprocess(
 
     stdout_path = capture_log
     if stdout_path is not None:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(stdout_path.parent, quiet=True)
         log_mode = "a" if append_log and stdout_path.is_file() else "w"
         with open(stdout_path, log_mode, encoding="utf-8") as log_f:
             if log_mode == "a":

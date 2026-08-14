@@ -16,7 +16,7 @@
 # After changing base recipe (LR, epochs, …), rerun all trials:
 #   python run_tuning_study.py run tuning/studies/productivity_architecture.yaml --rerun-all
 
-name: productivity_architecture
+name: productivity_architecture_xavier
 
 objective: val_r2
 
@@ -26,7 +26,7 @@ output_dir: ./results/tuning
 base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
-  feature_layout: spectral
+  feature_layout: spectral_xavier
   yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
   no_coverage_filter: true
   logdir: ./results
@@ -34,7 +34,7 @@ base:
   epochs: 100
   workers: 20
   sequencelength: 45
-  batchsize: 74
+  batchsize: 40
   learning_rate: 5.0e-4
   weight_decay: 5.0e-4
   sample_ratio: 1.0

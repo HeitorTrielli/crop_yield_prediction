@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Download Brazilian soybean Sentinel-2 daily imagery from Google Earth Engine.
+Download Brazilian soybean Sentinel-1 or Landsat daily imagery from Google Earth Engine.
+
+Same pipeline as download_soy_gee_drive.py (GEE → Drive → local raw/), but for:
+  - Sentinel-1 IW GRD (VV/VH, dB), optional ASCENDING/DESCENDING filter
+  - Landsat 8/9 Collection 2 Tier-1 Level-2 surface reflectance (scaled)
+
+By default exports on a shared 30 m EPSG:4326 pixel grid (Projection.atScale) so
+S1/Landsat pixels align with S2 downloads that use the same alignment. Pass
+--s2-reference path/to/s2.tif to lock exactly to an existing S2 GeoTIFF grid.
 
 Uses MapBiomas year-X soy classification to mask pixels. By default fetches the
 soybean growth cycle Oct (X-1)--Mar (X); optional --start-date/--end-date override.
-Exports to Google Drive, then downloads the exact GEE files to local .../raw/ and deletes them from Drive (no merge).
-To merge raw tiles into .tiff later, use preprocessing/merge_gee_tiles_to_tiff.py (raw files are never deleted locally).
-Output: raw_tiff/{year_start}-{year_end}/{municipality}/raw/<exact GEE filename>.
-Per-municipality download_log.csv (date, status, note) for retries and progress.
-
-No-data convention: masked pixels (no S2 coverage, clouds, non-soy) are written as
-NO_DATA_VALUE (-9999) and the TIFF nodata tag is set so downstream (clip, training)
-can exclude them and only use real observations.
 
 Usage:
-  python data_download/download_soy_gee_drive.py --shapefile path/to/municipality.shp --season-year 2024
-  python data_download/download_soy_gee_drive.py --shapefile a.shp --shapefile b.shp --start-date 2023-10-01 --end-date 2024-03-31
-  python data_download/download_soy_gee_drive.py --shapefile-dir path/to/shapefiles --season-year 2024 --max-download-workers 4
+  python data_download/download_s1_landsat_gee_drive.py --sensor s1 --shapefile path/to/mun.shp --season-year 2024
+  python data_download/download_s1_landsat_gee_drive.py --sensor s1 --shapefile-dir files/shapefiles --season-year 2024 --resolution 30
+  python data_download/download_s1_landsat_gee_drive.py --sensor s1 --shapefile a.shp --season-year 2024 --s2-reference path/to/s2.tif
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import csv
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Optional
@@ -41,9 +41,12 @@ from drive_api import (
     list_files_in_folder,
 )
 from gee_export import (
-    build_daily_image,
+    build_daily_landsat_image,
+    build_daily_s1_image,
+    crs_transform_from_reference_tiff,
     get_aligned_crs_transform,
-    get_dates_with_s2_scenes,
+    get_dates_with_landsat_scenes,
+    get_dates_with_s1_scenes,
     start_export_task,
 )
 
@@ -51,11 +54,33 @@ from gee_export import (
 # Constants
 # -----------------------------------------------------------------------------
 DEFAULT_CREDENTIALS_DIR = Path("data")
+SENSOR_DEFAULTS = {
+    "s1": {
+        "resolution": 30,
+        "output_dir": Path("files/raw_tiff_s1"),
+        "drive_folder": "GEE_Soy_Export_S1",
+    },
+    "landsat": {
+        "resolution": 30,
+        "output_dir": Path("files/raw_tiff_landsat"),
+        "drive_folder": "GEE_Soy_Export_Landsat",
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download Brazilian soy daily S2 imagery via GEE → Drive → local."
+        description=(
+            "Download Brazilian soy daily Sentinel-1 or Landsat imagery "
+            "via GEE → Drive → local."
+        )
+    )
+    parser.add_argument(
+        "--sensor",
+        type=str,
+        required=True,
+        choices=["s1", "landsat"],
+        help="Imagery source: s1 (Sentinel-1 GRD) or landsat (L8+L9 C2 L2)",
     )
     shape_group = parser.add_mutually_exclusive_group(required=True)
     shape_group.add_argument(
@@ -69,7 +94,10 @@ def parse_args() -> argparse.Namespace:
         "--shapefile-dir",
         type=Path,
         dest="shapefile_dir",
-        help="Directory of municipality folders (e.g. files/shapefiles/); each subfolder is a municipality code with a .shp (one run per shapefile found)",
+        help=(
+            "Directory of municipality folders; each subfolder is a municipality "
+            "code with a .shp"
+        ),
     )
     parser.add_argument(
         "--season-year",
@@ -95,44 +123,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resolution",
         type=int,
-        default=30,
-        help="Export scale in meters (default: 30). Used in output path and GEE export.",
+        default=None,
+        help="Export scale in meters (default: 30 for s1 and landsat). Used for aligned grid.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("files/raw_tiff"),
-        help="Base output directory (default: files/raw_tiff)",
+        default=None,
+        help="Base output directory (default: files/raw_tiff_s1 or files/raw_tiff_landsat)",
     )
     parser.add_argument(
         "--raw-dir",
         type=Path,
         default=None,
-        help="Directory to save raw GEE files (default: {output_dir}/{year_start}-{year_end}/{municipality}/raw).",
+        help=(
+            "Directory to save raw GEE files "
+            "(default: {output_dir}/{year_start}-{year_end}/{municipality}/raw)."
+        ),
     )
     parser.add_argument(
         "--drive-folder",
         type=str,
-        default="GEE_Soy_Export",
-        help="Google Drive folder name for temporary exports (default: GEE_Soy_Export)",
+        default=None,
+        help="Google Drive folder for temporary exports (sensor-specific default)",
+    )
+    parser.add_argument(
+        "--s2-reference",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Sentinel-2 GeoTIFF whose CRS/transform/dimensions pin the export "
+            "grid (exact pixel match to that file). If omitted, uses a global "
+            "EPSG:4326 grid at --resolution via Projection.atScale (same grid for all "
+            "municipalities/sensors at that scale)."
+        ),
+    )
+    parser.add_argument(
+        "--no-align-grid",
+        action="store_true",
+        help="Disable fixed crsTransform (legacy scale+region export; pixels may not match S2)",
     )
     parser.add_argument(
         "--gee-project",
         type=str,
         default="soybean-yield-prediction",
-        help="GEE project ID (default: from ee.Initialize or default project)",
+        help="GEE project ID",
     )
     parser.add_argument(
         "--cloud-pct",
         type=float,
         default=20.0,
-        help="Max scene cloud percentage (metadata filter) for S2 scenes and for 'dates with coverage' query (default: 20)",
+        help="Max scene cloud cover %% for Landsat metadata filter (default: 20; ignored for s1)",
     )
     parser.add_argument(
-        "--cloud-score-threshold",
-        type=float,
-        default=0.60,
-        help="Cloud Score+ clear pixel threshold (default: 0.60)",
+        "--orbit-pass",
+        type=str,
+        default=None,
+        choices=["ASCENDING", "DESCENDING"],
+        help="Optional Sentinel-1 orbit pass filter (ignored for landsat)",
     )
     parser.add_argument(
         "--max-download-workers",
@@ -152,22 +200,25 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Seconds between GEE task polls (default: 30)",
     )
-    parser.add_argument(
-        "--no-align-grid",
-        action="store_true",
-        help=(
-            "Disable fixed crsTransform. Default is a global EPSG:4326 grid at "
-            "--resolution (Projection.atScale) so S2 aligns with S1/Landsat exports."
-        ),
-    )
     args = parser.parse_args()
 
-    # Resolve shapefile list
+    defaults = SENSOR_DEFAULTS[args.sensor]
+    if args.resolution is None:
+        args.resolution = defaults["resolution"]
+    if args.output_dir is None:
+        args.output_dir = defaults["output_dir"]
+    if args.drive_folder is None:
+        args.drive_folder = defaults["drive_folder"]
+
+    if args.s2_reference is not None:
+        args.s2_reference = Path(args.s2_reference).resolve()
+        if not args.s2_reference.is_file():
+            parser.error(f"--s2-reference not found: {args.s2_reference}")
+
     if args.shapefile_dir is not None:
         d = Path(args.shapefile_dir).resolve()
         if not d.is_dir():
             parser.error(f"--shapefile-dir is not a directory: {d}")
-        # One folder per municipality; each folder contains that municipality's .shp
         args.shapefiles = []
         for subdir in sorted(d.iterdir()):
             if subdir.is_dir():
@@ -180,7 +231,6 @@ def parse_args() -> argparse.Namespace:
         args.shapefiles = args.shapefiles or []
         args.shapefiles = [Path(p).resolve() for p in args.shapefiles]
 
-    # Date range: either (start_date, end_date) or season_year
     if args.start_date is not None or args.end_date is not None:
         if args.start_date is None or args.end_date is None:
             parser.error("Both --start-date and --end-date must be set together")
@@ -198,9 +248,6 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-# -----------------------------------------------------------------------------
-# Date range: soy cycle (Oct X-1 to Mar X) or custom start/end
-# -----------------------------------------------------------------------------
 def output_path_for_date(
     output_dir: Path,
     municipality_code: str,
@@ -208,7 +255,7 @@ def output_path_for_date(
     year_end: int,
     date_str: str,
 ) -> Path:
-    """Path for one day: {output_dir}/{year_start}-{year_end}/{municipality}/{municipality}_{year}_{month}_{day}.tiff"""
+    """Path for one day under {output_dir}/{year_start}-{year_end}/{municipality}/."""
     y, m, d = date_str.split("-")
     return (
         output_dir
@@ -224,7 +271,7 @@ def raw_dir_for_date(
     year_start: int,
     year_end: int,
 ) -> Path:
-    """Directory for raw GEE tiles: {output_dir}/{year_start}-{year_end}/{municipality}/raw/"""
+    """Directory for raw GEE tiles."""
     return output_dir / f"{year_start}-{year_end}" / municipality_code / "raw"
 
 
@@ -233,10 +280,7 @@ def download_raw_only(
     file_list: list[tuple[str, str]],
     raw_dir: Path,
 ) -> None:
-    """
-    Download all Drive files with their exact GEE filenames into raw_dir. No merge, no delete from Drive.
-    file_list: [(file_id, file_name), ...].
-    """
+    """Download Drive files with exact GEE filenames into raw_dir."""
     raw_dir = Path(raw_dir).resolve()
     raw_dir.mkdir(parents=True, exist_ok=True)
     for fid, fname in file_list:
@@ -244,7 +288,7 @@ def download_raw_only(
 
 
 def _date_from_raw_filename(municipality_code: str, filename: str) -> str | None:
-    """Extract YYYY-MM-DD from GEE raw filename (e.g. 4100103_2022-10-02.tif or 4100103_2022-10-02-0000000000-0000009984.tif)."""
+    """Extract YYYY-MM-DD from GEE raw filename."""
     stem = Path(filename).stem
     if not stem.startswith(municipality_code + "_"):
         return None
@@ -257,14 +301,14 @@ def _date_from_raw_filename(municipality_code: str, filename: str) -> str | None
         and len(parts[2]) == 10
         and parts[2].isdigit()
     ):
-        return parts[0]  # 2022-10-02
+        return parts[0]
     if len(suffix) == 10 and suffix[4] == "-" and suffix[7] == "-":
         return suffix
     return None
 
 
 def raw_has_date(raw_dir: Path, municipality_code: str, date_str: str) -> bool:
-    """True if raw_dir contains at least one file for that date (GEE prefix = municipality_code_date_str)."""
+    """True if raw_dir contains at least one file for that date."""
     if not raw_dir.exists():
         return False
     prefix = f"{municipality_code}_{date_str}"
@@ -300,9 +344,59 @@ def get_date_list_from_args(args: argparse.Namespace) -> tuple[list[str], int, i
     return dates, min(years), max(years)
 
 
-# -----------------------------------------------------------------------------
-# Main: single municipality run + batch entrypoint
-# -----------------------------------------------------------------------------
+def _dates_with_coverage(ee_geometry: ee.Geometry, args: argparse.Namespace, start_date: str, end_date: str) -> list[str]:
+    """Query GEE for dates that have at least one scene for the selected sensor."""
+    if args.sensor == "s1":
+        return get_dates_with_s1_scenes(
+            ee_geometry, start_date, end_date, orbit_pass=args.orbit_pass
+        )
+    return get_dates_with_landsat_scenes(
+        ee_geometry, start_date, end_date, cloud_pct=args.cloud_pct
+    )
+
+
+def _build_daily_image(
+    ee_geometry: ee.Geometry,
+    date_str: str,
+    mapbiomas_year: int,
+    args: argparse.Namespace,
+) -> Optional[ee.Image]:
+    """Build one daily image for the selected sensor."""
+    if args.sensor == "s1":
+        return build_daily_s1_image(
+            ee_geometry,
+            date_str,
+            mapbiomas_year,
+            orbit_pass=args.orbit_pass,
+        )
+    return build_daily_landsat_image(
+        ee_geometry,
+        date_str,
+        mapbiomas_year,
+        cloud_pct=args.cloud_pct,
+    )
+
+
+def _resolve_export_grid(
+    args: argparse.Namespace,
+) -> tuple[Optional[str], Optional[list[float]], Optional[tuple[int, int]]]:
+    """
+    Return (crs, crs_transform, dimensions) for aligned export.
+
+    dimensions is only set when locking to a reference TIFF.
+    """
+    if args.no_align_grid:
+        return None, None, None
+    if args.s2_reference is not None:
+        crs, crs_transform, dimensions = crs_transform_from_reference_tiff(
+            args.s2_reference
+        )
+        return crs, crs_transform, dimensions
+    crs = "EPSG:4326"
+    crs_transform = get_aligned_crs_transform(args.resolution, crs=crs)
+    return crs, crs_transform, None
+
+
 def run_one_municipality(
     shapefile: Path,
     args: argparse.Namespace,
@@ -313,13 +407,16 @@ def run_one_municipality(
     run_start_time: float,
     total_municipalities: int,
     municipality_index: int,
+    export_crs: Optional[str] = None,
     export_crs_transform: Optional[list[float]] = None,
+    export_dimensions: Optional[tuple[int, int]] = None,
 ) -> tuple[list[str], list[dict]]:
     """Run export+download for one municipality. Returns (downloaded_dates, failed_entries)."""
     municipality_code = shapefile.stem
     output_mun_dir = args.output_dir / f"{year_start}-{year_end}" / municipality_code
     args.output_dir.mkdir(parents=True, exist_ok=True)
     mapbiomas_year = args.season_year if args.season_year is not None else year_end
+    sensor_label = "S1" if args.sensor == "s1" else "Landsat"
 
     log = lambda msg: print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
@@ -329,7 +426,6 @@ def run_one_municipality(
     geom = gdf.geometry.values[0]
     ee_geometry = ee.Geometry(geom.__geo_interface__)
 
-    # Progress: count already-downloaded days (raw/ only, no GEE)
     raw_d = (
         Path(args.raw_dir).resolve()
         if getattr(args, "raw_dir", None) is not None
@@ -347,16 +443,14 @@ def run_one_municipality(
         already_count = 0
     total_days_in_range = len(date_list)
 
-    # Only check dates where Sentinel-2 has at least one scene (one GEE query for whole range)
     start_date = date_list[0]
     end_date = date_list[-1]
-    log(f"Municipality {municipality_code}: querying dates with S2 coverage...")
-    dates_to_check = get_dates_with_s2_scenes(
-        ee_geometry, start_date, end_date, args.cloud_pct
-    )
+    log(f"Municipality {municipality_code}: querying dates with {sensor_label} coverage...")
+    dates_to_check = _dates_with_coverage(ee_geometry, args, start_date, end_date)
     log(
         f"Municipality {municipality_code} ({municipality_index + 1}/{total_municipalities}): "
-        f"{len(dates_to_check)} dates with possible S2 coverage (of {total_days_in_range} in range), "
+        f"{len(dates_to_check)} dates with possible {sensor_label} coverage "
+        f"(of {total_days_in_range} in range), "
         f"{already_count} already downloaded (elapsed: {time.time() - run_start_time:.0f}s)"
     )
 
@@ -367,24 +461,16 @@ def run_one_municipality(
     max_workers = max(1, args.max_download_workers)
 
     def poll_and_download() -> None:
-        """Process completed/failed tasks; download to raw/ then delete from Drive.
-        Only remove from pending_tasks on definitive GEE state (SUCCEEDED/COMPLETED/FAILED).
-        On download failure we log and remove (no retry this run); re-run script later to retry via resume step.
-        """
+        """Process completed/failed tasks; download to raw/ then delete from Drive."""
         task_list = ee.data.getTaskList()
-        to_remove_failed: list[str] = (
-            []
-        )  # tids with definitive FAILED (or success but no file to download)
-        download_jobs: list[tuple[str, list[tuple[str, str]], Path]] = (
-            []
-        )  # (tid, [(file_id, file_name), ...], local_path)
+        to_remove_failed: list[str] = []
+        download_jobs: list[tuple[str, list[tuple[str, str]], Path]] = []
         for task in task_list:
             tid = task.get("id")
             if tid not in pending_tasks:
                 continue
             state = task.get("state")
             date_str, file_prefix = pending_tasks[tid]
-            # Only act on definitive terminal states from GEE; ignore RUNNING, READY, etc.
             if state in ("SUCCEEDED", "COMPLETED"):
                 fid = get_folder_id_by_name(drive_service, args.drive_folder)
                 if not fid:
@@ -410,7 +496,6 @@ def run_one_municipality(
                     year_end,
                     date_str,
                 )
-                # All tiles for this date: (tid, [(file_id, file_name), ...], output_path)
                 file_list = [(c["id"], c["name"]) for c in candidates]
                 download_jobs.append((tid, file_list, local_path))
             elif state == "FAILED":
@@ -419,9 +504,7 @@ def run_one_municipality(
                 with failed_lock:
                     failed_entries.append({"date": date_str, "error": err})
                 to_remove_failed.append(tid)
-            # else: RUNNING, READY, etc. — do not remove; wait for definitive state
 
-        # Download in parallel; remove from pending on success or on failure (log only, no retry this run)
         successful_downloads: set[str] = set()
         download_failed_tids: set[str] = set()
         if download_jobs:
@@ -435,7 +518,6 @@ def run_one_municipality(
                         delete_file_from_drive(drive_service, fid)
                     return (tid, path, None)
                 except Exception as e:
-                    # Do not delete from Drive on failure — keep file so we can retry later (logged in failed_entries)
                     return (tid, path, str(e))
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -445,7 +527,8 @@ def run_one_municipality(
                     if err:
                         date_str = pending_tasks[tid][0]
                         log(
-                            f"Download failed for {path.name}: {err} (logged; re-run script later to retry)"
+                            f"Download failed for {path.name}: {err} "
+                            "(logged; re-run script later to retry)"
                         )
                         with failed_lock:
                             failed_entries.append({"date": date_str, "error": str(err)})
@@ -454,7 +537,6 @@ def run_one_municipality(
                         successful_downloads.add(tid)
                         log(f"Downloaded {path.name} -> raw/ (removed from Drive)")
 
-        # Remove on definitive outcome: GEE failed, download failed (log only), or download succeeded
         for tid in to_remove_failed:
             pending_tasks.pop(tid, None)
         for tid in download_failed_tids:
@@ -462,8 +544,6 @@ def run_one_municipality(
         for tid in successful_downloads:
             pending_tasks.pop(tid, None)
 
-    # Resume: download any files already on Drive from a previous run (e.g. after interrupt).
-    # Group by export prefix (GEE may have written multiple tiles per date: prefix-XXXXXXXXXX-YYYYYYYYYY.tif).
     dates_to_check_set = set(dates_to_check)
     fid = get_folder_id_by_name(drive_service, args.drive_folder)
     if fid:
@@ -475,7 +555,6 @@ def run_one_municipality(
             ):
                 continue
             stem = name.rsplit(".", 1)[0]
-            # Strip GEE tile suffix -NNNNNNNNNN-NNNNNNNNNN if present
             parts = stem.rsplit("-", 2)
             if (
                 len(parts) == 3
@@ -489,7 +568,6 @@ def run_one_municipality(
                 prefix = stem
             prefix_to_files.setdefault(prefix, []).append((f["id"], name))
         for prefix, file_list in prefix_to_files.items():
-            # prefix is e.g. state_41_2022-10-02 -> date_str = 2022-10-02
             suffix = prefix[len(municipality_code) + 1 :]
             if len(suffix) == 10 and suffix[4] == "-" and suffix[7] == "-":
                 date_str = suffix
@@ -516,11 +594,11 @@ def run_one_municipality(
                 for fid, _ in file_list:
                     delete_file_from_drive(drive_service, fid)
                 log(
-                    f"Resumed: downloaded {len(file_list)} raw tile(s) for {date_str} (removed from Drive)"
+                    f"Resumed: downloaded {len(file_list)} raw tile(s) for {date_str} "
+                    "(removed from Drive)"
                 )
             except Exception as e:
                 log(f"Resume download failed for {date_str}: {e}")
-                # Do not delete from Drive — keep file so we can retry later
 
     for date_str in dates_to_check:
         if raw_d.exists() and raw_has_date(raw_d, municipality_code, date_str):
@@ -528,14 +606,8 @@ def run_one_municipality(
 
         poll_and_download()
 
-        log(f"Building image for {date_str}...")
-        img = build_daily_image(
-            ee_geometry,
-            date_str,
-            mapbiomas_year,
-            args.cloud_pct,
-            args.cloud_score_threshold,
-        )
+        log(f"Building {sensor_label} image for {date_str}...")
+        img = _build_daily_image(ee_geometry, date_str, mapbiomas_year, args)
         if img is None:
             log(f"No imagery for {date_str}; skipping")
             continue
@@ -548,7 +620,9 @@ def run_one_municipality(
                 folder_name=args.drive_folder,
                 region=ee_geometry,
                 scale=args.resolution,
+                crs=export_crs or "EPSG:4326",
                 crs_transform=export_crs_transform,
+                dimensions=export_dimensions,
             )
         except Exception as e:
             log(f"Export start failed for {date_str}: {e}")
@@ -559,7 +633,6 @@ def run_one_municipality(
         pending_tasks[task_id] = (date_str, file_prefix)
         log(f"Started export for {date_str} (task {task_id})")
 
-    # Sleep in chunks so we don't sit silent for 60s (avoids being killed as "idle"); log once per cycle
     half = max(1, args.poll_interval // 2)
     try:
         while pending_tasks:
@@ -581,9 +654,6 @@ def run_one_municipality(
         )
         raise SystemExit(1)
 
-    # All GEE tasks are done and all files have been downloaded from Drive at this point.
-
-    # Build downloaded list from raw/ on disk (source of truth for status log)
     downloaded_dates = []
     if raw_d.exists():
         for f in raw_d.iterdir():
@@ -595,11 +665,10 @@ def run_one_municipality(
     final_count = len(downloaded_dates)
     elapsed = time.time() - run_start_time
     log(
-        f"Municipality {municipality_code} done: {final_count}/{total_days_in_range} raw date(s) (elapsed: {elapsed:.0f}s)"
+        f"Municipality {municipality_code} done: {final_count}/{total_days_in_range} "
+        f"raw date(s) (elapsed: {elapsed:.0f}s)"
     )
 
-    # Per-municipality log written only here, after all tasks ended and downloads completed
-    # (every attempted date and its status: success / failed / no_imagery)
     success_set = set(downloaded_dates)
     failed_by_date = {e["date"]: e.get("error", "") for e in failed_entries}
     log_path = output_mun_dir / "download_log.csv"
@@ -648,15 +717,24 @@ def main() -> None:
 
     drive_service = build_drive_service(args.credentials_dir)
 
-    export_crs_transform = None
-    if not getattr(args, "no_align_grid", False):
-        export_crs_transform = get_aligned_crs_transform(args.resolution)
-        log(
-            f"Using aligned export grid at {args.resolution}m: transform={export_crs_transform}"
+    sensor_label = "Sentinel-1" if args.sensor == "s1" else "Landsat 8/9"
+    export_crs, export_crs_transform, export_dimensions = _resolve_export_grid(args)
+    if export_crs_transform is not None:
+        align_note = (
+            f"aligned grid crs={export_crs}, transform={export_crs_transform}"
+            + (
+                f", dimensions={export_dimensions[0]}x{export_dimensions[1]}"
+                if export_dimensions
+                else ""
+            )
         )
-
+    else:
+        align_note = "legacy scale+region (no fixed crsTransform)"
     log(
-        f"Batch: {len(shapefiles)} municipality(ies), date range {date_list[0]}–{date_list[-1]} ({year_start}-{year_end}), {len(date_list)} days"
+        f"Batch ({sensor_label}): {len(shapefiles)} municipality(ies), "
+        f"date range {date_list[0]}–{date_list[-1]} ({year_start}-{year_end}), "
+        f"{len(date_list)} days, scale={args.resolution}m, drive={args.drive_folder}, "
+        f"{align_note}"
     )
 
     for i, shapefile in enumerate(shapefiles):
@@ -679,7 +757,9 @@ def main() -> None:
             run_start_time,
             len(shapefiles),
             i,
+            export_crs=export_crs,
             export_crs_transform=export_crs_transform,
+            export_dimensions=export_dimensions,
         )
         if raw_dir.exists():
             total_files_after += len(list(raw_dir.iterdir()))

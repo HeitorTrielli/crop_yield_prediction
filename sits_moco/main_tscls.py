@@ -199,7 +199,7 @@ def train(args):
 
     if not args.eval:
         log = list()
-        val_loss_min = np.Inf
+        val_loss_min = np.inf
         print(f"Training {model.modelname}")
         for epoch in range(args.epochs):
             if args.warmup_epochs > 0:

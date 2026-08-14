@@ -205,6 +205,15 @@ def _iter_tagged_chunks_with_mmap_lookahead(
 
             if municipality_data is None:
                 continue
+            muni_code = entries[i][1]
+            year = entries[i][2]
+            year_resolved = dataset._resolve_load_year(muni_code, year)
+            cache_key = dataset._resolve_npy_path(muni_code, year_resolved)
+            municipality_data = dataset.filter_municipality_data(
+                municipality_data, cache_key=cache_key
+            )
+            if municipality_data is None or len(municipality_data) == 0:
+                continue
             num_pixels = len(municipality_data)
             for start in range(0, num_pixels, chunk_size):
                 end = min(start + chunk_size, num_pixels)
@@ -240,11 +249,16 @@ def _iter_tagged_period_chunks_with_mmap_lookahead(
 
             if municipality_data is None:
                 continue
+            muni_code = entries[i][1]
+            year = entries[i][2]
+            year_resolved = dataset._resolve_load_year(muni_code, year)
+            cache_key = dataset._resolve_npy_path(muni_code, year_resolved)
             for pixel_chunk in dataset.iter_period_pixel_chunks_from_data(
                 municipality_data,
                 num_periods=num_periods,
                 chunk_size=chunk_size,
                 reference_date=reference_date,
+                cache_key=cache_key,
             ):
                 unpacked = unpack_pixel_chunk(pixel_chunk)
                 if unpacked is not None:

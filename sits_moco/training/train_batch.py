@@ -18,6 +18,55 @@ from training.accumulator import MunicipalityPixelAccumulator
 from training.log_util import log_training as _log_training
 
 
+def _as_1d(t: torch.Tensor) -> torch.Tensor:
+    t = t.squeeze()
+    if t.dim() == 0:
+        return t.unsqueeze(0)
+    return t.reshape(-1)
+
+
+def _stats_on(stat, ref: torch.Tensor):
+    if stat is None:
+        return None
+    if not torch.is_tensor(stat):
+        return torch.as_tensor(stat, dtype=ref.dtype, device=ref.device)
+    return stat.to(device=ref.device, dtype=ref.dtype)
+
+
+def _normalize_pred(pred: torch.Tensor, target_mean, target_std) -> torch.Tensor:
+    if target_mean is None or target_std is None:
+        return pred
+    mean = _stats_on(target_mean, pred)
+    std = _stats_on(target_std, pred)
+    return (pred - mean) / std
+
+
+def _partial_target(
+    target_normalized: torch.Tensor,
+    fraction_processed: float,
+    aggregation: str | list | tuple,
+) -> torch.Tensor:
+    """For sum heads, scale target by fraction of pixels seen; mean heads keep full target."""
+    if isinstance(aggregation, str):
+        if aggregation == "sum":
+            return (target_normalized * fraction_processed).to(torch.float32)
+        return target_normalized
+    out = target_normalized.clone().to(torch.float32)
+    aggs = list(aggregation)
+    if len(aggs) == 1:
+        aggs = aggs * int(out.numel())
+    for i, agg in enumerate(aggs):
+        if agg == "sum":
+            out[i] = out[i] * fraction_processed
+    return out
+
+
+def _fmt_agg(aggregation: str | list | tuple) -> str:
+    if isinstance(aggregation, str):
+        return ".2f" if aggregation == "mean" else ".0f"
+    return ".4g"
+
+
 def process_train_batch(
     *,
     model,
@@ -30,7 +79,7 @@ def process_train_batch(
     years,
     device: torch.device,
     args,
-    aggregation: str,
+    aggregation: str | list | tuple,
     target_mean,
     target_std,
     chunk_size: int,
@@ -57,6 +106,7 @@ def process_train_batch(
     chunk_debug = chunk_debug_syncs(args)
     chunks_per_grad = effective_chunks_per_grad(args)
     use_pipeline_h2d = pipeline_h2d(args, device)
+    log_fmt = _fmt_agg(aggregation)
 
     skip_muni_indices = scan_skip_municipalities(
         municipalities, targets, num_pixels_list
@@ -109,22 +159,11 @@ def process_train_batch(
                 flush=True,
             )
         if pixel_acc is not None and pixel_acc.valid and chunk_idx > 0:
-            municipality_agg = pixel_acc.value().squeeze()
-            if municipality_agg.dim() == 0:
-                municipality_agg = municipality_agg.unsqueeze(0)
-            elif municipality_agg.dim() > 1:
-                municipality_agg = municipality_agg.flatten()[0:1]
-
-            target_normalized = target.squeeze().to(torch.float32)
-            if target_normalized.dim() == 0:
-                target_normalized = target_normalized.unsqueeze(0)
-
-            municipality_agg_normalized = municipality_agg.to(torch.float32)
-            if target_mean is not None and target_std is not None:
-                municipality_agg_normalized = (
-                    municipality_agg_normalized - target_mean
-                ) / target_std
-
+            municipality_agg = _as_1d(pixel_acc.value())
+            target_normalized = _as_1d(target).to(torch.float32)
+            municipality_agg_normalized = _normalize_pred(
+                municipality_agg.to(torch.float32), target_mean, target_std
+            )
             final_loss = torch.nn.functional.mse_loss(
                 municipality_agg_normalized, target_normalized
             )
@@ -135,20 +174,33 @@ def process_train_batch(
                 )
             else:
                 if target_mean is not None and target_std is not None:
-                    target_denorm = target_normalized.item() * target_std + target_mean
-                    pred_denorm = (
-                        municipality_agg_normalized.item() * target_std + target_mean
-                    )
+                    mean_t = _stats_on(target_mean, target_normalized)
+                    std_t = _stats_on(target_std, target_normalized)
+                    target_denorm = target_normalized * std_t + mean_t
+                    pred_denorm = municipality_agg_normalized * std_t + mean_t
                 else:
-                    target_denorm = target_normalized.item()
-                    pred_denorm = municipality_agg_normalized.item()
+                    target_denorm = target_normalized
+                    pred_denorm = municipality_agg_normalized
                 total_loss += final_loss.item()
                 if vram_probe_state is None:
-                    fmt = ".2f" if aggregation == "mean" else ".0f"
                     timestamp = datetime.now().strftime("%H:%M:%S")
+                    if target_denorm.numel() == 1:
+                        tgt_s = f"{target_denorm.item():{log_fmt}}"
+                        pred_s = f"{pred_denorm.item():{log_fmt}}"
+                    else:
+                        tgt_s = (
+                            "["
+                            + ", ".join(f"{v:{log_fmt}}" for v in target_denorm.tolist())
+                            + "]"
+                        )
+                        pred_s = (
+                            "["
+                            + ", ".join(f"{v:{log_fmt}}" for v in pred_denorm.tolist())
+                            + "]"
+                        )
                     _log_training(
                         f"[{timestamp}] Muni {municipality_code}: "
-                        f"target={target_denorm:{fmt}}, pred={pred_denorm:{fmt}}, "
+                        f"target={tgt_s}, pred={pred_s}, "
                         f"chunks={chunk_idx}/{total_chunks}, loss={final_loss.item():.2e}"
                     )
 
@@ -158,7 +210,7 @@ def process_train_batch(
         current_muni = muni_idx
         municipality_code = municipalities[muni_idx]
         num_pixels = num_pixels_list[muni_idx]
-        target = targets[muni_idx : muni_idx + 1].to(device).float()
+        target = targets[muni_idx]
         pixel_acc = MunicipalityPixelAccumulator(aggregation)
         chunk_idx = 0
         total_chunks = (num_pixels + chunk_size - 1) // chunk_size
@@ -267,31 +319,18 @@ def process_train_batch(
                 muni_break = True
                 continue
 
-            municipality_agg = pixel_acc.value().squeeze()
-            if municipality_agg.dim() == 0:
-                municipality_agg = municipality_agg.unsqueeze(0)
-            elif municipality_agg.dim() > 1:
-                municipality_agg = municipality_agg.flatten()[0:1]
-
-            target_normalized = target.squeeze().to(torch.float32)
-            if target_normalized.dim() == 0:
-                target_normalized = target_normalized.unsqueeze(0)
-
-            municipality_agg_normalized = municipality_agg.to(torch.float32)
-            if target_mean is not None and target_std is not None:
-                municipality_agg_normalized = (
-                    municipality_agg_normalized - target_mean
-                ) / target_std
+            municipality_agg = _as_1d(pixel_acc.value())
+            target_normalized = _as_1d(target).to(torch.float32)
+            municipality_agg_normalized = _normalize_pred(
+                municipality_agg.to(torch.float32), target_mean, target_std
+            )
 
             fraction_processed = (
                 pixel_acc.pixel_count / num_pixels if num_pixels > 0 else 1.0
             )
-            if aggregation == "sum":
-                expected_partial_target = (
-                    target_normalized * fraction_processed
-                ).to(torch.float32)
-            else:
-                expected_partial_target = target_normalized
+            expected_partial_target = _partial_target(
+                target_normalized, fraction_processed, aggregation
+            )
 
             muni_loss = torch.nn.functional.mse_loss(
                 municipality_agg_normalized, expected_partial_target
@@ -302,8 +341,8 @@ def process_train_batch(
                     f"  ❌ DEBUG: Municipality {municipality_code} has invalid loss: {muni_loss.item()}"
                 )
                 print(
-                    f"      Expected partial target: {expected_partial_target.item():.4f}, "
-                    f"Pred: {municipality_agg_normalized.item():.4f}"
+                    f"      Expected partial target: {expected_partial_target.detach().cpu().tolist()}, "
+                    f"Pred: {municipality_agg_normalized.detach().cpu().tolist()}"
                 )
                 print(
                     f"      Chunks: {chunk_idx}/{total_chunks}, Fraction processed: {fraction_processed:.4f}"

@@ -25,10 +25,13 @@ from datasets.feature_layout import (
     feature_layout_input_dim,
     normalize_feature_layout,
 )
-from datasets.pixel_transform import DOY_CHANNEL
+from datasets.pixel_transform import (
+    DOY_CHANNEL,
+    scale_xavier_climate_extras,
+    scale_xavier_rain_channels,
+)
 from datasets.uscrops_aggregated_npy_polars import (
     _indices_first_n_months,
-    scale_xavier_rain_channels,
 )
 from models import STNetRegression
 from utils import recursive_todevice
@@ -461,7 +464,7 @@ def transform_pixel(
 ):
     """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY.
     If deterministic_head is True and x has more than sequencelength rows, keeps the earliest sequencelength rows.
-    ``input_dim`` must match the trained model (10 or 12 with Xavier).
+    ``input_dim`` must match the trained model (10, 12 with rain, or 16 with climate).
     """
     if seed is not None:
         np.random.seed(seed)
@@ -479,7 +482,13 @@ def transform_pixel(
 
     weight = getWeight(x_spec)
     x_spec_n = (x_spec - mean) / std
-    if input_dim == 12:
+    if input_dim == 16:
+        if c_in >= 17:
+            extra = scale_xavier_climate_extras(raw[:, 11:17])
+        else:
+            extra = np.zeros((t_len, 6), dtype=np.float32)
+        x = np.concatenate([x_spec_n, extra], axis=-1)
+    elif input_dim == 12:
         if c_in >= 13:
             rain = scale_xavier_rain_channels(raw[:, 11:13])
         else:
@@ -787,7 +796,13 @@ def reconstruct_spatial_predictions(
         return None, None, None, None, None, None, None
 
     print(f"  Loaded {muni_npy_file} shape={municipality_data.shape}")
-    if input_dim == 12 and municipality_data.shape[-1] < 13:
+    if input_dim == 16 and municipality_data.shape[-1] < 17:
+        print(
+            "  ⚠️  Warning: checkpoint uses spectral_xavier_climate (16 inputs) but .npy has "
+            f"{municipality_data.shape[-1]} channels per timestep. "
+            "Run data_download/append_xavier_climate_to_npy.py before heatmapping."
+        )
+    elif input_dim == 12 and municipality_data.shape[-1] < 13:
         print(
             "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
             f"{municipality_data.shape[-1]} channels per timestep. "

@@ -14,6 +14,7 @@ from .feature_layout import normalize_feature_layout, resolve_feature_layout
 
 DOY_CHANNEL = 10
 NUM_SPECTRAL_CHANNELS = 10
+NO_DATA_VALUE = -9999
 
 
 def scale_xavier_rain_channels(rain: np.ndarray) -> np.ndarray:
@@ -21,6 +22,28 @@ def scale_xavier_rain_channels(rain: np.ndarray) -> np.ndarray:
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
     out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
+    return out.astype(np.float32)
+
+
+def scale_xavier_climate_extras(extra: np.ndarray) -> np.ndarray:
+    """
+    Scale npy extras [..., 6] = rain(2) + cum ETo, Rs, Tmax, Tmin.
+
+    Rain uses the same scaling as scale_xavier_rain_channels.
+    Climate cumulatives are stored raw in .npy; divisors are approximate season totals.
+    """
+    out = np.asarray(extra, dtype=np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if out.shape[-1] < 6:
+        raise ValueError(
+            f"Expected at least 6 Xavier climate extras (rain+ETo/Rs/T), got {out.shape[-1]}"
+        )
+    out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
+    out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
+    out[..., 2] = np.clip(out[..., 2] / 1500.0, 0.0, 4.0)  # cum ETo (mm)
+    out[..., 3] = np.clip(out[..., 3] / 5000.0, 0.0, 4.0)  # cum Rs (MJ/m^2)
+    out[..., 4] = np.clip(out[..., 4] / 5000.0, 0.0, 4.0)  # cum Tmax (°C·day)
+    out[..., 5] = np.clip(out[..., 5] / 5000.0, -1.0, 4.0)  # cum Tmin (°C·day)
     return out.astype(np.float32)
 
 
@@ -67,7 +90,11 @@ class PixelTransform:
         """Normalized features (N,T,F), reflectance weights (N,T), DOY (N,T)."""
         _n, _t, c = chunk_arr.shape
         doy = chunk_arr[:, :, DOY_CHANNEL].astype(np.int32)
-        x_spec = chunk_arr[:, :, :NUM_SPECTRAL_CHANNELS].astype(np.float32) * 1e-4
+        x_spec = chunk_arr[:, :, :NUM_SPECTRAL_CHANNELS].astype(np.float32)
+        # Treat preprocess nodata (-9999 / non-finite) like 0 before reflectance scale.
+        # Leaving -9999 as-is yields ~-1 after *1e-4 and extreme z-scores.
+        invalid = (x_spec == NO_DATA_VALUE) | ~np.isfinite(x_spec)
+        x_spec = np.where(invalid, 0.0, x_spec) * 1e-4
         weight = self.getWeight_batch(x_spec)
         x_spec_n = (x_spec - self.mean) / self.std
         sl = self._extra_channels_slice
@@ -76,8 +103,13 @@ class PixelTransform:
             n_extra = hi - lo
             if c >= hi:
                 extra = chunk_arr[:, :, lo:hi].astype(np.float32)
+                extra = np.where(
+                    (extra == NO_DATA_VALUE) | ~np.isfinite(extra), 0.0, extra
+                )
                 if (lo, hi) == (11, 13):
                     extra = scale_xavier_rain_channels(extra)
+                elif (lo, hi) == (11, 17):
+                    extra = scale_xavier_climate_extras(extra)
                 else:
                     extra = np.nan_to_num(extra, nan=0.0, posinf=0.0, neginf=0.0)
             else:

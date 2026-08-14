@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -54,6 +54,17 @@ def reinitialize_training_weights(model: torch.nn.Module) -> None:
 
     base = model._orig_mod if hasattr(model, "_orig_mod") else model
     base.apply(weight_init_regression)
+
+
+def _reset_model_weights(
+    model: torch.nn.Module,
+    weight_reset_fn: Callable[[torch.nn.Module], None] | None = None,
+) -> None:
+    """Reset weights before a probe trial / after search (default: random init)."""
+    if weight_reset_fn is not None:
+        weight_reset_fn(model)
+    else:
+        reinitialize_training_weights(model)
 
 
 def max_pixels_per_backward(chunks_per_grad: int, pixel_chunk_size: int) -> int:
@@ -278,6 +289,7 @@ def _run_probe_trial(
     chunks_per_grad: int,
     pixel_chunk_size: int,
     product: int,
+    weight_reset_fn: Callable[[torch.nn.Module], None] | None = None,
 ) -> tuple[torch.optim.Optimizer, dict[str, float], bool]:
     """Run one backward-group probe. Returns (optimizer, pressure, fits)."""
     from utils_aggregated import run_training_vram_probe
@@ -285,7 +297,7 @@ def _run_probe_trial(
     resolver.probe_attempts += 1
     args.chunks_per_grad = chunks_per_grad
     args.pixel_chunk_size = pixel_chunk_size
-    reinitialize_training_weights(model)
+    _reset_model_weights(model, weight_reset_fn)
     optimizer = make_optimizer()
     cleanup_device_vram(device)
 
@@ -416,6 +428,7 @@ def _probe_candidate_index(
     idx: int,
     probed_indices: set[int],
     phase: str,
+    weight_reset_fn: Callable[[torch.nn.Module], None] | None = None,
 ) -> tuple[torch.optim.Optimizer, dict[str, Any] | None]:
     chunks, pixel, product = resolver.candidates[idx]
     existing = _trial_for_candidate(resolver, chunks, pixel)
@@ -437,6 +450,7 @@ def _probe_candidate_index(
         chunks_per_grad=chunks,
         pixel_chunk_size=pixel,
         product=product,
+        weight_reset_fn=weight_reset_fn,
     )
     probed_indices.add(idx)
     trial = resolver.search_trials[-1]
@@ -456,12 +470,16 @@ def resolve_chunks_per_grad_before_training(
     target_mean,
     target_std,
     make_optimizer,
+    weight_reset_fn: Callable[[torch.nn.Module], None] | None = None,
 ) -> torch.optim.Optimizer:
     """
     Search a coarse grid for the largest (chunks_per_grad, pixel_chunk_size) pair
     that fits dedicated VRAM.
 
     Mutates ``args.chunks_per_grad`` and ``args.pixel_chunk_size`` for all epochs.
+
+    ``weight_reset_fn`` restores training-start weights between probe trials and
+    after the search (e.g. MoCo encoder init). Default: random regression init.
     """
     resolver = init_chunks_per_grad_resolver(args)
     if resolver is None or not resolver.enabled:
@@ -514,6 +532,7 @@ def resolve_chunks_per_grad_before_training(
                     idx=idx,
                     probed_indices=probed_indices,
                     phase="narrow",
+                    weight_reset_fn=weight_reset_fn,
                 )
                 if trial is None:
                     continue
@@ -541,6 +560,7 @@ def resolve_chunks_per_grad_before_training(
             idx=mid,
             probed_indices=probed_indices,
             phase="binary",
+            weight_reset_fn=weight_reset_fn,
         )
         if trial is None:
             break
@@ -592,6 +612,7 @@ def resolve_chunks_per_grad_before_training(
                     idx=idx,
                     probed_indices=probed_indices,
                     phase="refine",
+                    weight_reset_fn=weight_reset_fn,
                 )
                 if trial is None:
                     continue
@@ -630,7 +651,7 @@ def resolve_chunks_per_grad_before_training(
     resolver.pixel_chunk_size = best_pixel
     args.chunks_per_grad = best_chunks
     args.pixel_chunk_size = best_pixel
-    reinitialize_training_weights(model)
+    _reset_model_weights(model, weight_reset_fn)
     optimizer = make_optimizer()
     cleanup_device_vram(device)
     return optimizer

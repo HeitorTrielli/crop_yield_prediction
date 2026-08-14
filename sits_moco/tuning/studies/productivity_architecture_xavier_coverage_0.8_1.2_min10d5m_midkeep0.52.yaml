@@ -1,0 +1,91 @@
+# Same top-5 architectures as productivity_architecture_xavier_coverage_0.8_1.2_min10d5m,
+# plus train-only mid-band yield undersampling:
+#   keep ~52% of train rows with yield_t_ha ∈ [3.0, 4.25), uniform per 0.25 t/ha bin
+#   (preserves histogram shape; tails and valid/test unchanged).
+#
+# Target: absolute productivity (yield_t_ha).
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_architecture_xavier_coverage_0.8_1.2_min10d5m_midkeep0.52.yaml --list-trials
+#
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_architecture_xavier_coverage_0.8_1.2_min10d5m_midkeep0.52.yaml --skip-completed
+
+name: productivity_architecture_xavier_coverage_0.8_1.2_min10d5m_midkeep0.52
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral_xavier
+  yield_csv: files/pam_soy_pr_2019_2025.csv
+  # Do NOT set no_coverage_filter — apply the band below at load time.
+  min_coverage_ratio: 0.8
+  max_coverage_ratio: 1.2
+  # Temporal pixel quality: drop sparse / short season coverage pixels.
+  min_images: 10
+  min_months: 5
+  # Train-only: scale down mid productivity band (~52% keep, shape preserved).
+  train_mid_yield_keep_fraction: 0.52
+  train_mid_yield_lo: 3.0
+  train_mid_yield_hi: 4.25
+  train_mid_yield_bin_width: 0.25
+  logdir: ./results
+  seed: 101010
+  epochs: 150
+  workers: 20
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 5.0e-4
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [20, 50]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 50
+  prefetch_chunks: 30
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
+  quiet_training: true
+  model_n_layers: 1
+
+search:
+  strategy: list
+
+  # Order matches prior testloss ranking (best → 5th).
+  trials:
+    - model_d_model: 96
+      model_n_head: 16
+      model_d_inner: 64
+      model_dropout: 0.4
+
+    - model_d_model: 96
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 64
+      model_dropout: 0.3
