@@ -317,3 +317,104 @@ def compute_rain_block_for_municipality(
             continue
 
     return out
+
+
+def load_pr_grid(nc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (pr[time,y,x], time_values, x_coord, y_coord) from a Xavier NetCDF."""
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+    p = Path(nc_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Xavier work copy missing: {p}")
+    with xr.open_dataset(os.fspath(p), decode_times=True, engine="netcdf4") as ds:
+        pr = ds["pr"]
+        if pr.ndim != 3:
+            raise ValueError(f"Expected 3D pr, got shape {pr.shape}")
+        da = pr.squeeze()
+        if "time" not in da.dims:
+            raise ValueError(f"pr dims {da.dims}: expected a 'time' dimension")
+        dim_names = list(da.dims)
+        if dim_names[0] != "time":
+            da = da.transpose("time", *[d for d in dim_names if d != "time"])
+        pr_vals = np.asarray(da.values, dtype=np.float32)
+        time_values = np.asarray(ds["time"].values)
+        x_da = ds["x"] if "x" in ds.coords else ds["longitude"]
+        y_da = ds["y"] if "y" in ds.coords else ds["latitude"]
+        x_coord = np.asarray(x_da.values, dtype=np.float64)
+        y_coord = np.asarray(y_da.values, dtype=np.float64)
+    return pr_vals, time_values, x_coord, y_coord
+
+
+def rain_channels_mean_at_lonlat(
+    pr_vals: np.ndarray,
+    time_values: np.ndarray,
+    x_coord: np.ndarray,
+    y_coord: np.ndarray,
+    year_range: str,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    obs_dates: list[date],
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Soy-pixel-weighted mean of Xavier rain, aligned to Sentinel-2 dates.
+
+    Each (lon, lat) is one soy pixel centroid. Pixels in the same Xavier cell
+    share a series; the municipal value is the mean over soy pixels.
+
+    Returns (channels [T,2], daily_mean_mm [T], n_xavier_cells).
+    Channel 0 = cumulative mm from Oct 1 through each S2 date.
+    Channel 1 = max consecutive dry days in (previous S2 date, this S2 date].
+    daily_mean_mm = soy-weighted pr on that calendar day only.
+    """
+    t = len(obs_dates)
+    out = np.full((t, N_RAIN_CHANNELS), np.nan, dtype=np.float32)
+    lon = np.asarray(lon, dtype=np.float64).ravel()
+    lat = np.asarray(lat, dtype=np.float64).ravel()
+    daily = np.full(t, np.nan, dtype=np.float32)
+    if t == 0 or lon.size == 0:
+        return out, daily, 0
+
+    window_start, window_end = climate_window_dates(year_range)
+    oct1 = window_start
+    ny, nx = pr_vals.shape[1], pr_vals.shape[2]
+    weights: dict[tuple[int, int], int] = {}
+    for i in range(lon.size):
+        try:
+            ix, iy = lonlat_to_pr_indices(float(lon[i]), float(lat[i]), x_coord, y_coord)
+        except Exception:
+            continue
+        if iy < 0 or iy >= ny or ix < 0 or ix >= nx:
+            continue
+        weights[(ix, iy)] = weights.get((ix, iy), 0) + 1
+    if not weights:
+        return out, daily, 0
+
+    acc = np.zeros((t, N_RAIN_CHANNELS), dtype=np.float64)
+    acc_day = np.zeros(t, dtype=np.float64)
+    day_w = np.zeros(t, dtype=np.float64)
+    wsum = 0.0
+    n_cells = 0
+    for (ix, iy), w in weights.items():
+        try:
+            pr_by_date = build_pr_lookup_for_cell(
+                pr_vals, time_values, ix, iy, window_start, window_end
+            )
+            if not any(np.isfinite(v) for v in pr_by_date.values()):
+                continue
+            cum, dsk = rain_channels_for_observations(obs_dates, oct1, pr_by_date)
+        except Exception:
+            continue
+        acc[:, 0] += w * cum.astype(np.float64)
+        acc[:, 1] += w * dsk.astype(np.float64)
+        wsum += w
+        n_cells += 1
+        for k, d in enumerate(obs_dates):
+            v = pr_by_date.get(d)
+            if v is None or not np.isfinite(v):
+                continue
+            acc_day[k] += w * float(v)
+            day_w[k] += w
+    if wsum <= 0:
+        return out, daily, 0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        daily = np.where(day_w > 0, acc_day / day_w, np.nan).astype(np.float32)
+    return (acc / wsum).astype(np.float32), daily, n_cells

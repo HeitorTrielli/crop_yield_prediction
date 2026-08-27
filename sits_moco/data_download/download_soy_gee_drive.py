@@ -41,9 +41,12 @@ from drive_api import (
     list_files_in_folder,
 )
 from gee_export import (
+    DEFAULT_GEE_ACCOUNT,
+    DEFAULT_GEE_PROJECT,
     build_daily_image,
     get_aligned_crs_transform,
     get_dates_with_s2_scenes,
+    initialize_gee,
     start_export_task,
 )
 
@@ -119,8 +122,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gee-project",
         type=str,
-        default="soybean-yield-prediction",
-        help="GEE project ID (default: from ee.Initialize or default project)",
+        default=DEFAULT_GEE_PROJECT,
+        help=f"GEE project ID (default: {DEFAULT_GEE_PROJECT})",
+    )
+    parser.add_argument(
+        "--gee-account",
+        type=str,
+        default=DEFAULT_GEE_ACCOUNT,
+        help=f"Google account for Earth Engine auth (default: {DEFAULT_GEE_ACCOUNT})",
     )
     parser.add_argument(
         "--cloud-pct",
@@ -634,17 +643,7 @@ def main() -> None:
     total_files_before = 0
     total_files_after = 0
 
-    try:
-        if args.gee_project:
-            ee.Initialize(project=args.gee_project)
-        else:
-            ee.Initialize()
-    except ee.EEException as e:
-        if "Please authenticate" in str(e) or "credentials" in str(e).lower():
-            sys.exit(
-                'GEE not authenticated. Run in a terminal: python -c "import ee; ee.Authenticate()"'
-            )
-        raise
+    initialize_gee(args.gee_project, args.gee_account)
 
     drive_service = build_drive_service(args.credentials_dir)
 

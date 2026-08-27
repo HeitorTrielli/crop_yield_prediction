@@ -17,10 +17,14 @@ class STNetRegression(nn.Module):
     """
     STNet model adapted for regression tasks.
 
+    The decoder emits **z-scores** of the municipal training target
+    (``(y − μ) / σ``). Bias 0 at init is climatology. Convert to original
+    units with ``z * σ + μ`` (see ``denormalize_head_output``).
+
     Changes from classification version:
     - Output layer outputs num_outputs (default 1) instead of num_classes
     - No softmax activation
-    - Returns continuous values instead of class logits
+    - Returns continuous z-scores instead of class logits
     """
 
     def __init__(

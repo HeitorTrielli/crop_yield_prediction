@@ -79,11 +79,16 @@ def predict_moco_modelname(
     return f"{name}_{suffix}"
 
 
-def arch_from_trial_params(trial_params: dict) -> dict[str, Any]:
+def arch_from_trial_params(
+    trial_params: dict, moco_cfg: dict | None = None
+) -> dict[str, Any]:
+    """Trunk fingerprint. ``moco.feature_layout`` overrides the yield layout."""
+    moco_cfg = moco_cfg or {}
+    layout = moco_cfg.get("feature_layout") or trial_params.get(
+        "feature_layout", "spectral"
+    )
     return {
-        "feature_layout": normalize_feature_layout(
-            trial_params.get("feature_layout", "spectral")
-        ),
+        "feature_layout": normalize_feature_layout(layout),
         "d_model": int(trial_params.get("model_d_model", 128)),
         "n_head": int(trial_params.get("model_n_head", 16)),
         "d_inner": int(trial_params.get("model_d_inner", 128)),
@@ -98,7 +103,7 @@ def predict_moco_run_dir(
     repo_root: Path | None = None,
 ) -> Path:
     repo_root = repo_root or REPO_ROOT
-    arch = arch_from_trial_params(trial_params)
+    arch = arch_from_trial_params(trial_params, moco_cfg)
     harvest_years = moco_cfg.get("harvest_years") or trial_params.get(
         "harvest_years", "2020,2021,2022,2023,2024"
     )
@@ -142,7 +147,7 @@ def build_moco_argv(
 ) -> list[str]:
     """Build subprocess argv for main_moco.py matching the yield trial trunk."""
     repo_root = repo_root or REPO_ROOT
-    arch = arch_from_trial_params(trial_params)
+    arch = arch_from_trial_params(trial_params, moco_cfg)
     harvest_years = moco_cfg.get("harvest_years") or trial_params.get(
         "harvest_years", "2020,2021,2022,2023,2024"
     )
@@ -220,12 +225,20 @@ def ensure_moco_checkpoint(
     """
     Return path to model_best.pth for this trial's MoCo fingerprint.
 
-    Trains MoCo via subprocess when the checkpoint is missing.
+    Trains MoCo via subprocess when the checkpoint is missing, unless
+    ``moco.reuse_only`` is true (then a missing file is an error).
     """
     repo_root = repo_root or REPO_ROOT
     ckpt = predict_moco_checkpoint_path(trial_params, moco_cfg, repo_root=repo_root)
     if ckpt.is_file():
         return ckpt.resolve()
+
+    if bool(moco_cfg.get("reuse_only", False)):
+        raise RuntimeError(
+            f"MoCo checkpoint missing and moco.reuse_only is set: {ckpt}. "
+            "Train that trunk on pixel .npy first "
+            "(e.g. productivity_top5_moco_parana); mega-pixel studies do not pretrain."
+        )
 
     argv = build_moco_argv(trial_params, moco_cfg, repo_root=repo_root)
     if dry_run:

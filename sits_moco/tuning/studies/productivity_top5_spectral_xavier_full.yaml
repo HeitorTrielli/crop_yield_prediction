@@ -1,12 +1,10 @@
-# Finetune the 5 best val_r2 architectures from productivity_first_real_tuning
-# (productivity_architecture_xavier) with MoCo encoder init matched per trial.
+# From-scratch pixel baseline with full Xavier inputs (rain + cum ETo/Rs/Tmax/Tmin).
+# Same five arches and training recipe as rain-from-scratch
+# (productivity_architecture_xavier / first_real_tuning). No MoCo.
 #
-# When `moco:` is set, the tuner trains (or reuses) a Paraná MoCo checkpoint whose
-# feature_layout + d_model/n_head/d_inner/n_layers match the yield trial before
-# finetuning. Dropout is not part of the MoCo fingerprint (trials 001 & 003 share
-# one MoCo). Unique arches in this list → 4 MoCo pretrains, then 5 yield runs.
+# Requires 17-channel pixel .npy under SITS_MOCO_DATAPATH (~/sits_moco_data/npy).
 #
-# Source ranking (val_r2):
+# Source ranking on rain-only (val_r2):
 #   trial_034  0.236   128/4/128 drop=0.4
 #   trial_024  0.202    64/16/128 drop=0.4
 #   trial_031  0.133   128/4/128 drop=0.3
@@ -14,44 +12,21 @@
 #   trial_008  0.121    96/8/64  drop=0.3
 #
 # Preview:
-#   python run_tuning_study.py show tuning/studies/productivity_top5_moco_parana.yaml --list-trials
+#   python run_tuning_study.py show tuning/studies/productivity_top5_spectral_xavier_full.yaml --list-trials
 #
-# Run (resumes incomplete yield trials; skips successful ones):
-#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana.yaml --skip-completed
-#
-# After MoCo recipe / matching change, restart yield trial_001 if it used an old ckpt:
-#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana.yaml --rerun-all
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_top5_spectral_xavier_full.yaml --skip-completed
 
-name: productivity_top5_moco_parana
+name: productivity_top5_spectral_xavier_full
 
 objective: val_r2
 
 output_dir: ./results/tuning
 
-# Paraná MoCo recipe (same scale as P_MoCoV2TransformerModel_RC_2020-2024_doy).
-# Arch + feature_layout come from each yield trial.
-moco:
-  model: transformer
-  rc: true
-  use_doy: true
-  useall: true
-  mlp: true
-  max_samples: 500000
-  epochs: 100
-  batchsize: 512
-  workers: 8
-  sequencelength: 70
-  learning_rate: 1.0e-3
-  weight_decay: 1.0e-4
-  seed: 111
-  model_dropout: 0.2
-  harvest_years: "2020,2021,2022,2023,2024"
-  logdir: ./results
-
 base:
   target: productivity
   harvest_years: "2020,2021,2022,2023,2024"
-  feature_layout: spectral_xavier
+  feature_layout: spectral_xavier_full
   yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
   no_coverage_filter: true
   logdir: ./results
@@ -65,7 +40,7 @@ base:
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [10, 75]
+  schedule: [15, 75]
   no_compile: true
   overwrite_run: true
   early_stop_patience: 10

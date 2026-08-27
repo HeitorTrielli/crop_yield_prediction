@@ -6,48 +6,28 @@ Used by USCropsAggregatedNPY and any script that loads preprocessed municipality
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
 from .datautils import getWeight_batch
+from .extra_scaler import (
+    DEFAULT_INPUT_SCALER_PATH,
+    InputScaler,
+    scale_xavier_climate_extras,
+    scale_xavier_rain_channels,
+)
 from .feature_layout import normalize_feature_layout, resolve_feature_layout
+from .feature_recipes import assemble_recipe, extras_from_chunk
 
 DOY_CHANNEL = 10
 NUM_SPECTRAL_CHANNELS = 10
 NO_DATA_VALUE = -9999
 
 
-def scale_xavier_rain_channels(rain: np.ndarray) -> np.ndarray:
-    out = np.asarray(rain, dtype=np.float32)
-    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-    out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
-    out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
-    return out.astype(np.float32)
-
-
-def scale_xavier_climate_extras(extra: np.ndarray) -> np.ndarray:
-    """
-    Scale npy extras [..., 6] = rain(2) + cum ETo, Rs, Tmax, Tmin.
-
-    Rain uses the same scaling as scale_xavier_rain_channels.
-    Climate cumulatives are stored raw in .npy; divisors are approximate season totals.
-    """
-    out = np.asarray(extra, dtype=np.float32)
-    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-    if out.shape[-1] < 6:
-        raise ValueError(
-            f"Expected at least 6 Xavier climate extras (rain+ETo/Rs/T), got {out.shape[-1]}"
-        )
-    out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
-    out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
-    out[..., 2] = np.clip(out[..., 2] / 1500.0, 0.0, 4.0)  # cum ETo (mm)
-    out[..., 3] = np.clip(out[..., 3] / 5000.0, 0.0, 4.0)  # cum Rs (MJ/m^2)
-    out[..., 4] = np.clip(out[..., 4] / 5000.0, 0.0, 4.0)  # cum Tmax (°C·day)
-    out[..., 5] = np.clip(out[..., 5] / 5000.0, -1.0, 4.0)  # cum Tmin (°C·day)
-    return out.astype(np.float32)
-
-
-# Sentinel-2 reflectance normalization (training default)
+# Legacy hardcoded S2 stats (pre-train-split scaler). PixelTransform reads
+# mean/std from files/train_input_scaler.json once the scaler is loaded.
 SPECTRAL_MEAN = np.array(
     [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]],
     dtype=np.float32,
@@ -72,17 +52,45 @@ class PixelTransform:
         randomchoice: bool = False,
         interp: bool = False,
         seed: int = 27,
+        extra_scaler: InputScaler | None = None,
+        extra_scaler_path: str | Path | None = None,
     ):
         self.sequencelength = int(sequencelength)
         self.feature_layout = normalize_feature_layout(feature_layout)
         lay = resolve_feature_layout(self.feature_layout)
         self.input_feature_dim = int(lay["input_dim"])
         self._extra_channels_slice: tuple[int, int] | None = lay["extra_channels_slice"]
+        self._recipe = lay.get("recipe")
         self.rc = bool(randomchoice)
         self.interp = bool(interp)
         self.getWeight_batch = getWeight_batch
         self.mean = SPECTRAL_MEAN
         self.std = SPECTRAL_STD
+        self._extra_scaler = extra_scaler
+        self.extra_scaler_path = (
+            Path(extra_scaler_path)
+            if extra_scaler_path is not None
+            else DEFAULT_INPUT_SCALER_PATH
+        )
+        if extra_scaler is not None:
+            self._apply_spectral_stats(extra_scaler)
+
+    def _apply_spectral_stats(self, scaler: InputScaler) -> None:
+        self.mean = scaler.spectral_mean_row
+        self.std = scaler.spectral_std
+
+    def set_extra_scaler(self, scaler: InputScaler | None) -> None:
+        self._extra_scaler = scaler
+        if scaler is not None:
+            self._apply_spectral_stats(scaler)
+            if scaler.path is not None:
+                self.extra_scaler_path = scaler.path
+
+    def extra_scaler(self) -> InputScaler:
+        if self._extra_scaler is None:
+            self._extra_scaler = InputScaler.require_load(self.extra_scaler_path)
+            self._apply_spectral_stats(self._extra_scaler)
+        return self._extra_scaler
 
     def features_from_chunk(
         self, chunk_arr: np.ndarray
@@ -96,7 +104,29 @@ class PixelTransform:
         invalid = (x_spec == NO_DATA_VALUE) | ~np.isfinite(x_spec)
         x_spec = np.where(invalid, 0.0, x_spec) * 1e-4
         weight = self.getWeight_batch(x_spec)
-        x_spec_n = (x_spec - self.mean) / self.std
+        scaler = self.extra_scaler()
+        x_spec_n = scaler.transform_spectral(x_spec)
+        if self._recipe is not None:
+            extras = extras_from_chunk(chunk_arr)
+            recipe_scaler = (
+                scaler
+                if self._recipe.get("climate") not in (None, "none")
+                else None
+            )
+            x = assemble_recipe(
+                x_spec_n,
+                x_spec,
+                extras,
+                doy,
+                self._recipe,
+                extra_scaler=recipe_scaler,
+            )
+            if x.shape[-1] != self.input_feature_dim:
+                raise ValueError(
+                    f"Recipe {self.feature_layout!r} produced {x.shape[-1]} features, "
+                    f"expected input_dim={self.input_feature_dim}"
+                )
+            return x, weight, doy
         sl = self._extra_channels_slice
         if sl is not None:
             lo, hi = sl
@@ -107,9 +137,9 @@ class PixelTransform:
                     (extra == NO_DATA_VALUE) | ~np.isfinite(extra), 0.0, extra
                 )
                 if (lo, hi) == (11, 13):
-                    extra = scale_xavier_rain_channels(extra)
+                    extra = scale_xavier_rain_channels(extra, scaler=scaler)
                 elif (lo, hi) == (11, 17):
-                    extra = scale_xavier_climate_extras(extra)
+                    extra = scale_xavier_climate_extras(extra, scaler=scaler)
                 else:
                     extra = np.nan_to_num(extra, nan=0.0, posinf=0.0, neginf=0.0)
             else:
@@ -135,8 +165,12 @@ class PixelTransform:
                 x_pad[i] = np.array(
                     [np.interp(doy_pad, doy[i], x[i, :, j]) for j in range(fdim)]
                 ).T
-            spec_denorm = x_pad[:, :, :NUM_SPECTRAL_CHANNELS] * self.std + self.mean
-            weight_pad = self.getWeight_batch(spec_denorm)
+            if self._recipe is None or self._recipe.get("spectral") == "zscore":
+                spec_denorm = x_pad[:, :, :NUM_SPECTRAL_CHANNELS] * self.std + self.mean
+                weight_pad = self.getWeight_batch(spec_denorm)
+            else:
+                weight_pad = np.ones((n, seq_len), dtype=np.float64)
+                weight_pad /= float(seq_len)
             mask = np.ones((n, seq_len), dtype=np.int32)
             doy_pad_broadcast = np.tile(doy_pad.astype(np.int64), (n, 1))
         elif self.rc:

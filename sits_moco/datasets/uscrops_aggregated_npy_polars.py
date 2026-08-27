@@ -28,7 +28,6 @@ from .pixel_transform import (
     DOY_CHANNEL,
     NUM_SPECTRAL_CHANNELS,
     PixelTransform,
-    scale_xavier_rain_channels,
 )
 
 
@@ -119,6 +118,99 @@ SUGGESTED_MAX_COVERAGE_RATIO = 1.2
 COVERAGE_RATIO_COL = "coverage_ratio"
 PRODUCTIVITY_DEV_SOURCE_COL = "yield_t_ha"
 PRODUCTIVITY_DEV_COL = "yield_t_ha_dev"
+YEAR_LOO_HOLDOUT_SPLIT = "holdout"
+
+
+def apply_year_loo_split(yield_df: pl.DataFrame, holdout_year: int) -> pl.DataFrame:
+    """
+    Ignore the CSV split column: train = every year except ``holdout_year``;
+    valid and test both use that year (leave-one-year-out).
+    """
+    if "year" not in yield_df.columns:
+        raise ValueError(
+            "Year leave-one-out requires a 'year' column in the yield CSV"
+        )
+    hy = int(holdout_year)
+    years = sorted(
+        {
+            int(y)
+            for y in yield_df["year"].drop_nulls().to_list()
+            if y is not None
+        }
+    )
+    if hy not in years:
+        raise ValueError(
+            f"--holdout-year {hy} is not in the yield CSV years {years}"
+        )
+    n_hold = len(yield_df.filter(pl.col("year") == hy))
+    n_train = len(yield_df.filter(pl.col("year") != hy))
+    if n_hold == 0:
+        raise ValueError(f"--holdout-year {hy}: no rows in the yield CSV")
+    if n_train == 0:
+        raise ValueError(
+            f"--holdout-year {hy}: no remaining years for training"
+        )
+    print(
+        f"  Year LOO: holdout={hy} → valid=test (n={n_hold}); "
+        f"train=other years (n={n_train})"
+    )
+    return yield_df.with_columns(
+        pl.when(pl.col("year") == hy)
+        .then(pl.lit(YEAR_LOO_HOLDOUT_SPLIT))
+        .otherwise(pl.lit("train"))
+        .alias("split")
+    )
+
+
+def parse_exclude_muni_years(spec: str | None) -> list[tuple[str, int]]:
+    """Parse ``CODE:YEAR,CODE:YEAR`` pairs (IBGE code, harvest year)."""
+    if spec is None:
+        return []
+    text = str(spec).strip()
+    if not text:
+        return []
+    pairs: list[tuple[str, int]] = []
+    for part in text.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"exclude-muni-years item {item!r} must be CODE:YEAR "
+                "(e.g. 4112009:2020)"
+            )
+        code, year_s = item.rsplit(":", 1)
+        code = str(code).strip()
+        if not code:
+            raise ValueError(f"exclude-muni-years item {item!r} has an empty code")
+        pairs.append((code, int(year_s.strip())))
+    return pairs
+
+
+def apply_exclude_muni_years(
+    yield_df: pl.DataFrame,
+    spec: str | None,
+    *,
+    municipality_code_col: str = "municipality_code",
+) -> pl.DataFrame:
+    """Drop specific municipality–harvest-year rows from the yield table."""
+    pairs = parse_exclude_muni_years(spec)
+    if not pairs:
+        return yield_df
+    if municipality_code_col not in yield_df.columns or "year" not in yield_df.columns:
+        raise ValueError(
+            "exclude-muni-years requires municipality_code and year columns"
+        )
+    codes = pl.col(municipality_code_col).cast(pl.Utf8)
+    hit = pl.lit(False)
+    for code, year in pairs:
+        hit = hit | ((codes == code) & (pl.col("year") == int(year)))
+    before = len(yield_df)
+    out = yield_df.filter(~hit)
+    dropped = before - len(out)
+    pretty = ", ".join(f"{c}:{y}" for c, y in pairs)
+    print(f"  Excluded {dropped} municipality–year(s) ({pretty})")
+    return out
 
 
 def ensure_productivity_dev_column(
@@ -483,6 +575,8 @@ class USCropsAggregatedNPY(Dataset):
         train_mid_yield_lo: float = DEFAULT_TRAIN_MID_YIELD_LO,
         train_mid_yield_hi: float = DEFAULT_TRAIN_MID_YIELD_HI,
         train_mid_yield_bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+        holdout_year: Optional[int] = None,
+        exclude_muni_years: str | None = None,
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -520,7 +614,8 @@ class USCropsAggregatedNPY(Dataset):
         )
         self._temporal_filter_enabled = self.min_images > 0 or self.min_months > 0
 
-        # Store normalization parameters (scalar or per-head vectors)
+        # Store normalization parameters (scalar or per-head vectors).
+        # Labels are z-scored here; the decoder also emits z-scores.
         self.target_mean = target_mean if target_mean is not None else 0.0
         self.target_std = target_std if target_std is not None else 1.0
         self.normalize_targets = target_mean is not None and target_std is not None
@@ -575,6 +670,16 @@ class USCropsAggregatedNPY(Dataset):
                 f"{len(yield_df)}/{before_y} rows"
             )
 
+        yield_df = apply_exclude_muni_years(
+            yield_df,
+            exclude_muni_years,
+            municipality_code_col=municipality_code_col,
+        )
+
+        self.holdout_year = int(holdout_year) if holdout_year is not None else None
+        if self.holdout_year is not None:
+            yield_df = apply_year_loo_split(yield_df, self.holdout_year)
+
         # Train-only mid-band undersample (before productivity_dev baselines / split filter).
         yield_df = undersample_train_mid_yield_band(
             yield_df,
@@ -607,6 +712,8 @@ class USCropsAggregatedNPY(Dataset):
                 "test": "test",
             }
             target_split = split_mapping.get(mode, mode)
+            if self.holdout_year is not None and mode in ("valid", "eval", "test"):
+                target_split = YEAR_LOO_HOLDOUT_SPLIT
             yield_df = yield_df.filter(pl.col("split") == target_split)
             print(f"Filtered to {target_split} split: {len(yield_df)} rows")
         elif mode == "all" and "split" in yield_df.columns:
@@ -867,9 +974,10 @@ class USCropsAggregatedNPY(Dataset):
         )
         total_pixels = sum(self.municipality_pixel_counts.values())
         print(f"Total pixels: {total_pixels:,}")
+        n_layouts = len(feature_layout_choices())
         print(
             f"Feature layout: {self.feature_layout!r} → STNet input_dim={self.input_feature_dim} "
-            f"(choices: {', '.join(feature_layout_choices())})"
+            f"({n_layouts} registered layouts)"
         )
         self._validate_npy_channel_requirement()
 
@@ -956,15 +1064,19 @@ class USCropsAggregatedNPY(Dataset):
         return None
 
     def _validate_npy_channel_requirement(self) -> None:
-        """Ensure on-disk .npy files have enough channels for the chosen layout."""
+        """Drop municipality–years whose .npy is too narrow for the layout.
+
+        2019-2020 mega-pixel files are often rain-only (C=13). Layouts that
+        need climate extras (C=17) skip those files instead of aborting a
+        mixed-year loader. An empty split after filtering is an error.
+        """
         if self._extra_channels_slice is None:
             return
         _, hi = self._extra_channels_slice
-        bad: list[tuple[str, int]] = []
+        dropped: list[tuple[object, str, int]] = []
         checked = 0
+        keep: list = []
         for key in self.municipality_list:
-            if checked >= 120:
-                break
             if isinstance(key, tuple):
                 code, year = key
             else:
@@ -972,24 +1084,43 @@ class USCropsAggregatedNPY(Dataset):
                 year = self.municipality_years.get(code, self.year)
             p = self._resolve_npy_path(code, year)
             if p is None or not p.is_file():
+                keep.append(key)
                 continue
-            checked += 1
             try:
                 data = np.load(p, mmap_mode="r")
                 if data.ndim < 3:
+                    keep.append(key)
                     continue
                 c = int(data.shape[2])
+                checked += 1
                 if c < hi:
-                    bad.append((str(p), c))
+                    dropped.append((key, str(p), c))
+                    continue
             except OSError:
+                keep.append(key)
                 continue
-        if bad:
-            examples = "; ".join(f"{path} (C={c})" for path, c in bad[:5])
+            keep.append(key)
+
+        if dropped:
+            for key, _path, _c in dropped:
+                self.municipality_pixel_counts.pop(key, None)
+                self.municipality_years.pop(key, None)
+            self.municipality_list = sorted(keep)
+            examples = "; ".join(f"{path} (C={c})" for _, path, c in dropped[:3])
+            print(
+                f"  Dropped {len(dropped)} municipality–year(s) with C<{hi} "
+                f"(layout {self.feature_layout!r} needs extras at "
+                f"{self._extra_channels_slice}), e.g. {examples}"
+            )
+
+        if not self.municipality_list:
+            examples = "; ".join(f"{path} (C={c})" for _, path, c in dropped[:5])
             raise ValueError(
-                f"Feature layout {self.feature_layout!r} requires each .npy to have at least {hi} channels "
-                f"(extra fields at indices {self._extra_channels_slice}). "
-                f"Found files with fewer channels, e.g.: {examples}. "
-                f"Use --feature-layout spectral or rebuild .npy with the extra channels."
+                f"Feature layout {self.feature_layout!r} needs at least {hi} "
+                f"channels per .npy (extras at {self._extra_channels_slice}), "
+                f"but every file in this split is narrower. "
+                f"Rebuild that season with climate extras "
+                f"(data_download/append_xavier_climate_to_npy.py), e.g.: {examples}"
             )
         if checked == 0 and len(self.municipality_list) > 0:
             print(

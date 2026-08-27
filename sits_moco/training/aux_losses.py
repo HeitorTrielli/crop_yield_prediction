@@ -31,7 +31,10 @@ def variance_hinge_loss(
     *,
     min_std: float = 0.05,
 ) -> torch.Tensor:
-    """Penalize when within-muni pixel std falls below ``min_std`` (t/ha scale)."""
+    """Penalize when within-muni pixel std falls below ``min_std``.
+
+    ``min_std`` is in decoder units (z-score for new heads; t/ha for legacy raw).
+    """
     if pixel_std.dim() == 0:
         pixel_std = pixel_std.unsqueeze(0)
     # Use primary channel if multi-output

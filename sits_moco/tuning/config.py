@@ -18,7 +18,7 @@ OBJECTIVES = {
     "test_loss": {"mode": "min", "column": "testloss", "log": "testlog"},
 }
 
-SEARCH_STRATEGIES = ("grid", "random", "list")
+SEARCH_STRATEGIES = ("grid", "random", "list", "feature_sweep")
 
 BOOL_PARAMS = frozenset(
     {
@@ -37,6 +37,7 @@ BOOL_PARAMS = frozenset(
         "no_dataloader_pin_memory",
         "auto_chunks_per_grad",
         "no_coverage_filter",
+        "refit_extra_scaler",
     }
 )
 
@@ -49,6 +50,7 @@ INT_PARAMS = frozenset(
         "warmup_epochs",
         "seed",
         "early_stop_patience",
+        "checkpoint_every",
         "model_d_model",
         "model_n_head",
         "model_n_layers",
@@ -65,6 +67,7 @@ INT_PARAMS = frozenset(
         "auto_chunks_per_grad_refine_radius",
         "min_images",
         "min_months",
+        "holdout_year",
     }
 )
 
@@ -131,6 +134,31 @@ def load_study_config(path: Path | str) -> dict:
 
     n_trials = search.get("n_trials")
     explicit_trials = search.get("trials")
+    year_loo = search.get("year_loo")
+    skip_holdout_years_missing_climate = search.get(
+        "skip_holdout_years_missing_climate"
+    )
+    extra_scaler_template = search.get("extra_scaler_template")
+    if year_loo is not None:
+        if strategy != "feature_sweep":
+            raise ValueError("search.year_loo is only valid with strategy: feature_sweep")
+        if isinstance(year_loo, (int, str)):
+            year_loo = [int(year_loo)]
+        elif not isinstance(year_loo, list) or not year_loo:
+            raise ValueError("search.year_loo must be a non-empty list of years")
+        else:
+            year_loo = [int(y) for y in year_loo]
+    if skip_holdout_years_missing_climate is not None:
+        if isinstance(skip_holdout_years_missing_climate, (int, str)):
+            skip_holdout_years_missing_climate = [
+                int(skip_holdout_years_missing_climate)
+            ]
+        else:
+            skip_holdout_years_missing_climate = [
+                int(y) for y in skip_holdout_years_missing_climate
+            ]
+    if extra_scaler_template is not None:
+        extra_scaler_template = str(extra_scaler_template)
     if strategy == "random":
         if n_trials is None or int(n_trials) < 1:
             raise ValueError("random search requires search.n_trials >= 1")
@@ -168,6 +196,13 @@ def load_study_config(path: Path | str) -> dict:
             "parameters": deepcopy(parameters or {}),
             "trials": deepcopy(explicit_trials) if explicit_trials is not None else None,
             "seed": int(search.get("seed", 42)),
+            "year_loo": deepcopy(year_loo) if year_loo is not None else None,
+            "skip_holdout_years_missing_climate": deepcopy(
+                skip_holdout_years_missing_climate
+            )
+            if skip_holdout_years_missing_climate is not None
+            else None,
+            "extra_scaler_template": extra_scaler_template,
         },
         "output_dir": str(output_dir),
         "training_script": str(training_script),

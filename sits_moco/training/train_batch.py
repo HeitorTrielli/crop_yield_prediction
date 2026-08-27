@@ -21,6 +21,11 @@ from training.aux_losses import (
     variance_hinge_loss,
 )
 from training.log_util import log_training as _log_training
+from utils_aggregated import (
+    HEAD_OUTPUT_ZSCORE,
+    denormalize_head_output,
+    pixel_pool_for_head,
+)
 
 
 def _as_1d(t: torch.Tensor) -> torch.Tensor:
@@ -82,6 +87,19 @@ def _chunk_x_for_ndvi(municipality_X_chunk) -> torch.Tensor | None:
     return None
 
 
+def _aux_min_std_in_head_units(aux_min_std: float, target_std, head_output: str) -> float:
+    """CLI ``--aux-min-std`` is t/ha; convert to z when the head emits z-scores."""
+    if head_output != HEAD_OUTPUT_ZSCORE or target_std is None:
+        return float(aux_min_std)
+    if torch.is_tensor(target_std):
+        std0 = float(target_std.reshape(-1)[0].item())
+    elif isinstance(target_std, (list, tuple)):
+        std0 = float(target_std[0])
+    else:
+        std0 = float(target_std)
+    return float(aux_min_std) / max(std0, 1e-8)
+
+
 def process_train_batch(
     *,
     model,
@@ -102,6 +120,7 @@ def process_train_batch(
     run_stats: dict | None = None,
     max_municipalities: int | None = None,
     vram_probe_state: dict | None = None,
+    head_output: str = HEAD_OUTPUT_ZSCORE,
 ) -> tuple[float, bool, int]:
     """
     Process municipalities in one optimizer batch.
@@ -113,7 +132,33 @@ def process_train_batch(
     """
     from torch.amp import autocast
 
+    from training.megapixel_batch import (
+        dataset_supports_megapixel_stack,
+        is_megapixel_batch,
+        process_train_megapixel_batch,
+    )
     from training_runtime import mark_cudagraph_step, zero_grad
+
+    if is_megapixel_batch(num_pixels_list) and dataset_supports_megapixel_stack(dataset):
+        return process_train_megapixel_batch(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            dataset=dataset,
+            municipalities=municipalities,
+            targets=targets,
+            num_pixels_list=num_pixels_list,
+            years=years,
+            device=device,
+            args=args,
+            target_mean=target_mean,
+            target_std=target_std,
+            batch_idx=batch_idx,
+            run_stats=run_stats,
+            max_municipalities=max_municipalities,
+            vram_probe_state=vram_probe_state,
+            head_output=head_output,
+        )
 
     targets = targets.to(device).float()
     total_loss = 0.0
@@ -122,9 +167,14 @@ def process_train_batch(
     chunks_per_grad = effective_chunks_per_grad(args)
     use_pipeline_h2d = pipeline_h2d(args, device)
     log_fmt = _fmt_agg(aggregation)
+    pixel_pool = pixel_pool_for_head(aggregation, head_output)
     aux_loss_type = str(getattr(args, "aux_loss", "none") or "none").lower()
     aux_loss_weight = float(getattr(args, "aux_loss_weight", 0.0) or 0.0)
-    aux_min_std = float(getattr(args, "aux_min_std", 0.05) or 0.05)
+    aux_min_std = _aux_min_std_in_head_units(
+        float(getattr(args, "aux_min_std", 0.05) or 0.05),
+        target_std,
+        head_output,
+    )
 
     skip_muni_indices = scan_skip_municipalities(
         municipalities, targets, num_pixels_list
@@ -180,9 +230,12 @@ def process_train_batch(
         if pixel_acc is not None and pixel_acc.valid and chunk_idx > 0:
             municipality_agg = _as_1d(pixel_acc.value())
             target_normalized = _as_1d(target).to(torch.float32)
-            municipality_agg_normalized = _normalize_pred(
-                municipality_agg.to(torch.float32), target_mean, target_std
-            )
+            if head_output == HEAD_OUTPUT_ZSCORE:
+                municipality_agg_normalized = municipality_agg.to(torch.float32)
+            else:
+                municipality_agg_normalized = _normalize_pred(
+                    municipality_agg.to(torch.float32), target_mean, target_std
+                )
             final_loss = torch.nn.functional.mse_loss(
                 municipality_agg_normalized, target_normalized
             )
@@ -193,10 +246,15 @@ def process_train_batch(
                 )
             else:
                 if target_mean is not None and target_std is not None:
-                    mean_t = _stats_on(target_mean, target_normalized)
-                    std_t = _stats_on(target_std, target_normalized)
-                    target_denorm = target_normalized * std_t + mean_t
-                    pred_denorm = municipality_agg_normalized * std_t + mean_t
+                    target_denorm = denormalize_head_output(
+                        target_normalized, target_mean, target_std, HEAD_OUTPUT_ZSCORE
+                    )
+                    pred_denorm = denormalize_head_output(
+                        municipality_agg_normalized,
+                        target_mean,
+                        target_std,
+                        HEAD_OUTPUT_ZSCORE,
+                    )
                 else:
                     target_denorm = target_normalized
                     pred_denorm = municipality_agg_normalized
@@ -230,7 +288,7 @@ def process_train_batch(
         municipality_code = municipalities[muni_idx]
         num_pixels = num_pixels_list[muni_idx]
         target = targets[muni_idx]
-        pixel_acc = MunicipalityPixelAccumulator(aggregation)
+        pixel_acc = MunicipalityPixelAccumulator(pixel_pool)
         chunk_idx = 0
         total_chunks = (num_pixels + chunk_size - 1) // chunk_size
         year = years[muni_idx] if years[muni_idx] is not None else None
@@ -333,7 +391,7 @@ def process_train_batch(
                 f"  ⚠️  DEBUG: Municipality {municipality_code} has extreme "
                 f"{aggregation} at chunk {chunk_idx}"
             )
-            pixel_acc = MunicipalityPixelAccumulator(aggregation)
+            pixel_acc = MunicipalityPixelAccumulator(pixel_pool)
             muni_break = True
             continue
 
@@ -349,21 +407,24 @@ def process_train_batch(
                     f"  ⚠️  DEBUG: Municipality {municipality_code} extreme "
                     f"{aggregation} at chunk {chunk_idx}/{total_chunks}, skipping backward"
                 )
-                pixel_acc = MunicipalityPixelAccumulator(aggregation)
+                pixel_acc = MunicipalityPixelAccumulator(pixel_pool)
                 muni_break = True
                 continue
 
             municipality_agg = _as_1d(pixel_acc.value())
             target_normalized = _as_1d(target).to(torch.float32)
-            municipality_agg_normalized = _normalize_pred(
-                municipality_agg.to(torch.float32), target_mean, target_std
-            )
+            if head_output == HEAD_OUTPUT_ZSCORE:
+                municipality_agg_normalized = municipality_agg.to(torch.float32)
+            else:
+                municipality_agg_normalized = _normalize_pred(
+                    municipality_agg.to(torch.float32), target_mean, target_std
+                )
 
             fraction_processed = (
                 pixel_acc.pixel_count / num_pixels if num_pixels > 0 else 1.0
             )
             expected_partial_target = _partial_target(
-                target_normalized, fraction_processed, aggregation
+                target_normalized, fraction_processed, pixel_pool
             )
 
             muni_loss = torch.nn.functional.mse_loss(

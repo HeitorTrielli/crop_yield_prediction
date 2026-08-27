@@ -2,7 +2,8 @@
 Main training script for municipality-level yield prediction using aggregated regression.
 Polars-optimized version for faster index loading.
 
-Pixel-level predictions are aggregated per municipality (sum for total, mean for productivity).
+Pixel-level predictions are z-scores of the municipal target, mean-pooled,
+then converted back to original units (t/ha or tons) with ``z * σ + μ``.
 """
 
 import argparse
@@ -21,7 +22,7 @@ import torch.optim
 from torch.utils.data import DataLoader
 
 # Import Polars version of dataset
-from datasets.feature_layout import feature_layout_choices
+from datasets.feature_layout import feature_layout_cli_choices, normalize_feature_layout
 from datasets.uscrops_aggregated_npy_polars import (
     DEFAULT_MAX_COVERAGE_RATIO,
     DEFAULT_MIN_COVERAGE_RATIO,
@@ -31,15 +32,19 @@ from datasets.uscrops_aggregated_npy_polars import (
     DEFAULT_TRAIN_MID_YIELD_LO,
     PRODUCTIVITY_DEV_COL,
     USCropsAggregatedNPY,
+    apply_exclude_muni_years,
+    apply_year_loo_split,
     ensure_productivity_dev_column,
     filter_yield_df_by_coverage,
     undersample_train_mid_yield_band,
 )
+from models.moco_transfer import remap_moco_encoder_state
 from models.weight_init import weight_init_regression
 from run_paths import (
     ensure_run_layout,
     experiment_dir,
     load_training_sessions,
+    normalize_user_path,
     run_dir_for_experiment,
     trainlog_path,
 )
@@ -51,10 +56,13 @@ from utils import (
     save,
 )
 from utils_aggregated import (
+    HEAD_OUTPUT_RAW,
+    HEAD_OUTPUT_ZSCORE,
     TARGET_SPECS,
     AggregatedMSELoss,
     aggregated_collate_fn,
     regression_metrics,
+    resolve_head_output,
     resolve_target_bundle,
     stnet_regression_input_dim_from_state_dict,
     test_epoch_aggregated,
@@ -177,6 +185,16 @@ def parse_args():
         type=str,
         default="./results",
         help="logdir to store progress and models (defaults to ./results)",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help=(
+            "Write training/figures/predictions in this folder instead of "
+            "{logdir}/{experiment_name}/{feature_layout}. Used by the tuner "
+            "so each trial lives under results/tuning/<study>/trial_XXX/."
+        ),
     )
     parser.add_argument("-s", "--suffix", default=None, help="suffix to output_dir")
     parser.add_argument(
@@ -353,17 +371,54 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--feature-layout",
+        "--holdout-year",
+        type=int,
+        default=None,
+        help=(
+            "Leave-one-year-out: train on --harvest-years except this year; "
+            "valid and test both use this year (ignores the CSV split column)."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-muni-years",
         type=str,
+        default=None,
+        help=(
+            "Drop municipality–harvest-year pairs from the yield table "
+            "(CODE:YEAR,CODE:YEAR). Example: 4112009:2020,4113734:2020"
+        ),
+    )
+    parser.add_argument(
+        "--feature-layout",
+        type=normalize_feature_layout,
         default="spectral",
-        choices=feature_layout_choices(),
+        choices=feature_layout_cli_choices(),
         metavar="NAME",
         help=(
             "Explicit per-pixel inputs to STNet: "
             "'spectral' = 10 S2 bands only; "
             "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy); "
-            "'spectral_xavier_climate' = rain + cum ETo/Rs/Tmax/Tmin (requires 17-channel .npy). "
+            "'spectral_xavier_climate' / 'spectral_xavier_full' = rain + cum ETo/Rs/Tmax/Tmin "
+            "(requires 17-channel .npy); "
+            "'mp_*' = derived index/climate recipes (see datasets/feature_recipes.py). "
             "See datasets/feature_layout.py."
+        ),
+    )
+    parser.add_argument(
+        "--extra-scaler",
+        type=str,
+        default=None,
+        help=(
+            "JSON with train-set mean/std/var for S2 bands + Xavier extras "
+            "(default: files/train_input_scaler.json). Created on first train run if missing."
+        ),
+    )
+    parser.add_argument(
+        "--refit-extra-scaler",
+        action="store_true",
+        help=(
+            "Recompute train-set mean/std for S2 + extras from the current train split "
+            "and overwrite --extra-scaler (or the default JSON)."
         ),
     )
     parser.add_argument(
@@ -371,6 +426,17 @@ def parse_args():
         type=int,
         default=30,
         help="Stop training after this many epochs without val-loss improvement (default: 30)",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "Write checkpoint_epoch_*.pth every N epochs (default: 5). "
+            "Set 0 to skip periodic checkpoints (model_best.pth is still saved). "
+            "Useful for fast mega-pixel runs."
+        ),
     )
     parser.add_argument(
         "--model-d-model",
@@ -570,6 +636,13 @@ def parse_args():
     }
     if not args.harvest_years_set:
         raise ValueError("--harvest-years must contain at least one year")
+    if args.holdout_year is not None:
+        args.holdout_year = int(args.holdout_year)
+        if args.holdout_year not in args.harvest_years_set:
+            raise ValueError(
+                f"--holdout-year {args.holdout_year} must be one of --harvest-years "
+                f"{sorted(args.harvest_years_set)}"
+            )
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -678,6 +751,8 @@ def compute_target_statistics(
     train_mid_yield_hi=DEFAULT_TRAIN_MID_YIELD_HI,
     train_mid_yield_bin_width=DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
     seed=DEFAULT_SEED,
+    holdout_year: int | None = None,
+    exclude_muni_years: str | None = None,
 ):
     """
     Compute mean and std of training targets for normalization.
@@ -705,6 +780,9 @@ def compute_target_statistics(
             f"  Restricted yield CSV to harvest years {hset}: "
             f"{len(yield_df)}/{before_y} rows"
         )
+    yield_df = apply_exclude_muni_years(yield_df, exclude_muni_years)
+    if holdout_year is not None:
+        yield_df = apply_year_loo_split(yield_df, int(holdout_year))
     yield_df = undersample_train_mid_yield_band(
         yield_df,
         keep_fraction=train_mid_yield_keep_fraction,
@@ -920,18 +998,33 @@ def append_training_config_session(
 
 
 def train(args):
-    split_design = split_design_for_config(
-        infer_yield_csv_split_design(args.yield_csv),
-        args.harvest_years_set,
-    )
-    holdout_years = split_design["holdout_years"]
-    print(f"Yield CSV holdout year(s) (valid/test only): {holdout_years}")
-    excluded = split_design["holdout_years_excluded_by_harvest_filter"]
-    if excluded:
+    if args.holdout_year is not None:
+        hy = int(args.holdout_year)
+        train_years = sorted(args.harvest_years_set - {hy})
+        csv_design = {
+            "holdout_years": [hy],
+            "train_years_in_csv": train_years,
+            "eval_years_in_csv": [hy],
+            "year_loo": True,
+        }
+        split_design = split_design_for_config(csv_design, args.harvest_years_set)
         print(
-            f" --harvest-years excludes holdout {excluded}; "
-            "valid/test dataloaders will be empty unless those years are included."
+            f"Year leave-one-out: holdout={hy} (valid=test); "
+            f"train years={train_years}"
         )
+    else:
+        split_design = split_design_for_config(
+            infer_yield_csv_split_design(args.yield_csv),
+            args.harvest_years_set,
+        )
+        holdout_years = split_design["holdout_years"]
+        print(f"Yield CSV holdout year(s) (valid/test only): {holdout_years}")
+        excluded = split_design["holdout_years_excluded_by_harvest_filter"]
+        if excluded:
+            print(
+                f" --harvest-years excludes holdout {excluded}; "
+                "valid/test dataloaders will be empty unless those years are included."
+            )
 
     target_mean, target_std, productivity_dev_meta = compute_target_statistics(
         args.yield_csv,
@@ -945,6 +1038,8 @@ def train(args):
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         seed=args.seed,
+        holdout_year=args.holdout_year,
+        exclude_muni_years=args.exclude_muni_years,
     )
     print(
         f"Target: {args.target} "
@@ -980,6 +1075,8 @@ def train(args):
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
+        holdout_year=args.holdout_year,
+        exclude_muni_years=args.exclude_muni_years,
         **dl_opts,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
@@ -1005,6 +1102,8 @@ def train(args):
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
+        holdout_year=args.holdout_year,
+        exclude_muni_years=args.exclude_muni_years,
         **dl_opts,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
@@ -1030,8 +1129,29 @@ def train(args):
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
+        holdout_year=args.holdout_year,
+        exclude_muni_years=args.exclude_muni_years,
         **dl_opts,
     )
+
+    extra_scaler = None
+    extra_scaler_path = None
+    from datasets.extra_scaler import (
+        DEFAULT_INPUT_SCALER_PATH,
+        apply_extra_scaler_to_dataset,
+        load_or_fit_extra_scaler,
+    )
+
+    extra_scaler_path = Path(
+        args.extra_scaler or DEFAULT_INPUT_SCALER_PATH
+    ).expanduser()
+    extra_scaler = load_or_fit_extra_scaler(
+        traindataloader.dataset,
+        extra_scaler_path,
+        refit=bool(args.refit_extra_scaler),
+    )
+    for loader in (traindataloader, valdataloader, testdataloader):
+        apply_extra_scaler_to_dataset(loader.dataset, extra_scaler)
 
     print("=> creating model")
     device = torch.device(args.device)
@@ -1077,32 +1197,22 @@ def train(args):
         if moco_weight_init:
             # MoCo: remap encoder_q.* → trunk; skip MoCo projection head / PE buffer.
             # Do not resume epoch/optimizer from the contrastive checkpoint.
-            state_dict = {}
-            skipped_shape = []
-            for k, v in pretrain_state.items():
-                if not k.startswith("encoder_q."):
-                    continue
-                if (
-                    k.startswith("encoder_q.decoder")
-                    or k.startswith("encoder_q.classification")
-                    or k.startswith("encoder_q.position_enc.pe")
-                ):
-                    continue
-                new_k = k[len("encoder_q.") :]
-                if new_k not in model_dict:
-                    continue
-                if tuple(model_dict[new_k].shape) != tuple(v.shape):
-                    skipped_shape.append(
-                        (new_k, tuple(v.shape), tuple(model_dict[new_k].shape))
-                    )
-                    continue
-                state_dict[new_k] = v
+            # Narrower first Linear (rain 12 → climate 16) copies overlapping
+            # in_features; extra climate columns stay at random init.
+            state_dict, skipped_shape, padded_keys = remap_moco_encoder_state(
+                pretrain_state, model_dict
+            )
 
             load_result = model.load_state_dict(state_dict, strict=False)
             print(
                 f"  ✓ MoCo encoder init: loaded {len(state_dict)}/{len(model_dict)} "
                 "matching tensors (fresh optimizer/epoch)"
             )
+            for name, src_shape, dst_shape in padded_keys:
+                print(
+                    f"  ✓ Partial Linear load {name}: copied in_features "
+                    f"{src_shape[1]}/{dst_shape[1]} (extra columns stay random init)"
+                )
             if skipped_shape:
                 print(
                     f"  ⚠️  Skipped {len(skipped_shape)} tensors due to shape mismatch "
@@ -1175,8 +1285,18 @@ def train(args):
             print(f"   Error: {str(e)[:200]}...")
             # Continue with uncompiled model
 
-    run_dir = run_dir_for_experiment(args.logdir, model.modelname, args.feature_layout)
-    experiment_dir_path = experiment_dir(args.logdir, model.modelname)
+    if args.run_dir:
+        run_dir = normalize_user_path(args.run_dir)
+        if not run_dir.is_absolute():
+            run_dir = (Path.cwd() / run_dir).resolve()
+        else:
+            run_dir = run_dir.resolve()
+        experiment_dir_path = run_dir
+    else:
+        run_dir = run_dir_for_experiment(
+            args.logdir, model.modelname, args.feature_layout
+        )
+        experiment_dir_path = experiment_dir(args.logdir, model.modelname)
     training_dir_path, figures_dir_path, predictions_dir_path = ensure_run_layout(
         run_dir
     )
@@ -1194,12 +1314,30 @@ def train(args):
     print(f"  predictions: {predictions_dir_path}")
     print(f"  figures:     {figures_dir_path}")
 
+    # Fresh runs and MoCo encoder init emit z-scores. Resuming a yield checkpoint
+    # without the key keeps the legacy raw (t/ha or tons) head.
+    if pretrained_checkpoint is not None:
+        head_output = resolve_head_output(
+            pretrained_checkpoint, default=HEAD_OUTPUT_RAW
+        )
+    else:
+        head_output = HEAD_OUTPUT_ZSCORE
+    if head_output == HEAD_OUTPUT_ZSCORE:
+        print(
+            f"  Decoder emits z-scores of {args.target}; "
+            f"original units = z * σ + μ "
+            f"(μ={target_mean}, σ={target_std}). Init bias 0 is climatology."
+        )
+    else:
+        print("  Decoder emits raw target units (legacy checkpoint).")
+
     # Pass normalization stats for denormalization in evaluation
     criterion = AggregatedMSELoss(
         target_mean=target_mean,
         target_std=target_std,
         aggregation=args.aggregation,
         target_column=args.target_column,
+        head_output=head_output,
     )
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -1493,6 +1631,15 @@ def train(args):
                 if isinstance(target_std, (list, tuple))
                 else float(target_std)
             ),
+            "extra_scaler_path": (
+                str(extra_scaler_path.resolve()) if extra_scaler_path is not None else None
+            ),
+            "extra_scaler": extra_scaler.to_dict() if extra_scaler is not None else None,
+            "holdout_year": (
+                int(args.holdout_year) if args.holdout_year is not None else None
+            ),
+            "exclude_muni_years": args.exclude_muni_years,
+            "head_output": head_output,
             "productivity_dev_baseline": productivity_dev_meta,
             "min_images": int(args.min_images),
             "min_months": int(args.min_months),
@@ -1598,6 +1745,7 @@ def train(args):
                     target=args.target,
                     target_column=args.target_column,
                     aggregation=args.aggregation,
+                    head_output=head_output,
                 )
                 val_loss_min = val_loss
                 print(f"lowest val loss in epoch {epoch + 1}\n")
@@ -1612,7 +1760,8 @@ def train(args):
             log_df = pd.DataFrame(log).set_index("epoch")
             log_df.to_csv(training_dir_path / "trainlog.csv", float_format="%.6g")
 
-            if (epoch + 1) % 1 == 0:
+            checkpoint_every = int(getattr(args, "checkpoint_every", 5) or 0)
+            if checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0:
                 checkpoint_path = training_dir_path / f"checkpoint_epoch_{epoch + 1}.pth"
                 save(
                     model,
@@ -1630,6 +1779,7 @@ def train(args):
                     target=args.target,
                     target_column=args.target_column,
                     aggregation=args.aggregation,
+                    head_output=head_output,
                 )
                 print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
 
@@ -1658,6 +1808,7 @@ def train(args):
             "aggregation": checkpoint.get("aggregation"),
             "target_mean": checkpoint.get("target_mean"),
             "target_std": checkpoint.get("target_std"),
+            "head_output": checkpoint.get("head_output", head_output),
         },
         best_model_path,
     )
@@ -1712,6 +1863,8 @@ def get_aggregated_dataloader(
     pin_memory: bool = True,
     persistent_workers: bool = False,
     prefetch_factor: int | None = 4,
+    holdout_year: int | None = None,
+    exclude_muni_years: str | None = None,
 ):
     """Create dataloader for aggregated regression (Polars-optimized)."""
     dataset = USCropsAggregatedNPY(
@@ -1739,6 +1892,8 @@ def get_aggregated_dataloader(
         train_mid_yield_lo=train_mid_yield_lo,
         train_mid_yield_hi=train_mid_yield_hi,
         train_mid_yield_bin_width=train_mid_yield_bin_width,
+        holdout_year=holdout_year,
+        exclude_muni_years=exclude_muni_years,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0

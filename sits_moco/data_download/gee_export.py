@@ -7,11 +7,19 @@ Used by download_soy_gee_drive.py and download_s1_landsat_gee_drive.py.
 
 from __future__ import annotations
 
+import json
+import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import ee
+from google.auth.transport.requests import Request as GoogleAuthRequest
+
+DEFAULT_GEE_PROJECT = "crop-yield-pred-506711"
+DEFAULT_GEE_ACCOUNT = "heigthtrielli@gmail.com"
 
 # -----------------------------------------------------------------------------
 # Constants (match GEE catalog and pipeline no-data convention)
@@ -33,6 +41,80 @@ NO_DATA_VALUE = -9999
 # Landsat Collection 2 Level-2 surface reflectance scale/offset (USGS).
 LANDSAT_SR_SCALE = 0.0000275
 LANDSAT_SR_OFFSET = -0.2
+
+
+def _gee_auth_message(project: str, account: str | None) -> str:
+    who = f" as {account}" if account else ""
+    return (
+        f"GEE not authenticated{who}. Sign in as {account or 'the GEE account'} "
+        f"(not heitortrielli@gmail.com), then run:\n"
+        f'  python -c "import ee; ee.Authenticate(force=True); '
+        f'ee.Initialize(project={project!r})"'
+    )
+
+
+def _gee_token_email() -> str | None:
+    try:
+        creds = ee.data.get_persistent_credentials()
+        creds.refresh(GoogleAuthRequest())
+        url = (
+            "https://oauth2.googleapis.com/tokeninfo?access_token="
+            + urllib.parse.quote(creds.token)
+        )
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+        email = info.get("email")
+        return str(email) if email else None
+    except Exception:
+        return None
+
+
+def _gee_legacy_user_ids() -> list[str]:
+    try:
+        roots = ee.data.getAssetRoots() or []
+    except Exception:
+        return []
+    ids: list[str] = []
+    for root in roots:
+        rid = str(root.get("id") or "")
+        if rid.startswith("users/"):
+            ids.append(rid.split("/", 1)[1].lower())
+    return ids
+
+
+def initialize_gee(
+    project: str | None = DEFAULT_GEE_PROJECT,
+    account: str | None = DEFAULT_GEE_ACCOUNT,
+) -> None:
+    """Initialize Earth Engine for ``project``, expecting Google account ``account``.
+
+    ``ee.Authenticate()`` cannot take an email; the browser account picker does.
+    Drive OAuth (``data/credentials.json``) is independent and is not changed.
+    """
+    project = project or DEFAULT_GEE_PROJECT
+    try:
+        ee.Initialize(project=project)
+    except ee.EEException as e:
+        if "Please authenticate" in str(e) or "credentials" in str(e).lower():
+            sys.exit(_gee_auth_message(project, account))
+        raise
+    print(f"GEE initialized: project={project} account={account or '(any)'}")
+    if not account:
+        return
+    email = _gee_token_email()
+    if email and email.lower() != account.lower():
+        sys.exit(
+            f"GEE is authenticated as {email}, expected {account}.\n"
+            + _gee_auth_message(project, account)
+        )
+    user_ids = _gee_legacy_user_ids()
+    expected_local = account.split("@", 1)[0].lower()
+    if user_ids and expected_local not in user_ids:
+        shown = ", ".join(f"users/{u}" for u in user_ids)
+        sys.exit(
+            f"GEE asset home is {shown}, expected {account}.\n"
+            + _gee_auth_message(project, account)
+        )
 
 
 def get_active_gee_task_count() -> int:

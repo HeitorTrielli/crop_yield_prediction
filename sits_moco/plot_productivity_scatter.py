@@ -3,7 +3,7 @@ Scatter plots: predicted municipal productivity vs IBGE (yield_t_ha).
 
 How predicted productivity is derived from model forecasts depends on the training target:
 
-  - productivity  → forecast is already t/ha (direct comparison)
+  - productivity  → forecast is t/ha (z-score head denormalized with μ, σ)
   - total         → forecast / area_planted_ha (official IBGE area)
                     and forecast / pixel_area_ha (S2 footprint)
   - total_adj     → forecast / pixel_area_ha

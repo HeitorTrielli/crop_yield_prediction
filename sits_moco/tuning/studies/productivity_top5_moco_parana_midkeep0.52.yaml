@@ -1,12 +1,12 @@
-# Finetune the 5 best val_r2 architectures from productivity_first_real_tuning
-# (productivity_architecture_xavier) with MoCo encoder init matched per trial.
+# Same as productivity_top5_moco_parana (MoCo encoder init matched per trial),
+# plus train-only mid-band yield undersampling:
+#   keep ~52% of train rows with yield_t_ha ∈ [3.0, 4.25), uniform per 0.25 t/ha bin
+#   (preserves histogram shape; tails and valid/test unchanged).
 #
-# When `moco:` is set, the tuner trains (or reuses) a Paraná MoCo checkpoint whose
-# feature_layout + d_model/n_head/d_inner/n_layers match the yield trial before
-# finetuning. Dropout is not part of the MoCo fingerprint (trials 001 & 003 share
-# one MoCo). Unique arches in this list → 4 MoCo pretrains, then 5 yield runs.
+# MoCo checkpoints are reused when the trunk fingerprint already exists
+# (same 4 pretrains as productivity_top5_moco_parana).
 #
-# Source ranking (val_r2):
+# Source ranking (val_r2 from productivity_architecture_xavier):
 #   trial_034  0.236   128/4/128 drop=0.4
 #   trial_024  0.202    64/16/128 drop=0.4
 #   trial_031  0.133   128/4/128 drop=0.3
@@ -14,15 +14,12 @@
 #   trial_008  0.121    96/8/64  drop=0.3
 #
 # Preview:
-#   python run_tuning_study.py show tuning/studies/productivity_top5_moco_parana.yaml --list-trials
+#   python run_tuning_study.py show tuning/studies/productivity_top5_moco_parana_midkeep0.52.yaml --list-trials
 #
-# Run (resumes incomplete yield trials; skips successful ones):
-#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana.yaml --skip-completed
-#
-# After MoCo recipe / matching change, restart yield trial_001 if it used an old ckpt:
-#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana.yaml --rerun-all
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana_midkeep0.52.yaml --skip-completed
 
-name: productivity_top5_moco_parana
+name: productivity_top5_moco_parana_midkeep0.52
 
 objective: val_r2
 
@@ -54,18 +51,23 @@ base:
   feature_layout: spectral_xavier
   yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
   no_coverage_filter: true
+  # Train-only: scale down mid productivity band (~52% keep, shape preserved).
+  train_mid_yield_keep_fraction: 0.52
+  train_mid_yield_lo: 3.0
+  train_mid_yield_hi: 4.25
+  train_mid_yield_bin_width: 0.25
   logdir: ./results
   seed: 101010
   epochs: 100
   workers: 20
   sequencelength: 45
   batchsize: 40
-  learning_rate: 1.0e-4
+  learning_rate: 5.0e-4
   weight_decay: 5.0e-4
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [10, 75]
+  schedule: [12, 75]
   no_compile: true
   overwrite_run: true
   early_stop_patience: 10

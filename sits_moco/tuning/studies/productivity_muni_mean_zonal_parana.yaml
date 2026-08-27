@@ -1,0 +1,69 @@
+# Same as productivity_muni_mean_zonal (spectral mega-pixel, MapBiomas/IBGE
+# coverage 0.8–1.2) restricted to Paraná (IBGE UF 41).
+#
+#   python run_tuning_study.py show tuning/studies/productivity_muni_mean_zonal_parana.yaml --list-trials
+#   python run_tuning_study.py run tuning/studies/productivity_muni_mean_zonal_parana.yaml --skip-completed
+
+name: productivity_muni_mean_zonal_parana
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral
+  yield_csv: files/pam_soy_pr_mapbiomas_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 1.0e-5
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [150, 750]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  model_n_layers: 1
+
+search:
+  strategy: list
+
+  trials:
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+
+    - model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 64
+      model_dropout: 0.3

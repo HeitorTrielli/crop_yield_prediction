@@ -62,6 +62,7 @@ from run_paths import (
 )
 from utils_aggregated import (
     regression_metrics,
+    resolve_head_output,
     resolve_inference_chunk_size,
     resolve_inference_target,
     resolve_model_kwargs,
@@ -102,6 +103,9 @@ class ModelContext:
     target_unit: str
     chunk_size: int
     reference_date: date
+    head_output: str
+    target_mean: float | None
+    target_std: float | None
 
 
 @dataclass
@@ -203,6 +207,9 @@ def load_model_context(
     target, target_column, aggregation, target_unit = resolve_inference_target(
         run_config, checkpoint_data
     )
+    head_output = resolve_head_output(checkpoint_data, run_config)
+    target_mean = checkpoint_data.get("target_mean")
+    target_std = checkpoint_data.get("target_std")
 
     return ModelContext(
         checkpoint=checkpoint,
@@ -223,6 +230,9 @@ def load_model_context(
         target_unit=target_unit,
         chunk_size=chunk_size,
         reference_date=reference_date,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
 
@@ -472,6 +482,10 @@ def run_incomplete_series_evaluation(
             args=inference_args,
             batch_size=inference_batch_size,
             desc=f"Predicting (k={num_periods})",
+            aggregation=ctx.aggregation,
+            head_output=ctx.head_output,
+            target_mean=ctx.target_mean,
+            target_std=ctx.target_std,
         )
 
         y_pred = []
@@ -616,6 +630,9 @@ def run_guarapuava_heatmaps(
             reference_date=reference_date,
             input_dim=ctx.input_dim,
             num_periods=num_periods,
+            head_output=ctx.head_output,
+            target_mean=ctx.target_mean,
+            target_std=ctx.target_std,
         )
         if bundle[0] is None:
             print(f"  Skipped {label}: inference failed")

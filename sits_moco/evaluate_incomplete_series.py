@@ -2,7 +2,7 @@
 Script to evaluate model performance with incomplete time series.
 Uses daily rows per season: for k=1..6, all observations in season months 1..k are
 concatenated in time (sorted by DOY), up to --sequencelength (default 45) earliest days.
-Municipality prediction = sum of per-pixel model outputs, compared to CSV label.
+Municipality prediction = mean of per-pixel z-scores, denormalized to the CSV unit.
 """
 
 import argparse
@@ -37,6 +37,7 @@ from run_paths import (
 from utils_aggregated import (
     aggregation_for_target_column,
     regression_metrics,
+    resolve_head_output,
     resolve_inference_chunk_size,
     resolve_inference_target,
     resolve_model_kwargs,
@@ -187,6 +188,9 @@ def predict_municipalities_with_periods(
     reference_date,
     args,
     aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ) -> dict[tuple[str, int], float]:
     """Batched incomplete-series inference (training chunk/H2D pipeline)."""
     from training.inference_batch import run_period_inference_batch
@@ -203,6 +207,9 @@ def predict_municipalities_with_periods(
         num_periods=num_periods,
         reference_date=reference_date,
         aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
 
@@ -256,6 +263,10 @@ def batched_predict_with_periods(
     single_season: bool = False,
     target_year: int | None = None,
     desc: str | None = None,
+    aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ) -> tuple[dict, list]:
     """Predict incomplete-series yields in municipality batches (training pipeline)."""
     from itertools import islice
@@ -293,6 +304,10 @@ def batched_predict_with_periods(
                 device,
                 reference_date,
                 args,
+                aggregation=aggregation,
+                head_output=head_output,
+                target_mean=target_mean,
+                target_std=target_std,
             )
             for entry, result_key in zip(entries, result_keys):
                 if entry in batch_results:
@@ -378,12 +393,16 @@ def main():
     target, target_column, aggregation, target_unit = resolve_inference_target(
         run_config, checkpoint
     )
+    head_output = resolve_head_output(checkpoint, run_config)
+    target_mean = checkpoint.get("target_mean")
+    target_std = checkpoint.get("target_std")
     print(
         f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
     )
     print(
         f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
     )
+    print(f"Head output: {head_output}")
 
     if not args.yield_csv.exists():
         raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
@@ -500,6 +519,10 @@ def main():
             single_season=single_season,
             target_year=target_year,
             desc=f"Predicting ({num_periods} periods)",
+            aggregation=aggregation,
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
         )
 
         # Compute metrics

@@ -147,6 +147,83 @@ def resolve_target_bundle(target: str) -> dict:
     }
 
 
+HEAD_OUTPUT_ZSCORE = "zscore"
+HEAD_OUTPUT_RAW = "raw"
+
+
+def resolve_head_output(
+    checkpoint: dict | None = None,
+    run_config: dict | None = None,
+    *,
+    default: str | None = None,
+) -> str:
+    """Return ``zscore`` or ``raw`` for the regression decoder.
+
+    New training emits z-scores of the municipal target (bias 0 = climatology).
+    Checkpoints and run configs without ``head_output`` are treated as ``raw``
+    so older models that emitted t/ha or tons keep working.
+    """
+    ck = checkpoint or {}
+    if ck.get("head_output"):
+        return str(ck["head_output"])
+    computed = (run_config or {}).get("computed") or {}
+    if computed.get("head_output"):
+        return str(computed["head_output"])
+    cli = (run_config or {}).get("cli") or {}
+    if cli.get("head_output"):
+        return str(cli["head_output"])
+    if default is not None:
+        return str(default)
+    if checkpoint is not None or run_config is not None:
+        return HEAD_OUTPUT_RAW
+    return HEAD_OUTPUT_ZSCORE
+
+
+def pixel_pool_for_head(aggregation, head_output: str):
+    """Z-score heads vote for the municipal scalar, so pixels are mean-pooled."""
+    if head_output != HEAD_OUTPUT_ZSCORE:
+        return aggregation
+    if isinstance(aggregation, str):
+        return "mean"
+    return type(aggregation)("mean" for _ in aggregation)
+
+
+def _stat_to_numpy(stat) -> np.ndarray:
+    if torch.is_tensor(stat):
+        return stat.detach().cpu().numpy()
+    return np.asarray(stat)
+
+
+def denormalize_head_output(values, target_mean, target_std, head_output: str):
+    """Map decoder outputs to original target units (z * σ + μ)."""
+    if head_output != HEAD_OUTPUT_ZSCORE:
+        return values
+    if target_mean is None or target_std is None:
+        return values
+
+    if torch.is_tensor(values):
+        mean = target_mean
+        std = target_std
+        if not torch.is_tensor(mean):
+            mean = torch.as_tensor(mean, dtype=values.dtype, device=values.device)
+        else:
+            mean = mean.to(device=values.device, dtype=values.dtype)
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, dtype=values.dtype, device=values.device)
+        else:
+            std = std.to(device=values.device, dtype=values.dtype)
+        return values * std + mean
+
+    if isinstance(values, np.ndarray):
+        mean = np.asarray(_stat_to_numpy(target_mean), dtype=values.dtype)
+        std = np.asarray(_stat_to_numpy(target_std), dtype=values.dtype)
+        return values * std + mean
+
+    mean = float(np.asarray(_stat_to_numpy(target_mean)).reshape(-1)[0])
+    std = float(np.asarray(_stat_to_numpy(target_std)).reshape(-1)[0])
+    return float(values) * std + mean
+
+
 def resolve_inference_target(
     run_config: dict,
     checkpoint: dict | None = None,
@@ -304,14 +381,22 @@ def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
 
 
 def aggregate_municipality_from_pixel_chunks(
-    model, pixel_chunks, device, aggregation: str = "sum"
+    model,
+    pixel_chunks,
+    device,
+    aggregation: str = "sum",
+    *,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
 ) -> float | None:
     """Run STNet on pixel chunks; aggregate to municipality prediction (sum or mean)."""
     from torch.amp import autocast
 
     from utils import recursive_todevice
 
-    acc = MunicipalityPixelAccumulator(aggregation)
+    pool = pixel_pool_for_head(aggregation, head_output)
+    acc = MunicipalityPixelAccumulator(pool)
     model.eval()
     with torch.no_grad():
         for pixel_chunk in pixel_chunks:
@@ -333,7 +418,11 @@ def aggregate_municipality_from_pixel_chunks(
     result = result.squeeze()
     if result.dim() > 0:
         result = result[0] if len(result) > 0 else torch.tensor(0.0)
-    return float(result.item())
+    return float(
+        denormalize_head_output(
+            result.item(), target_mean, target_std, head_output
+        )
+    )
 
 
 def sum_municipality_from_pixel_chunks(model, pixel_chunks, device) -> float | None:
@@ -440,7 +529,11 @@ def regression_metrics_bundle(
 
 
 class AggregatedMSELoss(nn.Module):
-    """Loss: aggregate pixel predictions per municipality (sum or mean), compare to target."""
+    """Loss: aggregate pixel predictions per municipality, compare to target.
+
+    When ``head_output='zscore'`` the decoder already emits municipal z-scores,
+    so pixels are mean-pooled and the aggregate is not z-scored again.
+    """
 
     def __init__(
         self,
@@ -449,6 +542,7 @@ class AggregatedMSELoss(nn.Module):
         target_std=None,
         aggregation: str | list[str] | tuple[str, ...] = "sum",
         target_column: str | list[str] | tuple[str, ...] = "production_t",
+        head_output: str = HEAD_OUTPUT_ZSCORE,
     ):
         super().__init__()
         self.reduction = reduction
@@ -458,6 +552,7 @@ class AggregatedMSELoss(nn.Module):
         self.normalize = target_mean is not None and target_std is not None
         self.aggregation = aggregation
         self.target_column = target_column
+        self.head_output = head_output
 
     def _norm_stats_tensors(self, ref: torch.Tensor):
         mean = self.target_mean
@@ -478,9 +573,12 @@ class AggregatedMSELoss(nn.Module):
             predictions_list: List of tensors, one per municipality [num_pixels, num_outputs]
             targets: [batch_size] or [batch_size, num_outputs] (already normalized if normalize=True)
         """
+        pool = pixel_pool_for_head(
+            self.aggregation, getattr(self, "head_output", HEAD_OUTPUT_RAW)
+        )
         aggregated_predictions = []
         for pred in predictions_list:
-            aggregated_predictions.append(aggregate_pixels(pred, self.aggregation))
+            aggregated_predictions.append(aggregate_pixels(pred, pool))
 
         aggregated = torch.stack(aggregated_predictions)  # [batch_size, num_outputs]
 
@@ -489,7 +587,8 @@ class AggregatedMSELoss(nn.Module):
         if targets.dim() > 1 and targets.size(1) == 1:
             targets = targets.squeeze(1)
 
-        if self.normalize:
+        head_output = getattr(self, "head_output", HEAD_OUTPUT_RAW)
+        if head_output != HEAD_OUTPUT_ZSCORE and self.normalize:
             mean, std = self._norm_stats_tensors(aggregated)
             aggregated = (aggregated - mean) / std
 
@@ -538,7 +637,7 @@ def train_epoch_aggregated(
     target_std=None,
     run_stats: dict | None = None,
 ):
-    """Training epoch: process municipalities, sum pixel predictions, compare to targets."""
+    """Training epoch: mean-pool pixel z-scores per municipality, MSE vs z-scored labels."""
     from torch.amp import GradScaler
 
     from training.train_batch import process_train_batch
@@ -548,6 +647,7 @@ def train_epoch_aggregated(
     losses = AverageMeter("Loss", ":.4e")
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
+    head_output = getattr(criterion, "head_output", HEAD_OUTPUT_RAW)
     scaler = GradScaler("cuda")
     chunk_size = _pixel_chunk_size(args)
 
@@ -579,6 +679,7 @@ def train_epoch_aggregated(
             chunk_size=chunk_size,
             batch_idx=idx,
             run_stats=run_stats,
+            head_output=head_output,
         )
 
         if num_municipalities > 0 and total_loss >= 0:
@@ -654,6 +755,7 @@ def run_training_vram_probe(
 
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
+    head_output = getattr(criterion, "head_output", HEAD_OUTPUT_RAW)
     scaler = GradScaler("cuda")
     chunk_size = _pixel_chunk_size(args)
     state = {
@@ -690,6 +792,7 @@ def run_training_vram_probe(
             chunk_size=chunk_size,
             batch_idx=batch_idx,
             vram_probe_state=state,
+            head_output=head_output,
         )
         if state["over_limit"] or state["complete"]:
             break
@@ -715,6 +818,8 @@ def test_epoch_aggregated(
     losses = AverageMeter("Loss", ":.4e")
     model.eval()
     aggregation = getattr(criterion, "aggregation", "sum")
+    head_output = getattr(criterion, "head_output", HEAD_OUTPUT_RAW)
+    pixel_pool = pixel_pool_for_head(aggregation, head_output)
     target_column = getattr(criterion, "target_column", "production_t")
     all_aggregated_preds = []
     all_targets = []
@@ -766,7 +871,7 @@ def test_epoch_aggregated(
             )
 
             aggregated_preds = torch.stack(
-                [aggregate_pixels(pred, aggregation) for pred in predictions_list]
+                [aggregate_pixels(pred, pixel_pool) for pred in predictions_list]
             )
             if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
                 aggregated_preds = aggregated_preds.squeeze(1)
@@ -774,11 +879,19 @@ def test_epoch_aggregated(
                 targets = targets.squeeze(1)
 
             if target_mean is not None and target_std is not None:
-                mean_t = _to_stats_tensor(target_mean, aggregated_preds)
-                std_t = _to_stats_tensor(target_std, aggregated_preds)
-                aggregated_preds_normalized = (aggregated_preds - mean_t) / std_t
-                aggregated_preds = aggregated_preds_normalized * std_t + mean_t
-                targets = targets * std_t + mean_t
+                if head_output == HEAD_OUTPUT_ZSCORE:
+                    aggregated_preds = denormalize_head_output(
+                        aggregated_preds, target_mean, target_std, head_output
+                    )
+                    targets = denormalize_head_output(
+                        targets, target_mean, target_std, head_output
+                    )
+                else:
+                    mean_t = _to_stats_tensor(target_mean, aggregated_preds)
+                    std_t = _to_stats_tensor(target_std, aggregated_preds)
+                    aggregated_preds_normalized = (aggregated_preds - mean_t) / std_t
+                    aggregated_preds = aggregated_preds_normalized * std_t + mean_t
+                    targets = targets * std_t + mean_t
 
             all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
             all_targets.append(targets.cpu().numpy())
