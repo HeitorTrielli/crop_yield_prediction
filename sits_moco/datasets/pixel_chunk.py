@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Iterator
 
+import numpy as np
 import torch
 
 BatchChunk = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -249,6 +250,86 @@ def _iter_tagged_period_chunks_with_mmap_lookahead(
                 unpacked = unpack_pixel_chunk(pixel_chunk)
                 if unpacked is not None:
                     yield muni_idx, unpacked
+
+
+def _iter_npy_arrays_with_mmap_lookahead(
+    dataset,
+    entries: list[tuple[int, object, object]],
+    *,
+    chunk_size: int,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield contiguous float32 pixel chunks; mmap the next municipality on a side thread."""
+    if not entries:
+        return
+
+    def _mmap(entry: tuple[int, object, object]) -> tuple[int, object | None]:
+        muni_idx, municipality_code, year = entry
+        return muni_idx, dataset.mmap_municipality(municipality_code, year=year)
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="npy-mmap") as executor:
+        pending = executor.submit(_mmap, entries[0])
+        for i, _entry in enumerate(entries):
+            muni_idx, municipality_data = pending.result()
+            if i + 1 < len(entries):
+                pending = executor.submit(_mmap, entries[i + 1])
+            if municipality_data is None:
+                continue
+            num_pixels = len(municipality_data)
+            for start in range(0, num_pixels, chunk_size):
+                end = min(start + chunk_size, num_pixels)
+                yield muni_idx, np.ascontiguousarray(
+                    municipality_data[start:end], dtype=np.float32
+                )
+
+
+def iter_npy_array_batch_chunks(
+    dataset,
+    municipalities,
+    years,
+    num_pixels_list,
+    *,
+    chunk_size: int,
+    prefetch_depth: int = 2,
+    skip_muni_indices: set[int] | None = None,
+    mmap_lookahead: bool = True,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """Yield ``(muni_idx, float32[N,T,C])`` for one inference batch (one disk read)."""
+    skip = skip_muni_indices or set()
+    entries: list[tuple[int, object, object]] = []
+    for muni_idx, municipality_code in enumerate(municipalities):
+        if muni_idx in skip:
+            continue
+        if num_pixels_list[muni_idx] <= 0:
+            continue
+        year = years[muni_idx] if years[muni_idx] is not None else None
+        entries.append((muni_idx, municipality_code, year))
+
+    if mmap_lookahead and len(entries) > 1:
+        stream: Iterator[tuple[int, np.ndarray]] = _iter_npy_arrays_with_mmap_lookahead(
+            dataset, entries, chunk_size=chunk_size
+        )
+    else:
+        def _serial() -> Iterator[tuple[int, np.ndarray]]:
+            for muni_idx, municipality_code, year in entries:
+                municipality_data = dataset.mmap_municipality(
+                    municipality_code, year=year
+                )
+                if municipality_data is None:
+                    continue
+                num_pixels = len(municipality_data)
+                for start in range(0, num_pixels, chunk_size):
+                    end = min(start + chunk_size, num_pixels)
+                    yield muni_idx, np.ascontiguousarray(
+                        municipality_data[start:end], dtype=np.float32
+                    )
+
+        stream = _serial()
+
+    depth = min(max(int(prefetch_depth), 0), 4)
+    if depth > 0:
+        yield from PrefetchIterator(stream, max_pending=depth)
+        return
+    yield from stream
 
 
 def _iter_raw_batch_period_cpu_chunks(

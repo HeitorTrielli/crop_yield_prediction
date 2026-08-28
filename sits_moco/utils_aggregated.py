@@ -212,18 +212,23 @@ def resolve_inference_chunk_size(
     chunk_size: int | None = None,
 ) -> int:
     """
-    Chunk size for forward-only inference.
+    Pixels per GPU forward pass during inference.
 
-    Training VRAM is shaped by ``pixel_chunk_size * chunks_per_grad``; without
-    gradients we can use that full width (or any larger ``--chunk-size``).
+    Defaults to training ``pixel_chunk_size`` (one training micro-batch), **not**
+    ``pixel_chunk_size * chunks_per_grad`` (that product is the gradient
+    accumulation budget and can exhaust VRAM during results generation).
     """
     if chunk_size is not None:
         return int(chunk_size)
+    computed = (run_config or {}).get("computed") or {}
     cli = (run_config or {}).get("cli") or {}
+    chunk_pipeline = computed.get("chunk_pipeline") or {}
+    px_eff = chunk_pipeline.get("pixel_chunk_size_effective")
+    if px_eff is not None:
+        return int(px_eff)
     px = cli.get("pixel_chunk_size")
     if px is not None:
-        cpg = max(int(cli.get("chunks_per_grad") or 1), 1)
-        return int(px) * cpg
+        return int(px)
     return 400
 
 

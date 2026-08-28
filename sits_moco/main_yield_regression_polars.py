@@ -305,8 +305,8 @@ def parse_args():
         help=(
             "Explicit per-pixel inputs to STNet: "
             "'spectral' = 10 S2 bands only; "
-            "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy). "
-            "See datasets/feature_layout.py to add layouts (e.g. ET)."
+            "'spectral_xavier' = 10 bands + 2 rain (13-channel .npy). "
+            "'spectral_xavier_climate' = rain + cum Tmax/Tmin/Rs/ETo (17-channel .npy)."
         ),
     )
     parser.add_argument(

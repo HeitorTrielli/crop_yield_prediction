@@ -3,8 +3,9 @@
 Preprocess daily municipal TIFFs (from clip_tiffs_to_shapefiles) to .npy.
 
 Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/, stacks to
-[num_pixels, num_days, 11] (10 bands + DOY), or [N, T, 13] with --xavier-pr-nc
-(two Xavier rain channels; see data_download/xavier_rain_for_daily_npy.py).
+[num_pixels, num_days, 11] (10 bands + DOY), [N, T, 13] with --xavier-pr-nc
+(cumulative mm + dry streak), or [N, T, 17] with rain plus cumulative Tmax,
+Tmin, Rs, ETo (see data_download/xavier_rain_for_daily_npy.py).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -49,6 +51,36 @@ from preprocessing.preprocess_tiff_to_npy import (
 
 NO_DATA_VALUE = -9999
 NUM_SPECTRAL_BANDS = 10
+# After DOY (10): rain 11:13, then cumulative Tmax, Tmin, Rs, ETo at 13:17
+CUM_CLIMATE_SPECS: tuple[tuple[str, str], ...] = (
+    ("tmax", "Tmax"),
+    ("tmin", "Tmin"),
+    ("rs", "Rs"),
+    ("eto", "ETo"),
+)
+
+
+def _copy_nc_to_work(src: Path, prefix: str) -> Path:
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+    src = src.expanduser().resolve()
+    if not src.is_file():
+        raise SystemExit(f"NetCDF is not a file: {src}")
+    try:
+        blob = src.read_bytes()
+    except OSError as e:
+        raise SystemExit(f"Could not read {src}: {e}") from e
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=f"{prefix}_{uuid.uuid4().hex}_",
+        suffix=".nc",
+        delete=False,
+    )
+    try:
+        tmp.write(blob)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    finally:
+        tmp.close()
+    return Path(tmp.name)
 
 
 def _save_npy_atomic(out_path: Path, arr: np.ndarray, *, max_retries: int = 4) -> None:
@@ -112,15 +144,50 @@ def parse_args() -> argparse.Namespace:
         "-j",
         "--workers",
         type=int,
-        default=1,
+        default=None,
         metavar="N",
-        help="Parallel workers for processing municipalities (default: 1). Use e.g. 10 on multi-core machines.",
+        help="Parallel workers for processing municipalities (default: min(12, CPU-2)).",
     )
     p.add_argument(
         "--xavier-pr-nc",
         type=Path,
         default=None,
-        help="Optional Xavier NetCDF (e.g. xavier_pr.nc). When set, appends 2 rain channels per timestep.",
+        help="Xavier precip NetCDF. Appends 2 rain channels (cumulative mm, dry streak).",
+    )
+    p.add_argument(
+        "--xavier-tmax-nc",
+        type=Path,
+        default=None,
+        help="Xavier Tmax NetCDF. Appends cumulative Tmax from Oct 1 (channel 13).",
+    )
+    p.add_argument(
+        "--xavier-tmin-nc",
+        type=Path,
+        default=None,
+        help="Xavier Tmin NetCDF. Appends cumulative Tmin from Oct 1 (channel 14).",
+    )
+    p.add_argument(
+        "--xavier-rs-nc",
+        type=Path,
+        default=None,
+        help="Xavier Rs NetCDF (MJ m-2). Appends cumulative Rs from Oct 1 (channel 15).",
+    )
+    p.add_argument(
+        "--xavier-eto-nc",
+        type=Path,
+        default=None,
+        help="Xavier ETo NetCDF (mm). Appends cumulative ETo from Oct 1 (channel 16).",
+    )
+    p.add_argument(
+        "--limit-munis",
+        type=int,
+        default=None,
+        help="Process only the first N municipalities (smoke test).",
+    )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip municipalities whose {code}.npy already exists (resume a killed run).",
     )
     return p.parse_args()
 
@@ -164,23 +231,87 @@ def _read_bands_on_reference_grid(
         src_crs = src.crs if src.crs is not None else ref_crs
         n = min(src.count, nbands)
         nodata = src.nodata if src.nodata is not None else NO_DATA_VALUE
-        for b in range(n):
-            reproject(
-                rasterio.band(src, b + 1),
-                out[b],
-                src_transform=src.transform,
-                src_crs=src_crs,
-                dst_transform=ref_transform,
-                dst_crs=ref_crs,
-                resampling=Resampling.nearest,
-                dst_nodata=np.nan,
-            )
+        same_grid = (
+            src.height == height
+            and src.width == width
+            and src.transform.almost_equals(ref_transform)
+            and (src.crs is None or src.crs == ref_crs)
+        )
+        if same_grid:
+            out[:n] = src.read(indexes=list(range(1, n + 1)), out_dtype="float32")
+        else:
+            for b in range(n):
+                reproject(
+                    rasterio.band(src, b + 1),
+                    out[b],
+                    src_transform=src.transform,
+                    src_crs=src_crs,
+                    dst_transform=ref_transform,
+                    dst_crs=ref_crs,
+                    resampling=Resampling.nearest,
+                    dst_nodata=np.nan,
+                )
         for b in range(n):
             band = out[b]
             band[band == nodata] = np.nan
             band[band == 0] = np.nan
             band[band == NO_DATA_VALUE] = np.nan
     return out
+
+
+def _fill_climate_channels(
+    out: np.ndarray,
+    *,
+    year_range: str,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    ref_transform,
+    ref_crs,
+    dates: list[date],
+    xavier_pr_work: Path | None,
+    climate_work: dict[str, Path | None],
+) -> None:
+    from data_download.xavier_rain_for_daily_npy import (
+        compute_cumulative_block_for_municipality,
+        compute_rain_block_for_municipality,
+        pixel_centroids_lonlat,
+    )
+
+    lon, lat = pixel_centroids_lonlat(rows, cols, ref_transform, ref_crs)
+
+    if xavier_pr_work is not None:
+        rain = compute_rain_block_for_municipality(
+            xavier_pr_work,
+            year_range,
+            rows,
+            cols,
+            ref_transform,
+            ref_crs,
+            dates,
+            lon=lon,
+            lat=lat,
+        )
+        rain = np.where(np.isfinite(rain), rain, NO_DATA_VALUE)
+        out[:, :, 11:13] = rain
+
+    for offset, (key, var_name) in enumerate(CUM_CLIMATE_SPECS):
+        nc = climate_work.get(key)
+        if nc is None:
+            continue
+        ch = 13 + offset
+        block = compute_cumulative_block_for_municipality(
+            nc,
+            var_name,
+            year_range,
+            rows,
+            cols,
+            ref_transform,
+            ref_crs,
+            dates,
+            lon=lon,
+            lat=lat,
+        )
+        out[:, :, ch] = np.where(np.isfinite(block), block, NO_DATA_VALUE)
 
 
 def process_municipality(
@@ -190,8 +321,9 @@ def process_municipality(
     output_dir: Path,
     season_start: date,
     xavier_pr_work: Path | None = None,
+    climate_work: dict[str, Path | None] | None = None,
 ) -> int:
-    """Load daily TIFFs for one municipality, build [num_pixels, num_days, 11|13], save .npy. Returns pixel count."""
+    """Load daily TIFFs for one municipality, build [N, T, 11|13|17], save .npy."""
     if not tiff_paths:
         return 0
 
@@ -251,7 +383,10 @@ def process_municipality(
     # Fill remaining NaN with NO_DATA_VALUE for storage
     stack = np.where(np.isnan(stack), NO_DATA_VALUE, stack)
 
-    n_extra = 2 if xavier_pr_work is not None else 0
+    climate_work = climate_work or {}
+    has_rain = xavier_pr_work is not None
+    has_cum = any(climate_work.get(k) is not None for k, _ in CUM_CLIMATE_SPECS)
+    n_extra = (2 if has_rain or has_cum else 0) + (4 if has_cum else 0)
     n_out_ch = 11 + n_extra
 
     # Append DOY: [num_pixels, num_days, 11..]
@@ -260,24 +395,20 @@ def process_municipality(
     out[:, :, :nbands] = stack
     out[:, :, 10] = doy_broadcast
 
-    if xavier_pr_work is not None:
-        from data_download.xavier_rain_for_daily_npy import (
-            compute_rain_block_for_municipality,
-        )
-
+    if has_rain or has_cum:
         rows = (idx_final // width).astype(np.int64)
         cols = (idx_final % width).astype(np.int64)
-        rain = compute_rain_block_for_municipality(
-            xavier_pr_work,
-            year_range,
-            rows,
-            cols,
-            ref_transform,
-            ref_crs,
-            list(dates),
+        _fill_climate_channels(
+            out,
+            year_range=year_range,
+            rows=rows,
+            cols=cols,
+            ref_transform=ref_transform,
+            ref_crs=ref_crs,
+            dates=list(dates),
+            xavier_pr_work=xavier_pr_work,
+            climate_work=climate_work,
         )
-        rain = np.where(np.isfinite(rain), rain, NO_DATA_VALUE)
-        out[:, :, 11:13] = rain
 
     out_dir = output_dir / year_range / code
     out_path = out_dir / f"{code}.npy"
@@ -292,9 +423,13 @@ def _process_municipality_worker(
     output_dir: Path,
     season_start: date,
     xavier_pr_work: str | None,
+    climate_work_str: dict[str, str | None] | None,
 ) -> tuple[str, int, str | None]:
     try:
         xp = Path(xavier_pr_work) if xavier_pr_work else None
+        cw: dict[str, Path | None] = {}
+        for k, v in (climate_work_str or {}).items():
+            cw[k] = Path(v) if v else None
         n = process_municipality(
             code,
             tiff_paths,
@@ -302,10 +437,31 @@ def _process_municipality_worker(
             output_dir,
             season_start,
             xavier_pr_work=xp,
+            climate_work=cw,
         )
         return (code, n, None)
     except Exception as e:
         return (code, 0, str(e))
+
+
+def _default_workers() -> int:
+    n = os.cpu_count() or 4
+    return max(1, min(12, n - 2))
+
+
+def _init_pool_worker(climate_pack_dir: str | None) -> None:
+    """Mmap shared climate cubes; pin GDAL/BLAS to 1 thread."""
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+    os.environ["GDAL_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    _ensure_pyproj_proj_data()
+    if not climate_pack_dir:
+        return
+    from data_download.xavier_rain_for_daily_npy import load_climate_mmap_pack
+
+    load_climate_mmap_pack(climate_pack_dir)
 
 
 def main() -> None:
@@ -352,47 +508,101 @@ def main() -> None:
         print(
             f"Skipped {n_skipped} municipalities (missing dir or no TIFFs): {skipped_no_dir + skipped_no_tiffs}"
         )
-    workers = max(1, int(args.workers))
-    xavier_arg = args.xavier_pr_nc
-    if xavier_arg is not None and not Path(xavier_arg).is_file():
-        raise SystemExit(f"--xavier-pr-nc not a file: {xavier_arg}")
-    xavier_str = str(Path(xavier_arg).resolve()) if xavier_arg is not None else None
-    xavier_work_path: Path | None = None
-    if xavier_str:
-        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
-        src = Path(xavier_arg).expanduser().resolve()
-        if not src.is_file():
-            raise SystemExit(f"--xavier-pr-nc not a file: {src}")
-        try:
-            blob = src.read_bytes()
-        except OSError as e:
-            raise SystemExit(f"Could not read --xavier-pr-nc ({src}): {e}") from e
-        tmp = tempfile.NamedTemporaryFile(
-            prefix=f"xavier_pr_{uuid.uuid4().hex}_",
-            suffix=".nc",
-            delete=False,
+    workers = max(1, int(args.workers) if args.workers is not None else _default_workers())
+    items = sorted(muni_to_paths.items(), key=lambda x: x[0])
+    if args.limit_munis is not None:
+        items = items[: max(0, int(args.limit_munis))]
+    if args.skip_existing:
+        before = len(items)
+        items = [
+            (code, paths)
+            for code, paths in items
+            if not (out_base / year_range / code / f"{code}.npy").is_file()
+        ]
+        print(
+            f"Skip-existing: {before - len(items)} already on disk, {len(items)} remaining"
         )
-        try:
-            tmp.write(blob)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        finally:
-            tmp.close()
-        xavier_work_path = Path(tmp.name)
+    if not items:
+        print("Nothing to process.")
+        return
+
+    def _optional_nc(path: Path | None, flag: str) -> Path | None:
+        if path is None:
+            return None
+        if not Path(path).is_file():
+            raise SystemExit(f"{flag} not a file: {path}")
+        return Path(path)
+
+    pr_src = _optional_nc(args.xavier_pr_nc, "--xavier-pr-nc")
+    climate_src = {
+        "tmax": _optional_nc(args.xavier_tmax_nc, "--xavier-tmax-nc"),
+        "tmin": _optional_nc(args.xavier_tmin_nc, "--xavier-tmin-nc"),
+        "rs": _optional_nc(args.xavier_rs_nc, "--xavier-rs-nc"),
+        "eto": _optional_nc(args.xavier_eto_nc, "--xavier-eto-nc"),
+    }
+
+    work_copies: list[Path] = []
+    xavier_work_path: Path | None = None
+    climate_work: dict[str, Path | None] = {k: None for k, _ in CUM_CLIMATE_SPECS}
+    try:
+        if pr_src is not None:
+            xavier_work_path = _copy_nc_to_work(pr_src, "xavier_pr")
+            work_copies.append(xavier_work_path)
+        for key, src in climate_src.items():
+            if src is None:
+                continue
+            wp = _copy_nc_to_work(src, f"xavier_{key}")
+            work_copies.append(wp)
+            climate_work[key] = wp
+    except Exception:
+        for p in work_copies:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+    n_out = 11
+    if pr_src is not None or any(climate_work.values()):
+        n_out = 13
+    if any(climate_work.values()):
+        n_out = 17
 
     print(
-        f"Processing {len(muni_to_paths)} municipalities, year-range {year_range}, "
-        f"season_start={season_start} (DOY 1), workers={workers}"
-        + (f", xavier_pr_nc={xavier_str}" if xavier_str else "")
-        + (f", xavier_work_copy={xavier_work_path}" if xavier_work_path else "")
+        f"Processing {len(items)} municipalities, year-range {year_range}, "
+        f"season_start={season_start} (DOY 1), workers={workers}, n_channels={n_out}"
+        + (f", pr={pr_src}" if pr_src else "")
+        + "".join(
+            f", {k}={climate_src[k]}" for k in climate_work if climate_src[k] is not None
+        )
     )
     total_pixels = 0
     failed: list[tuple[str, str]] = []
-    items = sorted(muni_to_paths.items(), key=lambda x: x[0])
     xavier_work_str = os.fspath(xavier_work_path) if xavier_work_path else None
+    climate_work_str = {
+        k: (os.fspath(v) if v is not None else None) for k, v in climate_work.items()
+    }
 
+    climate_pairs: list[tuple[str, str]] = []
+    if xavier_work_str:
+        climate_pairs.append((xavier_work_str, "pr"))
+    for key, var_name in CUM_CLIMATE_SPECS:
+        pth = climate_work_str.get(key)
+        if pth:
+            climate_pairs.append((pth, var_name))
+
+    pack_dir: Path | None = None
     try:
+        pack_dir_str: str | None = None
+        if climate_pairs:
+            from data_download.xavier_rain_for_daily_npy import write_climate_mmap_pack
+
+            pack_dir = Path(tempfile.mkdtemp(prefix="xavier_cubes_"))
+            write_climate_mmap_pack(climate_pairs, pack_dir)
+            pack_dir_str = os.fspath(pack_dir)
+
         if workers <= 1:
+            _init_pool_worker(pack_dir_str)
             for code, paths in tqdm(items, desc="Municipalities", unit="muni"):
                 try:
                     n = process_municipality(
@@ -402,13 +612,18 @@ def main() -> None:
                         out_base,
                         season_start,
                         xavier_pr_work=xavier_work_path,
+                        climate_work=climate_work,
                     )
                     total_pixels += n
                 except Exception as e:
                     failed.append((code, str(e)))
                     print(f"[ERROR] {code}: {e}")
         else:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_pool_worker,
+                initargs=(pack_dir_str,),
+            ) as executor:
                 futures = {
                     executor.submit(
                         _process_municipality_worker,
@@ -418,6 +633,7 @@ def main() -> None:
                         out_base,
                         season_start,
                         xavier_work_str,
+                        climate_work_str,
                     ): code
                     for code, paths in items
                 }
@@ -441,11 +657,13 @@ def main() -> None:
                 f"Failed {len(failed)} municipality/municipalities (re-run after fixing disk/OneDrive): {[c for c, _ in failed]}"
             )
     finally:
-        if xavier_work_path is not None:
+        for p in work_copies:
             try:
-                xavier_work_path.unlink(missing_ok=True)
+                p.unlink(missing_ok=True)
             except OSError:
                 pass
+        if pack_dir is not None:
+            shutil.rmtree(pack_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -58,6 +58,98 @@ def _season_months_from_doys(doys: np.ndarray, reference_date: date) -> np.ndarr
     return lut[doy_i]
 
 
+_INVALID_DOY_SORT = np.int64(10_000)
+
+
+def sort_in_season_chunk(
+    chunk_arr: np.ndarray,
+    *,
+    season_lut: np.ndarray,
+    sequencelength: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Copy a pixel chunk, keep season months 1..6, sort by DOY, truncate to ``sequencelength``.
+
+    Returns ``(packed, season_month)`` with shapes ``[N, T, C]`` and ``[N, T]``.
+    ``season_month`` is 0 for padded / out-of-window slots. Pixels with no in-season
+    days are dropped. One sort can then be reused for every k by masking ``season <= k``.
+    """
+    if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
+        chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
+    _n, t, _c = chunk_arr.shape
+    doy = np.clip(
+        chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
+        0,
+        season_lut.shape[0] - 1,
+    )
+    season = season_lut[doy]
+    in_season = season >= 1
+    n_in = in_season.sum(axis=1)
+    keep = n_in > 0
+    if not np.any(keep):
+        return None
+    if not bool(keep.all()):
+        chunk_arr = chunk_arr[keep]
+        season = season[keep]
+        doy = doy[keep]
+        in_season = in_season[keep]
+        n_in = n_in[keep]
+
+    t_keep = min(int(sequencelength), int(t))
+    sort_key = np.where(in_season, doy, _INVALID_DOY_SORT)
+    order = np.argsort(sort_key, axis=1, kind="mergesort")
+    packed = np.take_along_axis(chunk_arr, order[:, :, None], axis=1)[:, :t_keep]
+    season_p = np.take_along_axis(season, order, axis=1)[:, :t_keep]
+    prefix = np.arange(t_keep, dtype=np.int32)[None, :] < np.minimum(n_in, t_keep)[
+        :, None
+    ]
+    season_p = np.where(prefix, season_p, np.int8(0))
+    return packed, season_p
+
+
+def pack_incomplete_series_chunk(
+    chunk_arr: np.ndarray,
+    *,
+    season_lut: np.ndarray,
+    num_periods: int,
+    sequencelength: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Vectorized incomplete-series pack: keep season months 1..k, earliest DOY first.
+
+    Returns ``(packed, timestep_valid)`` with shapes ``[N, T, C]`` and ``[N, T]``,
+    ``T = min(sequencelength, original T)``. Pixels with no in-window days are dropped.
+    """
+    if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
+        chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
+    n, t, _c = chunk_arr.shape
+    doy = np.clip(
+        chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
+        0,
+        season_lut.shape[0] - 1,
+    )
+    valid = (season_lut[doy] >= 1) & (season_lut[doy] <= int(num_periods))
+    n_valid = valid.sum(axis=1)
+    keep = n_valid > 0
+    if not np.any(keep):
+        return None
+    if not bool(keep.all()):
+        chunk_arr = chunk_arr[keep]
+        valid = valid[keep]
+        doy = doy[keep]
+        n_valid = n_valid[keep]
+        n = int(chunk_arr.shape[0])
+
+    t_keep = min(int(sequencelength), int(t))
+    sort_key = np.where(valid, doy, _INVALID_DOY_SORT)
+    order = np.argsort(sort_key, axis=1, kind="mergesort")
+    packed = np.take_along_axis(chunk_arr, order[:, :, None], axis=1)[:, :t_keep]
+    timestep_valid = np.arange(t_keep, dtype=np.int32)[None, :] < np.minimum(
+        n_valid, t_keep
+    )[:, None]
+    return packed, timestep_valid
+
+
 # Default: no coverage filter (use all municipality–year rows).
 # Optional suggested band for S2 footprint vs IBGE planted area:
 #   --min-coverage-ratio 0.8 --max-coverage-ratio 1.2
@@ -564,9 +656,31 @@ class USCropsAggregatedNPY(Dataset):
                 f"  ⚠️  Could not read any .npy to verify channel count for layout {self.feature_layout!r}."
             )
 
-    def _transform_chunk(self, chunk_arr):
+    def _transform_chunk(self, chunk_arr, timestep_valid=None):
         """Vectorized transform (delegates to PixelTransform — same as training)."""
-        return self.pixel_transform.transform_chunk(chunk_arr)
+        return self.pixel_transform.transform_chunk(
+            chunk_arr, timestep_valid=timestep_valid
+        )
+
+    def pack_sorted_season_chunk(self, chunk_arr, reference_date: date):
+        """Sort in-season days once so every k can reuse the same packed chunk."""
+        packed = sort_in_season_chunk(
+            chunk_arr,
+            season_lut=_season_month_lut(reference_date),
+            sequencelength=int(self.sequencelength),
+        )
+        if packed is None:
+            return None
+        chunk_arr, season_p = packed
+        valid = season_p >= 1
+        seq_len = int(self.sequencelength)
+        n, t_keep = season_p.shape
+        if t_keep < seq_len:
+            season_pad = np.zeros((n, seq_len), dtype=np.int16)
+            season_pad[:, :t_keep] = season_p
+        else:
+            season_pad = np.ascontiguousarray(season_p, dtype=np.int16)
+        return self._transform_chunk(chunk_arr, timestep_valid=valid), season_pad
 
     def _resolve_load_year(self, municipality_code, year=None):
         """Return the harvest year used to locate a municipality .npy file."""
@@ -642,39 +756,21 @@ class USCropsAggregatedNPY(Dataset):
             return
 
         season_lut = _season_month_lut(reference_date)
+        seq_len = int(self.sequencelength)
         num_pixels = len(municipality_data)
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
             chunk_view = municipality_data[start:end]
-            if chunk_view.dtype == np.float32:
-                chunk_arr = np.ascontiguousarray(chunk_view)
-            else:
-                chunk_arr = np.asarray(chunk_view, dtype=np.float32)
-            n_pixels = chunk_arr.shape[0]
-            doy_i = np.clip(
-                chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
-                0,
-                season_lut.shape[0] - 1,
+            packed = pack_incomplete_series_chunk(
+                chunk_view,
+                season_lut=season_lut,
+                num_periods=num_periods,
+                sequencelength=seq_len,
             )
-            season_m = season_lut[doy_i]
-            valid = (season_m >= 1) & (season_m <= num_periods)
-            filtered: list[np.ndarray | None] = [None] * n_pixels
-            for i in range(n_pixels):
-                idx = np.flatnonzero(valid[i])
-                if idx.size == 0:
-                    continue
-                sub = chunk_arr[i, idx, :]
-                order = np.argsort(sub[:, DOY_CHANNEL], kind="stable")
-                filtered[i] = sub[order]
-            by_len: dict[int, list[int]] = defaultdict(list)
-            for i, sub in enumerate(filtered):
-                if sub is not None:
-                    by_len[sub.shape[0]].append(i)
-            for indices in by_len.values():
-                stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
-                if stacked.shape[0] == 0:
-                    continue
-                yield self._transform_chunk(stacked)
+            if packed is None:
+                continue
+            chunk_arr, timestep_valid = packed
+            yield self._transform_chunk(chunk_arr, timestep_valid=timestep_valid)
 
     def load_pixels_from_municipality_with_periods(
         self, municipality_code, year, num_periods, chunk_size=400, reference_date=None

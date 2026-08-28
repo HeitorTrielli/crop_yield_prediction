@@ -22,6 +22,14 @@ _LAYOUT: dict[str, dict[str, Any]] = {
         "extra_channels_slice": (11, 13),
         "description": "10 bands + 2 Xavier rain channels (11:13), scaled; DOY → PE.",
     },
+    "spectral_xavier_climate": {
+        "input_dim": 16,
+        "extra_channels_slice": (11, 17),
+        "description": (
+            "10 bands + rain (11:13) + cumulative Tmax/Tmin/Rs/ETo (13:17); DOY → PE. "
+            "Requires 17-channel daily .npy."
+        ),
+    },
 }
 
 
@@ -37,6 +45,8 @@ def normalize_feature_layout(name: str) -> str:
         "xavier": "spectral_xavier",
         "xavier_rain": "spectral_xavier",
         "s2_xavier": "spectral_xavier",
+        "xavier_climate": "spectral_xavier_climate",
+        "spectral_climate": "spectral_xavier_climate",
     }
     key = aliases.get(key, key)
     if key not in _LAYOUT:

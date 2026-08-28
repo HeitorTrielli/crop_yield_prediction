@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import torch
 
-from datasets.pixel_chunk import iter_batch_municipality_chunks, iter_batch_municipality_period_chunks
+from datasets.pixel_chunk import (
+    PrefetchIterator,
+    iter_batch_municipality_chunks,
+    iter_batch_municipality_period_chunks,
+    iter_npy_array_batch_chunks,
+    prepare_chunk_on_device,
+)
 
 
 def pixel_chunk_size(args) -> int:
@@ -182,6 +188,7 @@ def iter_inference_period_batch_chunks(
 
     skip = skip_muni_indices or set()
     use_pipeline = pipeline_h2d(args, device)
+    mmap_lookahead = bool(getattr(args, "mmap_lookahead", True))
     yield from iter_batch_municipality_period_chunks(
         dataset,
         municipalities,
@@ -195,5 +202,59 @@ def iter_inference_period_batch_chunks(
         pipeline_h2d=use_pipeline,
         pin_host=h2d_pin_host(args),
         skip_muni_indices=skip,
-        mmap_lookahead=True,
+        mmap_lookahead=mmap_lookahead,
     )
+
+
+def iter_sorted_season_inference_chunks(
+    dataset,
+    municipalities,
+    years,
+    num_pixels_list,
+    chunk_size: int,
+    args,
+    device: torch.device,
+    *,
+    reference_date,
+    skip_muni_indices: set[int] | None = None,
+):
+    """
+    Yield ``(muni_idx, cpu_or_gpu_chunk, season_month)`` after one sort of in-season days.
+
+    ``season_month`` is ``[N, T]`` int16 (0 = pad). Every k reuses the same packed chunk.
+    """
+    from training_runtime import h2d_pin_host
+
+    skip = skip_muni_indices or set()
+    mmap_lookahead = bool(getattr(args, "mmap_lookahead", True))
+    packed_prefetch = min(max(prefetch_depth(args), 1), 4)
+    pin_host = h2d_pin_host(args)
+    use_pipeline = pipeline_h2d(args, device)
+
+    def _packed():
+        for muni_idx, raw in iter_npy_array_batch_chunks(
+            dataset,
+            municipalities,
+            years,
+            num_pixels_list,
+            chunk_size=chunk_size,
+            prefetch_depth=0,
+            skip_muni_indices=skip,
+            mmap_lookahead=mmap_lookahead,
+        ):
+            packed = dataset.pack_sorted_season_chunk(raw, reference_date)
+            if packed is None:
+                continue
+            chunk, season_p = packed
+            yield muni_idx, chunk, torch.from_numpy(season_p)
+
+    stream = PrefetchIterator(_packed(), max_pending=packed_prefetch)
+    if use_pipeline:
+        for muni_idx, chunk, season_p in stream:
+            yield (
+                muni_idx,
+                prepare_chunk_on_device(chunk, device, pin_host=pin_host),
+                season_p,
+            )
+        return
+    yield from stream

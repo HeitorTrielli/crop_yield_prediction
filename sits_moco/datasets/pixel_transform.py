@@ -24,6 +24,21 @@ def scale_xavier_rain_channels(rain: np.ndarray) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def scale_xavier_climate_channels(extra: np.ndarray) -> np.ndarray:
+    """Scale .npy extras 11:17: rain, dry streak, cum Tmax, Tmin, Rs, ETo."""
+    out = np.asarray(extra, dtype=np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if out.shape[-1] < 6:
+        raise ValueError(f"expected 6 climate extras, got {out.shape}")
+    out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
+    out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
+    out[..., 2] = np.clip(out[..., 2] / 6000.0, 0.0, 4.0)
+    out[..., 3] = np.clip(out[..., 3] / 4000.0, 0.0, 4.0)
+    out[..., 4] = np.clip(out[..., 4] / 4000.0, 0.0, 4.0)
+    out[..., 5] = np.clip(out[..., 5] / 1500.0, 0.0, 4.0)
+    return out.astype(np.float32)
+
+
 # Sentinel-2 reflectance normalization (training default)
 SPECTRAL_MEAN = np.array(
     [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]],
@@ -78,6 +93,8 @@ class PixelTransform:
                 extra = chunk_arr[:, :, lo:hi].astype(np.float32)
                 if (lo, hi) == (11, 13):
                     extra = scale_xavier_rain_channels(extra)
+                elif (lo, hi) == (11, 17):
+                    extra = scale_xavier_climate_channels(extra)
                 else:
                     extra = np.nan_to_num(extra, nan=0.0, posinf=0.0, neginf=0.0)
             else:
@@ -87,7 +104,11 @@ class PixelTransform:
             x = x_spec_n
         return x, weight, doy
 
-    def transform_chunk(self, chunk_arr: np.ndarray) -> BatchChunk:
+    def transform_chunk(
+        self,
+        chunk_arr: np.ndarray,
+        timestep_valid: np.ndarray | None = None,
+    ) -> BatchChunk:
         """Return (x, mask, doy, weight) each [N, T, ...] — batched, no per-pixel list."""
         if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
             chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
@@ -95,6 +116,37 @@ class PixelTransform:
         x, weight, doy = self.features_from_chunk(chunk_arr)
         fdim = self.input_feature_dim
         seq_len = self.sequencelength
+
+        if timestep_valid is not None:
+            valid = np.asarray(timestep_valid, dtype=bool)
+            if valid.shape != (n, t):
+                raise ValueError(
+                    f"timestep_valid shape {valid.shape} != chunk {(n, t)}"
+                )
+            t_use = min(t, seq_len)
+            x_use = x[:, :t_use]
+            doy_use = doy[:, :t_use]
+            valid_use = valid[:, :t_use]
+            weight_use = np.where(valid_use, weight[:, :t_use], 0.0)
+            mask = np.zeros((n, seq_len), dtype=np.int32)
+            x_pad = np.zeros((n, seq_len, fdim), dtype=np.float32)
+            doy_pad_broadcast = np.zeros((n, seq_len), dtype=np.int32)
+            weight_pad = np.zeros((n, seq_len), dtype=np.float64)
+            mask[:, :t_use] = valid_use.astype(np.int32)
+            x_pad[:, :t_use] = x_use
+            doy_pad_broadcast[:, :t_use] = doy_use
+            weight_pad[:, :t_use] = weight_use
+            wsum = weight_pad.sum(axis=1, keepdims=True)
+            weight_pad /= np.where(wsum > 0, wsum, 1.0)
+            x_pad = np.ascontiguousarray(x_pad.astype(np.float32))
+            doy_pad_broadcast = np.ascontiguousarray(doy_pad_broadcast.astype(np.int64))
+            weight_pad = np.ascontiguousarray(weight_pad.astype(np.float32))
+            return (
+                torch.from_numpy(x_pad),
+                torch.from_numpy(mask == 0),
+                torch.from_numpy(doy_pad_broadcast),
+                torch.from_numpy(weight_pad),
+            )
 
         if self.interp:
             doy_pad = np.linspace(0, 366, seq_len).astype(np.int32)

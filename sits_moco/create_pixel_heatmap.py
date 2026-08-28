@@ -25,7 +25,7 @@ from datasets.feature_layout import (
     feature_layout_input_dim,
     normalize_feature_layout,
 )
-from datasets.pixel_transform import DOY_CHANNEL
+from datasets.pixel_transform import DOY_CHANNEL, scale_xavier_climate_channels
 from datasets.uscrops_aggregated_npy_polars import (
     _indices_first_n_months,
     scale_xavier_rain_channels,
@@ -507,6 +507,12 @@ def transform_pixel(
         else:
             rain = np.zeros((t_len, 2), dtype=np.float32)
         x = np.concatenate([x_spec_n, rain], axis=-1)
+    elif input_dim == 16:
+        if c_in >= 17:
+            extra = scale_xavier_climate_channels(raw[:, 11:17])
+        else:
+            extra = np.zeros((t_len, 6), dtype=np.float32)
+        x = np.concatenate([x_spec_n, extra], axis=-1)
     else:
         x = x_spec_n
 
@@ -813,7 +819,13 @@ def reconstruct_spatial_predictions(
         print(
             "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
             f"{municipality_data.shape[-1]} channels per timestep. "
-            "Run data_download/xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
+            "Rebuild daily .npy with --xavier-pr-nc before heatmapping."
+        )
+    if input_dim == 16 and municipality_data.shape[-1] < 17:
+        print(
+            "  ⚠️  Warning: checkpoint uses spectral_xavier_climate (16 inputs) but .npy has "
+            f"{municipality_data.shape[-1]} channels per timestep. "
+            "Rebuild daily .npy with rain + Tmax/Tmin/Rs/ETo NetCDFs."
         )
 
     # Recompute keep-mask in the exact same way as preprocess_daily_to_npy
