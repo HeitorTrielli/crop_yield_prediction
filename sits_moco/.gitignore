@@ -171,6 +171,7 @@ main_bert.py
 preprocess_old/
 
 files/
+sits_moco_data/
 heatmaps/
 *.csv
 */credentials.json

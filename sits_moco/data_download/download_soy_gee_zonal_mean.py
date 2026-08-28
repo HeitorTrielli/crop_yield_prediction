@@ -25,8 +25,13 @@ Usage:
   python data_download/download_soy_gee_zonal_mean.py \\
       --shapefile-dir files/shapefiles --season-years 2020-2024 --inventory-only
 
+  # Pull chunk CSVs already on Drive (no new GEE exports); skip munis on disk:
   python data_download/download_soy_gee_zonal_mean.py \\
-      --shapefile files/shapefiles/4100103/4100103.shp --season-year 2024
+      --shapefile-dir files/shapefiles --ingest-drive --skip-existing
+
+  # Same, from a local folder of Drive downloads:
+  python data_download/download_soy_gee_zonal_mean.py \\
+      --shapefile-dir files/shapefiles --ingest-dir ~/Downloads/GEE_Soy_Zonal_Export --skip-existing
 
 Output layout:
   {output_dir}/{YYYY-YYYY}/{municipality_code}/
@@ -41,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 import threading
 import time
@@ -116,7 +122,7 @@ def log(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    shape_group = p.add_mutually_exclusive_group(required=True)
+    shape_group = p.add_mutually_exclusive_group(required=False)
     shape_group.add_argument(
         "--shapefile",
         type=Path,
@@ -270,6 +276,22 @@ def parse_args() -> argparse.Namespace:
         help="Skip municipality if {code}_zonal.csv already exists",
     )
     p.add_argument(
+        "--ingest-drive",
+        action="store_true",
+        help="Download chunk CSVs already in --drive-folder and split them; no GEE export",
+    )
+    p.add_argument(
+        "--ingest-dir",
+        type=Path,
+        default=None,
+        help="Local folder of zonal_*.csv chunk tables to split (no Drive, no GEE)",
+    )
+    p.add_argument(
+        "--delete-drive-after",
+        action="store_true",
+        help="With --ingest-drive, delete each Drive CSV after it is split",
+    )
+    p.add_argument(
         "--states",
         type=str,
         default=None,
@@ -277,6 +299,9 @@ def parse_args() -> argparse.Namespace:
         "Default: all municipalities under --shapefile-dir",
     )
     args = p.parse_args()
+    args.ingest_only = bool(args.ingest_drive) or args.ingest_dir is not None
+    if args.ingest_drive and args.ingest_dir is not None:
+        p.error("Use only one of --ingest-drive or --ingest-dir")
 
     if args.shapefile_dir is not None:
         d = Path(args.shapefile_dir).resolve()
@@ -288,10 +313,13 @@ def parse_args() -> argparse.Namespace:
                 shps = list(subdir.glob("*.shp"))
                 if shps:
                     args.shapefiles.append(shps[0])
-        if not args.shapefiles:
+        if not args.shapefiles and not args.ingest_only:
             p.error(f"No .shp files found under {d}")
     else:
         args.shapefiles = [Path(p).resolve() for p in (args.shapefiles or [])]
+
+    if not args.shapefiles and not args.ingest_only:
+        p.error("Set --shapefile or --shapefile-dir")
 
     if args.states:
         try:
@@ -300,7 +328,7 @@ def parse_args() -> argparse.Namespace:
             p.error(str(e))
         kept = filter_shapefiles_by_states(args.shapefiles, state_codes)
         labels = ",".join(UF_BY_CODE[c] for c in state_codes)
-        if not kept:
+        if not kept and not args.ingest_only:
             p.error(
                 f"--states {args.states} matched 0 shapefiles "
                 f"(looked for IBGE prefixes {state_codes} among "
@@ -323,7 +351,7 @@ def parse_args() -> argparse.Namespace:
         args.season_years_list = parse_season_years_spec(
             args.season_years, args.season_year
         )
-        if not args.season_years_list:
+        if not args.season_years_list and not args.ingest_only:
             p.error("Set --season-year, --season-years, or --start-date/--end-date")
 
     if args.workers is None:
@@ -884,8 +912,9 @@ def split_chunk_csv(
     chunk_csv: Path,
     shapefiles: list[Path],
     season_root: Path,
+    skip_existing: bool = False,
 ) -> dict[str, int]:
-    """Write per-municipality zonal CSVs. Returns stem → row count."""
+    """Write per-municipality zonal CSVs. Returns stem → row count (-1 if skipped)."""
     lookup: dict[str, str] = {}
     for p in shapefiles:
         for alias in _muni_code_aliases(p.stem):
@@ -896,15 +925,22 @@ def split_chunk_csv(
         for row in csv.DictReader(f):
             stem = _row_muni_stem(row.get("municipality_code", ""), lookup)
             if stem is None:
-                continue
+                raw = str(row.get("municipality_code") or "").strip()
+                try:
+                    stem = f"{int(float(raw)):07d}"
+                except (TypeError, ValueError):
+                    continue
             grouped.setdefault(stem, []).append(row)
 
     counts: dict[str, int] = {p.stem: 0 for p in shapefiles}
     for stem, rows in grouped.items():
-        rows.sort(key=lambda r: str(r.get("date") or ""))
         out_dir = season_root / stem
-        out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{stem}_zonal.csv"
+        if skip_existing and path.is_file():
+            counts[stem] = -1
+            continue
+        rows.sort(key=lambda r: str(r.get("date") or ""))
+        out_dir.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=ZONAL_CSV_FIELDS, extrasaction="ignore")
             w.writeheader()
@@ -952,6 +988,149 @@ def download_drive_csv(
     except Exception as e:
         log(f"{file_prefix}: Drive cleanup warning: {e}")
     return dest_dir / tmp_name
+
+
+def year_range_from_chunk_name(name: str) -> tuple[int, int] | None:
+    m = re.match(r"^zonal_(\d{4})-(\d{4})", Path(name).name)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def year_range_from_chunk_csv(path: Path) -> tuple[int, int] | None:
+    parsed = year_range_from_chunk_name(path.name)
+    if parsed:
+        return parsed
+    with open(path, newline="", encoding="utf-8") as f:
+        row = next(csv.DictReader(f), None)
+    if not row:
+        return None
+    raw_range = str(row.get("year_range") or "").strip()
+    if "-" in raw_range:
+        a, b = raw_range.split("-", 1)
+        try:
+            return int(a), int(b)
+        except ValueError:
+            pass
+    sy = row.get("season_year")
+    try:
+        y = int(float(sy))
+        return y - 1, y
+    except (TypeError, ValueError):
+        return None
+
+
+def ingest_chunk_files(
+    chunk_csvs: list[Path],
+    output_dir: Path,
+    shapefiles: list[Path],
+    skip_existing: bool,
+    harvest_years: set[int] | None,
+) -> tuple[int, int, int]:
+    """Split chunk tables into per-muni CSVs. Returns (wrote, skipped, files)."""
+    n_wrote = n_skip = n_files = 0
+    for chunk_csv in chunk_csvs:
+        yr = year_range_from_chunk_csv(chunk_csv)
+        if yr is None:
+            log(f"ingest skip (no season in name/rows): {chunk_csv.name}")
+            continue
+        y1, y2 = yr
+        if harvest_years and y2 not in harvest_years:
+            continue
+        n_files += 1
+        season_root = output_dir / f"{y1}-{y2}"
+        counts = split_chunk_csv(
+            chunk_csv, shapefiles, season_root, skip_existing=skip_existing
+        )
+        wrote = sum(1 for n in counts.values() if n > 0)
+        skipped = sum(1 for n in counts.values() if n < 0)
+        n_wrote += wrote
+        n_skip += skipped
+        log(
+            f"ingest {chunk_csv.name}: {wrote} new munis, {skipped} already on disk "
+            f"→ {season_root}"
+        )
+    return n_wrote, n_skip, n_files
+
+
+def ingest_from_drive(args: argparse.Namespace) -> None:
+    drive_service = build_drive_service(args.credentials_dir)
+    fid = get_folder_id_by_name(drive_service, args.drive_folder)
+    if not fid:
+        raise SystemExit(f"Drive folder not found: {args.drive_folder}")
+    files = [
+        f
+        for f in list_files_in_folder(drive_service, fid)
+        if str(f.get("name") or "").startswith("zonal_")
+        and str(f.get("name") or "").lower().endswith(".csv")
+    ]
+    harvest = set(args.season_years_list) if args.season_years_list else None
+    if harvest:
+        kept = []
+        for f in files:
+            yr = year_range_from_chunk_name(f["name"])
+            if yr is None or yr[1] in harvest:
+                kept.append(f)
+        files = kept
+    files.sort(key=lambda f: str(f.get("name") or ""))
+    if not files:
+        log(f"No zonal_*.csv in Drive folder {args.drive_folder}")
+        return
+    tmp_dir = Path(args.output_dir).expanduser().resolve() / "_drive_ingest"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    shapefiles = [Path(p).resolve() for p in (args.shapefiles or [])]
+    skip = bool(args.skip_existing)
+    n_wrote = n_skip = 0
+    log(f"Ingest {len(files)} Drive CSVs from {args.drive_folder} (no GEE export)")
+    for meta in files:
+        name = meta["name"]
+        dest = tmp_dir / name
+        log(f"download {name}")
+        download_file_from_drive(drive_service, meta["id"], name, tmp_dir)
+        w, s, _ = ingest_chunk_files(
+            [dest],
+            Path(args.output_dir).expanduser().resolve(),
+            shapefiles,
+            skip,
+            harvest,
+        )
+        n_wrote += w
+        n_skip += s
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if args.delete_drive_after:
+            try:
+                delete_file_from_drive(drive_service, meta["id"])
+            except Exception as exc:
+                log(f"{name}: Drive cleanup warning: {exc}")
+    log(f"Ingest done: {n_wrote} new municipality CSVs, {n_skip} already existed")
+
+
+def ingest_from_dir(args: argparse.Namespace) -> None:
+    folder = Path(args.ingest_dir).expanduser().resolve()
+    if not folder.is_dir():
+        raise SystemExit(f"--ingest-dir is not a directory: {folder}")
+    chunks = sorted(
+        p
+        for p in folder.iterdir()
+        if p.is_file() and p.name.startswith("zonal_") and p.suffix.lower() == ".csv"
+    )
+    harvest = set(args.season_years_list) if args.season_years_list else None
+    shapefiles = [Path(p).resolve() for p in (args.shapefiles or [])]
+    log(f"Ingest {len(chunks)} local chunk CSVs from {folder} (no GEE, no Drive)")
+    n_wrote, n_skip, n_files = ingest_chunk_files(
+        chunks,
+        Path(args.output_dir).expanduser().resolve(),
+        shapefiles,
+        bool(args.skip_existing),
+        harvest,
+    )
+    log(
+        f"Ingest done: {n_files} chunk files → {n_wrote} new municipality CSVs, "
+        f"{n_skip} already existed"
+    )
 
 
 def run_one_chunk(
@@ -1311,6 +1490,13 @@ def run_season_batch(
 
 def main() -> None:
     args = parse_args()
+
+    if args.ingest_dir is not None:
+        ingest_from_dir(args)
+        return
+    if args.ingest_drive:
+        ingest_from_drive(args)
+        return
 
     shapefiles = [Path(p).resolve() for p in args.shapefiles]
     for shp in shapefiles:
