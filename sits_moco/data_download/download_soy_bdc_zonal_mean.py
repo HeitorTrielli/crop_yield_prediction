@@ -237,6 +237,15 @@ def parse_args() -> argparse.Namespace:
         default="4,5",
         help="Sen2Cor SCL classes treated as clear (default: 4,5)",
     )
+    p.add_argument(
+        "--harmonize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Subtract 1000 DN on spectral bands when processing baseline >= 04.00 "
+            "(GEE S2_SR_HARMONIZED). Default: on."
+        ),
+    )
     p.add_argument("--limit", type=int, default=None, help="Max municipalities (debug)")
     args = p.parse_args()
     if args.shapefile_dir is not None:
@@ -297,6 +306,7 @@ def _job(payload: dict[str, Any]) -> dict[str, str]:
             payload["mapbiomas_path"],
             soy_px,
             scl_clear=frozenset(payload["scl_clear"]),
+            harmonize=bool(payload.get("harmonize", True)),
         )
         if not rows:
             return {
@@ -371,6 +381,7 @@ def run_season(args: argparse.Namespace, season_year: int) -> tuple[int, int]:
                 "cloud_pct": args.cloud_pct,
                 "collection": args.collection,
                 "scl_clear": list(args.scl_clear),
+                "harmonize": bool(args.harmonize),
             }
         )
         if args.limit is not None and len(jobs) >= args.limit:

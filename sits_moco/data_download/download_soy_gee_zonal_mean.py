@@ -7,6 +7,8 @@ For each season:
   2. Chunk municipalities by UF and run one S2 reduceRegions export per chunk
      (one daily mosaic, many polygons — far cheaper than one GEE task per muni)
   3. Split the Drive table into one CSV per municipality (same schema as before)
+     (GEE COMPLETED can precede Drive listing; wait --drive-wait before giving up,
+     and do not start a new export just because the CSV is late)
   4. Quality columns: valid_pixel_count, clear_fraction, mean_cloud_score_soy
   5. Sidecar area file: mapbiomas_soy_area_ha vs IBGE PAM (filter after download)
 
@@ -104,8 +106,15 @@ from download_pam_soy_sidra import (
 )
 
 DEFAULT_CREDENTIALS_DIR = Path("data")
+DEFAULT_DRIVE_WAIT_SECONDS = 900
 _LOG_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
+
+
+class DriveLagError(RuntimeError):
+    """GEE export finished but the CSV is not listed on Drive yet (or still missing)."""
+
+
 INVENTORY_FIELDS = [
     "municipality_code",
     "season_year",
@@ -263,6 +272,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Seconds between GEE task polls",
+    )
+    p.add_argument(
+        "--drive-wait",
+        type=int,
+        default=DEFAULT_DRIVE_WAIT_SECONDS,
+        metavar="SEC",
+        help=(
+            "After GEE COMPLETED, keep polling Drive for the CSV before giving up "
+            f"(default: {DEFAULT_DRIVE_WAIT_SECONDS}s). Does not start a new export."
+        ),
     )
     p.add_argument(
         "--credentials-dir",
@@ -955,31 +974,52 @@ def split_chunk_csv(
     return counts
 
 
+def _drive_csv_candidates(files: list[dict], file_prefix: str) -> list[dict]:
+    named = [
+        f
+        for f in files
+        if f.get("name", "").startswith(file_prefix)
+        and str(f["name"]).endswith(".csv")
+    ]
+    if named:
+        return named
+    return [f for f in files if file_prefix in f.get("name", "")]
+
+
 def download_drive_csv(
     drive_service: Any,
     drive_folder: str,
     file_prefix: str,
     dest_dir: Path,
+    wait_seconds: int = DEFAULT_DRIVE_WAIT_SECONDS,
+    poll_interval: int = 30,
 ) -> Path:
-    fid = get_folder_id_by_name(drive_service, drive_folder)
-    if not fid:
-        raise RuntimeError("Drive folder not found after export")
+    """Poll Drive until the export CSV appears. GEE COMPLETED often precedes Drive listing."""
+    wait_seconds = max(0, int(wait_seconds))
+    poll_interval = max(5, int(poll_interval))
+    deadline = time.monotonic() + wait_seconds
+    fid: str | None = None
     candidates: list[dict] = []
-    for attempt in range(8):
-        files = list_files_in_folder(drive_service, fid)
-        candidates = [
-            f
-            for f in files
-            if f.get("name", "").startswith(file_prefix)
-            and str(f["name"]).endswith(".csv")
-        ]
-        if not candidates:
-            candidates = [f for f in files if file_prefix in f.get("name", "")]
+    while True:
+        remaining = deadline - time.monotonic()
+        if fid is None:
+            fid = get_folder_id_by_name(drive_service, drive_folder)
+        if fid:
+            files = list_files_in_folder(drive_service, fid)
+            candidates = _drive_csv_candidates(files, file_prefix)
         if candidates:
             break
-        time.sleep(5 + attempt)
-    if not candidates:
-        raise RuntimeError("CSV not found on Drive after export")
+        if remaining <= 0:
+            if fid is None:
+                raise DriveLagError("Drive folder not found after export")
+            raise DriveLagError("CSV not found on Drive after export")
+        sleep_s = min(poll_interval, remaining)
+        where = "folder" if fid is None else "CSV"
+        log(
+            f"{file_prefix}: {where} not on Drive yet; "
+            f"waiting {sleep_s:.0f}s ({remaining:.0f}s left, no new GEE task)"
+        )
+        time.sleep(sleep_s)
     dest_dir.mkdir(parents=True, exist_ok=True)
     tmp_name = candidates[0]["name"]
     download_file_from_drive(drive_service, candidates[0]["id"], tmp_name, dest_dir)
@@ -1162,6 +1202,19 @@ def run_one_chunk(
             inventory,
             label,
         )
+    except DriveLagError as exc:
+        log(
+            f"{label}: {exc}. GEE already completed — not starting another export. "
+            "Pull later with --ingest-drive --skip-existing."
+        )
+        return [
+            {
+                "municipality_code": p.stem,
+                "status": "error",
+                "note": str(exc),
+            }
+            for p in shapefiles
+        ]
     except Exception as exc:
         if len(shapefiles) > 1:
             log(f"{label}: failed ({exc}); splitting into two smaller chunks")
@@ -1273,7 +1326,12 @@ def _export_and_split_chunk(
     tmp_dir = season_root / "_chunks"
     drive_service = thread_drive_service(args.credentials_dir)
     chunk_csv = download_drive_csv(
-        drive_service, args.drive_folder, file_prefix, tmp_dir
+        drive_service,
+        args.drive_folder,
+        file_prefix,
+        tmp_dir,
+        wait_seconds=getattr(args, "drive_wait", DEFAULT_DRIVE_WAIT_SECONDS),
+        poll_interval=args.poll_interval,
     )
     counts = split_chunk_csv(chunk_csv, shapefiles, season_root)
     try:
