@@ -149,8 +149,25 @@ def get_sup_dataloader(
 
 
 def get_moco_dataloader(
-    datapath, year, batchsize, workers, sequencelength, num, rc, seed, useall
+    datapath,
+    year,
+    batchsize,
+    workers,
+    sequencelength,
+    num,
+    rc,
+    seed,
+    useall,
+    year_ranges=None,
+    max_samples=500_000,
+    rebuild_cache=False,
+    feature_layout="spectral",
 ):
+    from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
+
+    feature_layout = normalize_feature_layout(feature_layout)
+    input_dim = feature_layout_input_dim(feature_layout)
+
     train_dataaug = transforms.Compose(
         [
             RandomTempShift(),
@@ -160,16 +177,37 @@ def get_moco_dataloader(
         ]
     )
 
-    pretraindataset = MoCoDataset(
-        root=datapath,
-        year=year,
-        sequencelength=sequencelength,
-        dataaug=train_dataaug,
-        num=num,
-        randomchoice=rc,
-        seed=seed,
-        useall=useall,
-    )
+    datapath = Path(datapath)
+    if year_ranges or is_parana_npy_layout(datapath):
+        if not year_ranges:
+            # Single --year Y interpreted as harvest year → (Y-1)-Y
+            year_ranges = harvest_years_to_year_ranges([int(year)])
+        # --useall / --num only affect max_samples when Paraná layout is used
+        if useall:
+            n_samples = int(max_samples) if max_samples and max_samples > 0 else 500_000
+        else:
+            n_samples = int(num) if num and num > 0 else int(max_samples)
+        pretraindataset = ParanaMoCoDataset(
+            root=datapath,
+            year_ranges=list(year_ranges),
+            sequencelength=sequencelength,
+            dataaug=train_dataaug,
+            max_samples=n_samples,
+            seed=seed,
+            rebuild_cache=rebuild_cache,
+            feature_layout=feature_layout,
+        )
+    else:
+        pretraindataset = MoCoDataset(
+            root=datapath,
+            year=year,
+            sequencelength=sequencelength,
+            dataaug=train_dataaug,
+            num=num,
+            randomchoice=rc,
+            seed=seed,
+            useall=useall,
+        )
 
     num = len(pretraindataset)
     num_train = int(num * 0.9)
@@ -196,7 +234,10 @@ def get_moco_dataloader(
         drop_last=True,
     )
     meta = dict(
-        ndims=10,
+        ndims=input_dim,
+        n_samples=num,
+        year_ranges=list(year_ranges) if year_ranges else None,
+        feature_layout=feature_layout,
     )
 
     return traindataloader, valdataloader, meta
@@ -279,6 +320,10 @@ def get_model(modelname, ndims, num_classes, sequencelength, device):
 
 
 def get_moco_model(modelname, device, args):
+    from functools import partial
+
+    from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
+
     modelname = modelname.lower()
     if modelname == "transformer":
         basemodel = TransformerModel
@@ -293,11 +338,42 @@ def get_moco_model(modelname, device, args):
     else:
         raise ValueError("invalid model - basemodel argument")
 
+    feature_layout = normalize_feature_layout(
+        getattr(args, "feature_layout", "spectral")
+    )
+    input_dim = feature_layout_input_dim(feature_layout)
+    d_model = int(getattr(args, "model_d_model", 128))
+    n_head = int(getattr(args, "model_n_head", 16))
+    n_layers = int(getattr(args, "model_n_layers", 1))
+    d_inner = int(getattr(args, "model_d_inner", 128))
+    dropout = float(getattr(args, "model_dropout", 0.2))
+
+    if modelname in ("transformer", "stnet"):
+        basemodel_factory = partial(
+            basemodel,
+            input_dim=input_dim,
+            d_model=d_model,
+            n_head=n_head,
+            n_layers=n_layers,
+            d_inner=d_inner,
+            dropout=dropout,
+        )
+    elif modelname == "ltae":
+        basemodel_factory = partial(
+            basemodel,
+            input_dim=input_dim,
+            d_model=d_model,
+            n_head=n_head,
+            dropout=dropout,
+        )
+    else:
+        basemodel_factory = partial(basemodel, input_dim=input_dim, dropout=dropout)
+
     model = moco.builder.MoCo(
-        basemodel, args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp
+        basemodel_factory, args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp
     )
 
-    model.modelname = f"{model.modelname}{basemodel().modelname}"
+    model.modelname = f"{model.modelname}{basemodel_factory().modelname}"
 
     model = model.to(device)
 

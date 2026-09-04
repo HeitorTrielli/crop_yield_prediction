@@ -30,6 +30,31 @@ def run_eval_batch(
     """
     from torch.amp import autocast
 
+    from training.megapixel_batch import (
+        dataset_supports_megapixel_stack,
+        forward_megapixel_batch,
+        is_megapixel_batch,
+        load_stacked_megapixel_batch,
+        _log_fastpath_once,
+    )
+
+    if is_megapixel_batch(num_pixels_list) and dataset_supports_megapixel_stack(dataset):
+        stacked, kept = load_stacked_megapixel_batch(
+            dataset,
+            municipalities,
+            years,
+            workers=max(1, int(getattr(args, "workers", 8) or 8)),
+        )
+        if stacked is not None and kept:
+            _log_fastpath_once(len(kept))
+            preds = forward_megapixel_batch(model, stacked, device, args)
+            by_kept = {idx: preds[i : i + 1] for i, idx in enumerate(kept)}
+            return [
+                by_kept[muni_idx]
+                for muni_idx in range(len(municipalities))
+                if muni_idx in by_kept
+            ]
+
     use_pipeline_h2d = pipeline_h2d(args, device)
 
     predictions_by_muni: dict[int, list[torch.Tensor]] = {}

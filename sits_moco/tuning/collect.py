@@ -25,6 +25,57 @@ def _read_log_csv(path: Path) -> pd.DataFrame | None:
     return df
 
 
+def _trainlog_epoch_stats(run_dir: Path) -> dict[str, Any]:
+    """Last trained epoch and early-stop checkpoint epoch from trainlog.csv."""
+    df = _read_log_csv(trainlog_path(run_dir))
+    if df is None or df.empty:
+        return {}
+    epochs = pd.Series(pd.to_numeric(df.index, errors="coerce"), index=df.index)
+    mask = epochs.notna()
+    if not mask.any():
+        return {}
+    out: dict[str, Any] = {"n_epochs": int(epochs[mask].max())}
+    col = "valloss" if "valloss" in df.columns else ("r2" if "r2" in df.columns else None)
+    if col is None:
+        return out
+    values = pd.to_numeric(df[col], errors="coerce")
+    ok = mask & values.notna()
+    if not ok.any():
+        return out
+    subset = values[ok]
+    raw_idx = subset.idxmin() if col == "valloss" else subset.idxmax()
+    try:
+        out["best_epoch"] = str(int(pd.to_numeric(raw_idx)))
+    except (TypeError, ValueError):
+        out["best_epoch"] = str(raw_idx)
+    return out
+
+
+def format_run_epochs(outcome: dict, *, mean: bool = False) -> str:
+    """Suffix like ' (11 epochs)' or ' (211 epochs, best 201)' — never 'epoch test'."""
+    n = outcome.get("n_epochs")
+    best = outcome.get("best_epoch")
+    n_f: float | None = None
+    if n is not None:
+        try:
+            n_f = float(n)
+        except (TypeError, ValueError):
+            n_f = None
+    b_i: int | None = None
+    if best is not None:
+        try:
+            b_i = int(best)
+        except (TypeError, ValueError):
+            b_i = None
+    if n_f is None:
+        return ""
+    n_label = f"{n_f:.1f}" if abs(n_f - round(n_f)) > 1e-9 else str(int(round(n_f)))
+    prefix = "mean " if mean else ""
+    if not mean and b_i is not None and abs(b_i - n_f) > 1e-9:
+        return f" ({prefix}{n_label} epochs, best {b_i})"
+    return f" ({prefix}{n_label} epochs)"
+
+
 def best_epoch_metrics(
     run_dir: Path | str,
     *,
@@ -83,6 +134,13 @@ def best_epoch_metrics(
         "objective_value": float(series.loc[idx]),
         "metrics": metrics,
     }
+    train_stats = _trainlog_epoch_stats(run_dir)
+    if train_stats.get("n_epochs") is not None:
+        result["n_epochs"] = train_stats["n_epochs"]
+    if train_stats.get("best_epoch") is not None:
+        result["best_epoch"] = train_stats["best_epoch"]
+    elif str(idx).lower() == "test":
+        result.pop("best_epoch", None)
 
     testlog = run_dir / "training" / "testlog.csv"
     test_df = _read_log_csv(testlog)
@@ -111,6 +169,95 @@ def best_epoch_metrics(
     return result
 
 
+_VAL_METRIC_KEYS = ("rmse", "mae", "r2", "mape", "trainloss", "valloss")
+_TEST_METRIC_KEYS = ("rmse", "mae", "r2", "mape", "testloss")
+
+
+def _mean_numeric(values: list[Any]) -> float | None:
+    nums: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(number):
+            continue
+        nums.append(number)
+    if not nums:
+        return None
+    return float(sum(nums) / len(nums))
+
+
+def aggregate_year_loo_folds(
+    folds: list[dict[str, Any]],
+    *,
+    objective: str,
+    trial_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Mean val/test metrics across successful year-LOO folds of one trial."""
+    ok = [f for f in folds if f.get("status") == "ok"]
+    skipped = [f for f in folds if f.get("status") == "skipped"]
+    failed = [f for f in folds if f.get("status") not in ("ok", "skipped")]
+
+    metrics: dict[str, Any] = {}
+    test_metrics: dict[str, Any] = {}
+    if ok:
+        for key in _VAL_METRIC_KEYS:
+            metrics[key] = _mean_numeric(
+                [(f.get("metrics") or {}).get(key) for f in ok]
+            )
+        for key in _TEST_METRIC_KEYS:
+            test_metrics[key] = _mean_numeric(
+                [(f.get("test_metrics") or {}).get(key) for f in ok]
+            )
+
+    year_metrics: dict[str, Any] = {}
+    for fold in folds:
+        year = fold.get("holdout_year")
+        if year is None:
+            continue
+        year_metrics[f"val_r2_{int(year)}"] = (fold.get("metrics") or {}).get("r2")
+        year_metrics[f"test_r2_{int(year)}"] = (fold.get("test_metrics") or {}).get(
+            "r2"
+        )
+        year_metrics[f"n_epochs_{int(year)}"] = fold.get("n_epochs")
+
+    if failed:
+        status = "train_failed"
+        returncode = int(failed[0].get("returncode") or 1)
+        error = failed[0].get("error") or f"{len(failed)} fold(s) failed"
+    elif not ok:
+        status = "no_folds"
+        returncode = 1
+        error = "no successful year-LOO folds"
+    else:
+        status = "ok"
+        returncode = 0
+        error = None
+
+    result: dict[str, Any] = {
+        "status": status,
+        "returncode": returncode,
+        "objective": objective,
+        "objective_value": _mean_numeric([f.get("objective_value") for f in ok]),
+        "n_epochs": _mean_numeric([f.get("n_epochs") for f in ok]),
+        "metrics": metrics,
+        "test_metrics": test_metrics,
+        "n_folds": len(ok),
+        "n_folds_skipped": len(skipped),
+        "n_folds_failed": len(failed),
+        "folds": folds,
+        "year_metrics": year_metrics,
+    }
+    if trial_dir is not None:
+        result["run_dir"] = str(Path(trial_dir).resolve())
+    if error:
+        result["error"] = error
+    return result
+
+
 def trial_row(
     trial_id: str,
     params: dict,
@@ -133,15 +280,34 @@ def trial_row(
         except (TypeError, ValueError):
             pass
     for k, v in sorted(params.items()):
+        if k == "year_loo_folds":
+            years = []
+            for fold in v or []:
+                if isinstance(fold, dict) and fold.get("holdout_year") is not None:
+                    years.append(str(int(fold["holdout_year"])))
+            if years:
+                row["param_year_loo"] = ",".join(years)
+            continue
+        if isinstance(v, dict):
+            continue
         if isinstance(v, (list, tuple)):
+            if v and isinstance(v[0], dict):
+                continue
             row[f"param_{k}"] = ",".join(str(x) for x in v)
         else:
             row[f"param_{k}"] = v
 
     row["objective"] = outcome.get("objective")
     row["objective_value"] = outcome.get("objective_value")
+    row["n_epochs"] = outcome.get("n_epochs")
     row["best_epoch"] = outcome.get("best_epoch")
     row["run_dir"] = outcome.get("run_dir")
+    if outcome.get("n_folds") is not None:
+        row["n_folds"] = outcome.get("n_folds")
+        row["n_folds_skipped"] = outcome.get("n_folds_skipped")
+        row["n_folds_failed"] = outcome.get("n_folds_failed")
+    for key, value in (outcome.get("year_metrics") or {}).items():
+        row[key] = value
 
     metrics = outcome.get("metrics") or {}
     for mk in ("rmse", "mae", "r2", "mape", "trainloss", "valloss"):

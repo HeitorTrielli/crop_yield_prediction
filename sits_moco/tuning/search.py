@@ -47,14 +47,80 @@ def _grid_values(spec: dict) -> list[Any]:
     raise ValueError(f"Unsupported grid parameter type {ptype!r}")
 
 
+def _as_year_list(value: Any) -> list[int]:
+    if value is None or value is False:
+        return []
+    if isinstance(value, (int, str)):
+        return [int(value)]
+    return [int(y) for y in value]
+
+
+def _year_loo_folds_for_layout(search: dict, *, needs_climate: bool) -> list[dict[str, Any]]:
+    years = _as_year_list(search.get("year_loo"))
+    skip_missing_climate = set(
+        _as_year_list(search.get("skip_holdout_years_missing_climate"))
+    )
+    scaler_template = str(
+        search.get("extra_scaler_template")
+        or "files/train_input_scaler_loo{holdout_year}.json"
+    )
+    skip_reason = (
+        "npy for this holdout year is rain-only (C=13); layout needs climate extras"
+    )
+    folds: list[dict[str, Any]] = []
+    for year in years:
+        fold: dict[str, Any] = {
+            "holdout_year": year,
+            "extra_scaler": scaler_template.format(holdout_year=year, year=year),
+        }
+        if needs_climate and year in skip_missing_climate:
+            fold["skip"] = True
+            fold["skip_reason"] = skip_reason
+        folds.append(fold)
+    return folds
+
+
+def _feature_sweep_trials(search: dict) -> list[dict[str, Any]]:
+    """One trial per mp_* layout. ``year_loo`` nests holdout years inside the trial."""
+    from datasets.feature_recipes import recipe_layout_records
+
+    records = recipe_layout_records()
+    years = _as_year_list(search.get("year_loo"))
+    if not years:
+        return [{"feature_layout": rec["name"]} for rec in records]
+
+    trials: list[dict[str, Any]] = []
+    for rec in records:
+        trials.append(
+            {
+                "feature_layout": rec["name"],
+                "year_loo_folds": _year_loo_folds_for_layout(
+                    search,
+                    needs_climate=rec.get("extra_channels_slice") is not None,
+                ),
+            }
+        )
+    return trials
+
+
 def generate_trials(search: dict) -> list[dict[str, Any]]:
     """
     Return a list of parameter dicts to merge onto study base config.
 
-    search keys: strategy, n_trials, parameters, seed
+    search keys: strategy, n_trials, parameters, trials, seed,
+    year_loo (feature_sweep only)
     """
     strategy = search["strategy"]
     parameters: dict = search.get("parameters") or {}
+
+    if strategy == "list":
+        trials = [dict(t) for t in (search.get("trials") or [])]
+        if not trials:
+            raise ValueError("list search requires a non-empty search.trials list")
+        return _filter_invalid_trials(trials, search)
+
+    if strategy == "feature_sweep":
+        return _filter_invalid_trials(_feature_sweep_trials(search), search)
 
     if not parameters:
         return [{}]

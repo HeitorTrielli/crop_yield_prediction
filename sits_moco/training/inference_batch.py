@@ -10,9 +10,13 @@ from datasets.pixel_chunk import prepare_chunk_on_device
 from training.accumulator import MunicipalityPixelAccumulator
 from training.pipeline import (
     iter_inference_period_batch_chunks,
-    iter_sorted_season_inference_chunks,
     iter_training_batch_chunks,
     pipeline_h2d,
+)
+from utils_aggregated import (
+    HEAD_OUTPUT_RAW,
+    denormalize_head_output,
+    pixel_pool_for_head,
 )
 
 
@@ -24,14 +28,91 @@ def _entry_pixel_count(dataset, muni_code: str, year: int) -> int:
     return int(dataset.municipality_pixel_counts[key])
 
 
-def _finalize_accumulator(acc: MunicipalityPixelAccumulator) -> float | None:
+def _finalize_pred(
+    pred: torch.Tensor,
+    *,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
+) -> float | None:
+    result = pred.squeeze()
+    if result.dim() > 0:
+        result = result[0] if len(result) > 0 else torch.tensor(0.0)
+    return float(
+        denormalize_head_output(
+            result.item(), target_mean, target_std, head_output
+        )
+    )
+
+
+def _finalize_accumulator(
+    acc: MunicipalityPixelAccumulator,
+    *,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
+) -> float | None:
     result = acc.value()
     if result is None:
         return None
-    result = result.squeeze()
-    if result.dim() > 0:
-        result = result[0] if len(result) > 0 else torch.tensor(0.0)
-    return float(result.item())
+    return _finalize_pred(
+        result, head_output=head_output, target_mean=target_mean, target_std=target_std
+    )
+
+
+def _try_megapixel_inference(
+    *,
+    model,
+    dataset,
+    entries: list[tuple[str, int]],
+    municipalities: list[str],
+    years,
+    num_pixels_list: list[int],
+    device: torch.device,
+    args,
+    head_output: str,
+    target_mean,
+    target_std,
+    num_periods: int | None = None,
+    reference_date: date | None = None,
+) -> dict[tuple[str, int], float] | None:
+    from training.megapixel_batch import (
+        _log_fastpath_once,
+        dataset_supports_megapixel_stack,
+        forward_megapixel_batch,
+        is_megapixel_batch,
+        load_stacked_megapixel_batch,
+    )
+
+    if not (
+        is_megapixel_batch(num_pixels_list) and dataset_supports_megapixel_stack(dataset)
+    ):
+        return None
+    stacked, kept = load_stacked_megapixel_batch(
+        dataset,
+        municipalities,
+        years,
+        workers=max(1, int(getattr(args, "workers", 8) or 8)),
+        num_periods=num_periods,
+        reference_date=reference_date,
+    )
+    if stacked is None or not kept:
+        return None
+    _log_fastpath_once(len(kept))
+    model.eval()
+    with torch.no_grad():
+        preds = forward_megapixel_batch(model, stacked, device, args)
+    out: dict[tuple[str, int], float] = {}
+    for i, muni_idx in enumerate(kept):
+        value = _finalize_pred(
+            preds[i],
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
+        )
+        if value is not None:
+            out[entries[muni_idx]] = value
+    return out
 
 
 def run_period_inference_batch(
@@ -45,22 +126,43 @@ def run_period_inference_batch(
     num_periods: int,
     reference_date: date,
     aggregation: str,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
 ) -> dict[tuple[str, int], float]:
     """
     Forward a batch of municipality-years with incomplete-series filtering.
 
     Uses the same cross-muni prefetch/H2D pipeline as validation training.
     """
-    from torch.amp import autocast
-
     municipalities = [code for code, _year in entries]
     years = [year for _code, year in entries]
     num_pixels_list = [
         _entry_pixel_count(dataset, code, year) for code, year in entries
     ]
+    mega = _try_megapixel_inference(
+        model=model,
+        dataset=dataset,
+        entries=entries,
+        municipalities=municipalities,
+        years=years,
+        num_pixels_list=num_pixels_list,
+        device=device,
+        args=args,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
+        num_periods=num_periods,
+        reference_date=reference_date,
+    )
+    if mega is not None:
+        return mega
 
+    from torch.amp import autocast
+
+    pool = pixel_pool_for_head(aggregation, head_output)
     accumulators = {
-        muni_idx: MunicipalityPixelAccumulator(aggregation)
+        muni_idx: MunicipalityPixelAccumulator(pool)
         for muni_idx in range(len(entries))
     }
     use_pipeline_h2d = pipeline_h2d(args, device)
@@ -95,104 +197,14 @@ def run_period_inference_batch(
 
     out: dict[tuple[str, int], float] = {}
     for muni_idx, entry in enumerate(entries):
-        value = _finalize_accumulator(accumulators[muni_idx])
+        value = _finalize_accumulator(
+            accumulators[muni_idx],
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
+        )
         if value is not None:
             out[entry] = value
-    return out
-
-
-def _masked_period_chunk(chunk, season_month: torch.Tensor, num_periods: int):
-    """Zero later-than-k days on a packed full-season chunk (mask True = pad)."""
-    x, _mask, doy, weight = chunk
-    if season_month.device != x.device:
-        season_month = season_month.to(device=x.device, non_blocking=True)
-    valid = (season_month >= 1) & (season_month <= int(num_periods))
-    keep = valid.any(dim=1)
-    if not bool(keep.any()):
-        return None
-    valid = valid[keep]
-    x_k = x[keep].masked_fill(~valid.unsqueeze(-1), 0)
-    doy_k = doy[keep].masked_fill(~valid, 0)
-    weight_k = weight[keep] * valid.to(dtype=weight.dtype)
-    wsum = weight_k.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    weight_k = weight_k / wsum
-    return (x_k, ~valid, doy_k, weight_k)
-
-
-def run_multi_period_inference_batch(
-    *,
-    model,
-    dataset,
-    entries: list[tuple[str, int]],
-    device: torch.device,
-    args,
-    chunk_size: int,
-    num_periods_list: list[int],
-    reference_date: date,
-    aggregation: str,
-) -> dict[int, dict[tuple[str, int], float]]:
-    """
-    One disk read per municipality-year; forward k=1..6 from the same packed series.
-
-    Returns ``{k: {(muni, year): prediction}}``.
-    """
-    from torch.amp import autocast
-
-    municipalities = [code for code, _year in entries]
-    years = [year for _code, year in entries]
-    num_pixels_list = [
-        _entry_pixel_count(dataset, code, year) for code, year in entries
-    ]
-    periods = [int(k) for k in num_periods_list]
-    accumulators = {
-        k: {
-            muni_idx: MunicipalityPixelAccumulator(aggregation)
-            for muni_idx in range(len(entries))
-        }
-        for k in periods
-    }
-    use_pipeline_h2d = pipeline_h2d(args, device)
-
-    chunk_stream = iter_sorted_season_inference_chunks(
-        dataset,
-        municipalities,
-        years,
-        num_pixels_list,
-        chunk_size,
-        args,
-        device,
-        reference_date=reference_date,
-    )
-
-    model.eval()
-    with torch.no_grad():
-        for muni_idx, chunk_item, season_month in chunk_stream:
-            if use_pipeline_h2d:
-                municipality_X_chunk = chunk_item
-            else:
-                municipality_X_chunk = prepare_chunk_on_device(chunk_item, device)
-            if season_month.device != device:
-                season_month = season_month.to(device=device, non_blocking=True)
-
-            with (
-                autocast("cuda", dtype=torch.bfloat16)
-                if device.type == "cuda"
-                else torch.no_grad()
-            ):
-                for k in periods:
-                    period_chunk = _masked_period_chunk(
-                        municipality_X_chunk, season_month, k
-                    )
-                    if period_chunk is None:
-                        continue
-                    accumulators[k][muni_idx].add(model(period_chunk))
-
-    out: dict[int, dict[tuple[str, int], float]] = {k: {} for k in periods}
-    for k in periods:
-        for muni_idx, entry in enumerate(entries):
-            value = _finalize_accumulator(accumulators[k][muni_idx])
-            if value is not None:
-                out[k][entry] = value
     return out
 
 
@@ -205,18 +217,36 @@ def run_standard_inference_batch(
     args,
     chunk_size: int,
     aggregation: str,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
 ) -> dict[tuple[str, int], float]:
     """Forward a batch using the standard training pixel loader (full series)."""
-    from torch.amp import autocast
-
     municipalities = [code for code, _year in entries]
     years = [year for _code, year in entries]
     num_pixels_list = [
         _entry_pixel_count(dataset, code, year) for code, year in entries
     ]
+    mega = _try_megapixel_inference(
+        model=model,
+        dataset=dataset,
+        entries=entries,
+        municipalities=municipalities,
+        years=years,
+        num_pixels_list=num_pixels_list,
+        device=device,
+        args=args,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
+    )
+    if mega is not None:
+        return mega
+
+    from torch.amp import autocast
 
     accumulators = {
-        muni_idx: MunicipalityPixelAccumulator(aggregation)
+        muni_idx: MunicipalityPixelAccumulator(pixel_pool_for_head(aggregation, head_output))
         for muni_idx in range(len(entries))
     }
     use_pipeline_h2d = pipeline_h2d(args, device)
@@ -250,7 +280,12 @@ def run_standard_inference_batch(
 
     out: dict[tuple[str, int], float] = {}
     for muni_idx, entry in enumerate(entries):
-        value = _finalize_accumulator(accumulators[muni_idx])
+        value = _finalize_accumulator(
+            accumulators[muni_idx],
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
+        )
         if value is not None:
             out[entry] = value
     return out

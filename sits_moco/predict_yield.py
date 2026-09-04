@@ -33,6 +33,7 @@ from run_paths import (
 from utils_aggregated import (
     aggregate_municipality_from_pixel_chunks,
     regression_metrics,
+    resolve_head_output,
     resolve_inference_target,
     resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
@@ -204,13 +205,23 @@ def predict_municipality(
     device,
     year=None,
     aggregation: str = "sum",
+    *,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ):
     """Predict yield via USCropsAggregatedNPY (same transform as training)."""
     chunks = dataset.load_pixels_from_municipality(
         municipality_code, year=year, chunk_size=chunk_size
     )
     return aggregate_municipality_from_pixel_chunks(
-        model, chunks, device, aggregation=aggregation
+        model,
+        chunks,
+        device,
+        aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
 
@@ -253,6 +264,7 @@ def main():
     )
     target_mean = checkpoint.get("target_mean", 0.0)
     target_std = checkpoint.get("target_std", 1.0)
+    head_output = resolve_head_output(checkpoint, run_config)
     print(
         f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
     )
@@ -260,7 +272,7 @@ def main():
         f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
     )
     print(
-        f"Training normalization stats (for reference): mean={target_mean:.2f}, std={target_std:.2f}"
+        f"Head output: {head_output} (denorm with mean={target_mean:.2f}, std={target_std:.2f})"
     )
 
     # Create model
@@ -443,12 +455,12 @@ def main():
             args.chunk_size,
             device,
             aggregation=aggregation,
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
         )
 
         if prediction is not None:
-            # Model outputs are already in original scale (tons)
-            # The normalization (target_mean, target_std) was only used during training
-            # to normalize targets for loss computation, but model outputs raw values
             results.append(
                 {
                     "municipality_code": municipality_code,

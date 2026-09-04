@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -31,11 +32,24 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tuning.collect import best_epoch_metrics, trial_row
+from tuning.collect import (
+    aggregate_year_loo_folds,
+    best_epoch_metrics,
+    format_run_epochs,
+    trial_row,
+)
 from tuning.config import load_study_config, merge_trial_params
+from tuning.moco_ensure import ensure_moco_checkpoint, predict_moco_checkpoint_path
 from tuning.resume import plan_trial_resume
 from tuning.runner import apply_resume_params, predict_run_dir, run_trial_subprocess
 from tuning.search import generate_trials
+from run_paths import ensure_dir
+
+
+def _safe_run_tag(name: str) -> str:
+    """Filesystem-safe short tag for embedding the study name in run suffixes."""
+    tag = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    return tag or "study"
 
 
 def study_output_dir(cfg: dict) -> Path:
@@ -78,13 +92,13 @@ def _print_trial_finished(trial_id: str, finished: str, started: str | None) -> 
 
 
 def _save_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(path.parent, quiet=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def _append_jsonl(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(path.parent, quiet=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -128,12 +142,199 @@ def _finalize_trial_metrics(
         objective=objective,
         objective_spec=objective_spec,
     )
-    return {
+    out = {
         "run_dir": str(run_dir.resolve()),
         "returncode": 0,
         "finalized_without_training": True,
         **metrics,
     }
+    if objective_spec.get("log") == "testlog":
+        val_side = best_epoch_metrics(
+            run_dir,
+            objective="val_r2",
+            objective_spec={"mode": "max", "column": "r2"},
+        )
+        if val_side.get("status") == "ok":
+            out["metrics"] = val_side.get("metrics") or {}
+    return out
+
+
+def _run_one_yield_job(
+    *,
+    label: str,
+    merged: dict,
+    run_dir: Path,
+    log_path: Path,
+    cfg: dict,
+    args: argparse.Namespace,
+    training_script: Path,
+    repo_root: Path,
+    resume_incomplete: bool,
+) -> dict:
+    """Train one yield run (a trial, or one year-LOO fold). Returns an outcome dict."""
+    resume_plan = None
+    append_log = False
+    train_params = merged
+
+    if resume_incomplete:
+        resume_plan = plan_trial_resume(
+            run_dir,
+            target_epochs=int(merged.get("epochs", 100)),
+            early_stop_patience=int(merged.get("early_stop_patience", 0)) or None,
+        )
+        if resume_plan is not None:
+            train_params = apply_resume_params(merged, resume_plan["checkpoint"])
+            append_log = log_path.is_file()
+            if not args.dry_run:
+                epoch = resume_plan.get("epoch")
+                es = resume_plan.get("early_stop") or {}
+                not_improved = es.get("not_improved_count")
+                best_ep = es.get("best_epoch")
+                msg = f"[{label}] resume from epoch {epoch} via {resume_plan['checkpoint']}"
+                if not_improved is not None:
+                    msg += (
+                        f" (trainlog: best epoch {best_ep}, not_improved={not_improved})"
+                    )
+                print(msg)
+        elif _trial_appears_trained(run_dir) and not args.dry_run:
+            print(f"[{label}] training artifacts found; collecting metrics only")
+            return _finalize_trial_metrics(
+                run_dir,
+                objective=cfg["objective"],
+                objective_spec=cfg["objective_spec"],
+            )
+        elif (run_dir / "training" / "trainlog.csv").is_file() and not args.dry_run:
+            print(
+                f"[{label}] WARNING: trainlog exists but no checkpoint found; "
+                "starting fresh (earlier epoch weights cannot be restored)"
+            )
+
+    moco_cfg = cfg.get("moco")
+    if moco_cfg and resume_plan is None:
+        expected_moco = predict_moco_checkpoint_path(
+            merged, moco_cfg, repo_root=repo_root
+        )
+        if args.dry_run:
+            print(f"[{label}] would ensure MoCo: {expected_moco}")
+            train_params = dict(train_params)
+            train_params["pretrained"] = str(expected_moco)
+        else:
+            try:
+                moco_ckpt = ensure_moco_checkpoint(
+                    merged,
+                    moco_cfg,
+                    repo_root=repo_root,
+                    dry_run=False,
+                    capture_log=log_path.parent / "moco_stdout.log",
+                )
+            except RuntimeError as exc:
+                print(f"[{label}] FAILED MoCo ensure: {exc}")
+                return {
+                    "status": "moco_failed",
+                    "error": str(exc),
+                    "returncode": 1,
+                    "run_dir": str(run_dir.resolve()),
+                }
+            print(f"[{label}] MoCo pretrained: {moco_ckpt}")
+            train_params = dict(train_params)
+            train_params["pretrained"] = str(moco_ckpt)
+
+    if args.dry_run:
+        if resume_plan is not None:
+            epoch = resume_plan.get("epoch")
+            print(f"[{label}] would resume from epoch {epoch} via {resume_plan['checkpoint']}")
+        outcome = run_trial_subprocess(
+            train_params,
+            training_script=training_script,
+            repo_root=repo_root,
+            dry_run=True,
+        )
+        print(f"[{label}] argv: {' '.join(outcome['argv'])}")
+        return outcome
+
+    proc_outcome = run_trial_subprocess(
+        train_params,
+        training_script=training_script,
+        repo_root=repo_root,
+        capture_log=log_path,
+        append_log=append_log,
+    )
+    if proc_outcome["returncode"] != 0:
+        print(f"[{label}] FAILED (returncode={proc_outcome['returncode']})")
+        return {
+            **proc_outcome,
+            "status": "train_failed",
+            "error": f"training exited with code {proc_outcome['returncode']}",
+        }
+
+    metrics = best_epoch_metrics(
+        proc_outcome["run_dir"],
+        objective=cfg["objective"],
+        objective_spec=cfg["objective_spec"],
+    )
+    outcome = {**proc_outcome, **metrics}
+    if cfg["objective_spec"].get("log") == "testlog":
+        val_side = best_epoch_metrics(
+            proc_outcome["run_dir"],
+            objective="val_r2",
+            objective_spec={"mode": "max", "column": "r2"},
+        )
+        if val_side.get("status") == "ok":
+            outcome["metrics"] = val_side.get("metrics") or {}
+    if metrics.get("status") == "ok":
+        print(
+            f"[{label}] OK  {cfg['objective']}={metrics['objective_value']:.6g}"
+            f"{format_run_epochs(outcome)}"
+        )
+    else:
+        print(f"[{label}] finished but metrics status={metrics.get('status')}")
+    return outcome
+
+
+def _year_loo_fold_params(merged: dict, fold: dict, *, trial_id: str, fold_dir: Path) -> dict:
+    params = {
+        key: value
+        for key, value in merged.items()
+        if key not in ("year_loo_folds", "skip", "skip_reason")
+    }
+    year = int(fold["holdout_year"])
+    params["holdout_year"] = year
+    if fold.get("extra_scaler"):
+        params["extra_scaler"] = fold["extra_scaler"]
+    suffix = str(params.get("suffix") or f"tune_{trial_id}")
+    params["suffix"] = f"{suffix}_loo{year}"
+    params["run_dir"] = str(fold_dir.resolve())
+    return params
+
+
+def _record_and_summarize(
+    *,
+    study_dir: Path,
+    cfg: dict,
+    trial_id: str,
+    merged: dict,
+    sampled: dict,
+    outcome: dict,
+    started: str,
+    finished: str,
+    resumed_from_checkpoint: str | None = None,
+    status: str = "completed",
+) -> None:
+    record = {
+        "trial_id": trial_id,
+        "status": status,
+        "params": merged,
+        "sampled": sampled,
+        "outcome": outcome,
+        "started_at_utc": started,
+        "finished_at_utc": finished,
+        "resumed_from_checkpoint": resumed_from_checkpoint,
+    }
+    _append_jsonl(study_dir / "trials.jsonl", record)
+    df = _update_summary(study_dir)
+    best = _pick_best(df, cfg["objective"], cfg["objective_spec"])
+    if best:
+        _save_json(study_dir / "best_trial.json", best)
 
 
 def _trial_run_succeeded(rec: dict) -> bool:
@@ -177,10 +378,10 @@ def _pick_best(df: pd.DataFrame, objective: str, spec: dict) -> dict | None:
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = load_study_config(args.config)
     study_dir = study_output_dir(cfg)
-    study_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(study_dir)
 
-    # Snapshot study config
-    shutil.copy2(args.config, study_dir / "study_config.yaml")
+    # Snapshot study config (copyfile: WSL /mnt/c rejects copy2 utime)
+    shutil.copyfile(args.config, study_dir / "study_config.yaml")
 
     trials = generate_trials({**cfg["search"], "base": cfg["base"]})
     if args.max_trials is not None:
@@ -190,6 +391,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Objective: {cfg['objective']} ({cfg['objective_spec']['mode']} {cfg['objective_spec']['column']})")
     print(f"Strategy: {cfg['search']['strategy']} -> {len(trials)} trial(s)")
     print(f"Output: {study_dir.resolve()}")
+    if cfg.get("moco"):
+        if cfg["moco"].get("reuse_only"):
+            print("MoCo: reuse existing checkpoints only (will not train MoCo)")
+        else:
+            print("MoCo: auto-ensure enabled (train matching trunk before each yield trial)")
+    else:
+        print("MoCo: auto-ensure disabled (use base.pretrained if set)")
 
     succeeded_ids = set()
     if args.skip_completed and not args.rerun_all:
@@ -211,13 +419,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         if trial_id in succeeded_ids:
             print(f"\n[{trial_id}] skip (already succeeded)")
             continue
+        if sampled.get("skip"):
+            reason = sampled.get("skip_reason") or "search.trials skip: true"
+            print(f"\n[{trial_id}] skip ({reason})")
+            continue
 
         merged = merge_trial_params(cfg["base"], sampled)
-        # Prefer explicit suffix; else "{suffix_prefix}_{trial_id}" (default prefix: tune).
-        # Studies that share seed/years with another study must set a distinct suffix_prefix
-        # so run dirs do not collide (e.g. architecture vs ablations).
+        merged.pop("skip", None)
+        merged.pop("skip_reason", None)
+        # Prefer explicit suffix. Else "{suffix_prefix}_{trial_id}".
+        # Suffix is kept in config.json / model.modelname; the on-disk run
+        # lives under the study trial folder (not results/Productivity_*).
         if not merged.get("suffix"):
-            prefix = str(merged.pop("suffix_prefix", None) or "tune")
+            prefix = str(
+                merged.pop("suffix_prefix", None)
+                or f"tune_{_safe_run_tag(cfg['name'])}"
+            )
             merged["suffix"] = f"{prefix}_{trial_id}"
         else:
             merged.pop("suffix_prefix", None)
@@ -225,8 +442,121 @@ def cmd_run(args: argparse.Namespace) -> int:
             merged["seed"] = int(merged["seed"]) + int(cfg.get("seed_offset", 0))
 
         trial_dir = study_dir / trial_id
-        trial_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(trial_dir)
+        # Yield artifacts (training/, figures/, predictions/) go in this folder.
+        merged["run_dir"] = str(trial_dir.resolve())
         _save_json(trial_dir / "params.json", merged)
+
+        year_loo_folds = list(merged.get("year_loo_folds") or [])
+        if year_loo_folds:
+            sampled_show = {
+                k: v for k, v in sampled.items() if k != "year_loo_folds"
+            }
+            print(f"\n[{trial_id}] params: {json.dumps(sampled_show, sort_keys=True)}")
+            n_run = sum(1 for fold in year_loo_folds if not fold.get("skip"))
+            print(
+                f"[{trial_id}] year LOO: {n_run} run(s) / {len(year_loo_folds)} fold(s) "
+                f"→ mean {cfg['objective']}"
+            )
+            started = _utc_now_iso()
+            print(f"[{trial_id}] started at {started}")
+            fold_records: list[dict] = []
+            for fold in year_loo_folds:
+                year = int(fold["holdout_year"])
+                label = f"{trial_id}/loo{year}"
+                if fold.get("skip"):
+                    reason = fold.get("skip_reason") or "skipped holdout year"
+                    print(f"[{label}] skip ({reason})")
+                    fold_records.append(
+                        {
+                            "holdout_year": year,
+                            "status": "skipped",
+                            "skip_reason": reason,
+                        }
+                    )
+                    continue
+                fold_dir = trial_dir / f"loo{year}"
+                ensure_dir(fold_dir)
+                fold_params = _year_loo_fold_params(
+                    merged, fold, trial_id=trial_id, fold_dir=fold_dir
+                )
+                _save_json(fold_dir / "params.json", fold_params)
+                print(f"[{label}] holdout_year={year} run_dir={fold_dir}")
+                fold_outcome = _run_one_yield_job(
+                    label=label,
+                    merged=fold_params,
+                    run_dir=fold_dir,
+                    log_path=fold_dir / "train_stdout.log",
+                    cfg=cfg,
+                    args=args,
+                    training_script=training_script,
+                    repo_root=repo_root,
+                    resume_incomplete=resume_incomplete,
+                )
+                fold_records.append({"holdout_year": year, **fold_outcome})
+            if args.dry_run:
+                outcome = {
+                    "status": "dry_run",
+                    "returncode": 0,
+                    "folds": fold_records,
+                    "run_dir": str(trial_dir.resolve()),
+                }
+            else:
+                outcome = aggregate_year_loo_folds(
+                    fold_records,
+                    objective=cfg["objective"],
+                    trial_dir=trial_dir,
+                )
+                _save_json(
+                    trial_dir / "folds.json",
+                    {
+                        "folds": fold_records,
+                        "aggregate": {
+                            key: value
+                            for key, value in outcome.items()
+                            if key != "folds"
+                        },
+                    },
+                )
+            finished = _utc_now_iso()
+            _print_trial_finished(trial_id, finished, started)
+            if args.dry_run:
+                status = "dry_run"
+            else:
+                status = "completed"
+            if outcome.get("status") == "ok":
+                mean_val = (outcome.get("metrics") or {}).get("r2")
+                mean_test = (outcome.get("test_metrics") or {}).get("r2")
+                extra = []
+                if mean_val is not None:
+                    extra.append(f"val_r2={mean_val:.6g}")
+                if mean_test is not None:
+                    extra.append(f"test_r2={mean_test:.6g}")
+                skip_n = outcome.get("n_folds_skipped") or 0
+                skip_msg = f", skipped={skip_n}" if skip_n else ""
+                print(
+                    f"[{trial_id}] OK  mean {cfg['objective']}="
+                    f"{outcome['objective_value']:.6g}"
+                    + (f" ({', '.join(extra)})" if extra else "")
+                    + f" n_folds={outcome['n_folds']}{skip_msg}"
+                    + format_run_epochs(outcome, mean=True)
+                )
+            elif not args.dry_run:
+                print(
+                    f"[{trial_id}] {outcome.get('status')} {outcome.get('error', '')}".rstrip()
+                )
+            _record_and_summarize(
+                study_dir=study_dir,
+                cfg=cfg,
+                trial_id=trial_id,
+                merged=merged,
+                sampled=sampled,
+                outcome=outcome,
+                started=started,
+                finished=finished,
+                status=status,
+            )
+            continue
 
         print(f"\n[{trial_id}] params: {json.dumps(sampled, sort_keys=True)}")
         run_dir = predict_run_dir(merged, logdir=merged.get("logdir", "./results"))
@@ -275,8 +605,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 _print_trial_finished(trial_id, finished, started)
                 if outcome.get("status") == "ok":
                     print(
-                        f"[{trial_id}] OK  {cfg['objective']}={outcome['objective_value']:.6g} "
-                        f"(epoch {outcome['best_epoch']})"
+                        f"[{trial_id}] OK  {cfg['objective']}={outcome['objective_value']:.6g}"
+                        f"{format_run_epochs(outcome)}"
                     )
                 record = {
                     "trial_id": trial_id,
@@ -299,6 +629,57 @@ def cmd_run(args: argparse.Namespace) -> int:
                     f"[{trial_id}] WARNING: trainlog exists but no checkpoint found; "
                     "starting fresh (earlier epoch weights cannot be restored)"
                 )
+
+        # Fresh yield start (not resuming a yield ckpt): ensure matching MoCo exists.
+        moco_cfg = cfg.get("moco")
+        if moco_cfg and resume_plan is None:
+            expected_moco = predict_moco_checkpoint_path(
+                merged, moco_cfg, repo_root=repo_root
+            )
+            if args.dry_run:
+                print(f"[{trial_id}] would ensure MoCo: {expected_moco}")
+                train_params = dict(train_params)
+                train_params["pretrained"] = str(expected_moco)
+                merged["pretrained"] = str(expected_moco)
+            else:
+                try:
+                    moco_ckpt = ensure_moco_checkpoint(
+                        merged,
+                        moco_cfg,
+                        repo_root=repo_root,
+                        dry_run=False,
+                        capture_log=trial_dir / "moco_stdout.log",
+                    )
+                except RuntimeError as exc:
+                    finished = _utc_now_iso()
+                    print(f"[{trial_id}] FAILED MoCo ensure: {exc}")
+                    _print_trial_finished(trial_id, finished, started)
+                    record = {
+                        "trial_id": trial_id,
+                        "status": "completed",
+                        "params": merged,
+                        "sampled": sampled,
+                        "outcome": {
+                            "status": "moco_failed",
+                            "error": str(exc),
+                            "returncode": 1,
+                            "run_dir": str(run_dir.resolve()),
+                        },
+                        "started_at_utc": started,
+                        "finished_at_utc": finished,
+                        "resumed_from_checkpoint": None,
+                    }
+                    _append_jsonl(study_dir / "trials.jsonl", record)
+                    df = _update_summary(study_dir)
+                    best = _pick_best(df, cfg["objective"], cfg["objective_spec"])
+                    if best:
+                        _save_json(study_dir / "best_trial.json", best)
+                    continue
+                print(f"[{trial_id}] MoCo pretrained: {moco_ckpt}")
+                train_params = dict(train_params)
+                train_params["pretrained"] = str(moco_ckpt)
+                merged["pretrained"] = str(moco_ckpt)
+                _save_json(trial_dir / "params.json", merged)
 
         if args.dry_run:
             if resume_plan is not None:
@@ -352,8 +733,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             outcome = {**proc_outcome, **metrics}
             if metrics.get("status") == "ok":
                 print(
-                    f"[{trial_id}] OK  {cfg['objective']}={metrics['objective_value']:.6g} "
-                    f"(epoch {metrics['best_epoch']})"
+                    f"[{trial_id}] OK  {cfg['objective']}={metrics['objective_value']:.6g}"
+                    f"{format_run_epochs(outcome)}"
                 )
             else:
                 print(f"[{trial_id}] finished but metrics status={metrics.get('status')}")
@@ -435,11 +816,15 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
             "finished_at_utc",
             "duration_seconds",
             "objective_value",
+            "n_epochs",
             "best_epoch",
             "val_r2",
             "val_rmse",
             "val_valloss",
             "test_r2",
+            "n_folds",
+            "param_feature_layout",
+            "param_year_loo",
             "param_learning_rate",
             "param_weight_decay",
             "param_batchsize",
@@ -462,13 +847,30 @@ def cmd_show_config(args: argparse.Namespace) -> int:
             "objective": cfg["objective"],
             "n_trials": len(trials),
             "strategy": cfg["search"]["strategy"],
+            "year_loo": cfg["search"].get("year_loo"),
             "output_dir": str(study_output_dir(cfg)),
         },
         sort_keys=False,
     ))
     if args.list_trials:
         for i, t in enumerate(trials, start=1):
-            print(f"{_trial_id(i)}: {json.dumps(t, sort_keys=True)}")
+            folds = t.get("year_loo_folds")
+            if folds:
+                years = []
+                skipped = []
+                for fold in folds:
+                    year = int(fold["holdout_year"])
+                    if fold.get("skip"):
+                        skipped.append(str(year))
+                    else:
+                        years.append(str(year))
+                extra = f" folds={','.join(years)}"
+                if skipped:
+                    extra += f" skip={','.join(skipped)}"
+                layout = t.get("feature_layout", "")
+                print(f"{_trial_id(i)}: {layout}{extra}")
+            else:
+                print(f"{_trial_id(i)}: {json.dumps(t, sort_keys=True)}")
     return 0
 
 
@@ -489,9 +891,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Continue interrupted trials from the latest checkpoint under the "
-            "expected run_dir (default: enabled). Use --no-resume-incomplete to "
-            "restart them from epoch 1."
+            "Continue interrupted trials from the latest checkpoint under "
+            "results/tuning/<study>/<trial_id>/training/ (default: enabled). "
+            "Use --no-resume-incomplete to restart them from epoch 1."
         ),
     )
     p_run.add_argument(

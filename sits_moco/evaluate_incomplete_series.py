@@ -2,7 +2,7 @@
 Script to evaluate model performance with incomplete time series.
 Uses daily rows per season: for k=1..6, all observations in season months 1..k are
 concatenated in time (sorted by DOY), up to --sequencelength (default 45) earliest days.
-Municipality prediction = sum of per-pixel model outputs, compared to CSV label.
+Municipality prediction = mean of per-pixel z-scores, denormalized to the CSV unit.
 """
 
 import argparse
@@ -37,6 +37,7 @@ from run_paths import (
 from utils_aggregated import (
     aggregation_for_target_column,
     regression_metrics,
+    resolve_head_output,
     resolve_inference_chunk_size,
     resolve_inference_target,
     resolve_model_kwargs,
@@ -49,7 +50,7 @@ YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate with all daily timesteps in season months 1, then 1-2, ..., 1-6 (one I/O pass)."
+        description="Evaluate with all daily timesteps in season months 1, then 1–2, …, 1–6 (6 runs)."
     )
     parser.add_argument(
         "--checkpoint",
@@ -86,7 +87,7 @@ def parse_args():
         "--chunk-size",
         type=int,
         default=None,
-        help="Pixels per GPU forward pass (default: training pixel_chunk_size, typically ~7k–8k)",
+        help="Pixels per GPU forward pass (default: pixel_chunk_size * chunks_per_grad from training config)",
     )
     parser.add_argument(
         "-d",
@@ -162,21 +163,19 @@ def parse_args():
 def inference_args_from_run_config(
     run_config: dict, *, quiet: bool = True
 ) -> SimpleNamespace:
-    """Minimal args namespace matching the training chunk/H2D pipeline."""
+    """Minimal args namespace for training's chunk prefetch / H2D pipeline."""
     cli = run_config.get("cli") or {}
     return SimpleNamespace(
         prefetch_chunks=int(cli.get("prefetch_chunks", 2)),
         disable_pipeline_h2d=bool(cli.get("disable_pipeline_h2d", False)),
         quiet_training=quiet,
         h2d_pin_host=bool(cli.get("h2d_pin_host", False)),
-        mmap_lookahead=True,
     )
 
 
 def inference_batch_size_from_run_config(run_config: dict, default: int = 10) -> int:
-    """Municipalities per inference pipeline batch (same as training ``batchsize``)."""
     cli = run_config.get("cli") or {}
-    return max(1, int(cli.get("batchsize", default)))
+    return int(cli.get("batchsize", default))
 
 
 def predict_municipalities_with_periods(
@@ -189,6 +188,9 @@ def predict_municipalities_with_periods(
     reference_date,
     args,
     aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ) -> dict[tuple[str, int], float]:
     """Batched incomplete-series inference (training chunk/H2D pipeline)."""
     from training.inference_batch import run_period_inference_batch
@@ -205,35 +207,9 @@ def predict_municipalities_with_periods(
         num_periods=num_periods,
         reference_date=reference_date,
         aggregation=aggregation,
-    )
-
-
-def predict_municipalities_all_periods(
-    model,
-    entries: list[tuple[str, int]],
-    dataset,
-    num_periods_list: list[int],
-    chunk_size: int,
-    device,
-    reference_date,
-    args,
-    aggregation: str | None = None,
-) -> dict[int, dict[tuple[str, int], float]]:
-    """One I/O pass; forward every k from the same packed in-season series."""
-    from training.inference_batch import run_multi_period_inference_batch
-
-    if aggregation is None:
-        aggregation = aggregation_for_target_column(dataset.target_column)
-    return run_multi_period_inference_batch(
-        model=model,
-        dataset=dataset,
-        entries=entries,
-        device=device,
-        args=args,
-        chunk_size=chunk_size,
-        num_periods_list=num_periods_list,
-        reference_date=reference_date,
-        aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
 
@@ -287,6 +263,10 @@ def batched_predict_with_periods(
     single_season: bool = False,
     target_year: int | None = None,
     desc: str | None = None,
+    aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ) -> tuple[dict, list]:
     """Predict incomplete-series yields in municipality batches (training pipeline)."""
     from itertools import islice
@@ -324,81 +304,16 @@ def batched_predict_with_periods(
                 device,
                 reference_date,
                 args,
+                aggregation=aggregation,
+                head_output=head_output,
+                target_mean=target_mean,
+                target_std=target_std,
             )
             for entry, result_key in zip(entries, result_keys):
                 if entry in batch_results:
                     predictions[result_key] = batch_results[entry]
                 else:
                     failed_entries.append(result_key)
-
-            if progress is not None:
-                progress.update(len(batch))
-    finally:
-        if progress is not None:
-            progress.close()
-
-    return predictions, failed_entries
-
-
-def batched_predict_all_periods(
-    model,
-    municipality_list,
-    dataset,
-    num_periods_list,
-    chunk_size,
-    device,
-    reference_date,
-    args,
-    *,
-    batch_size: int = 10,
-    single_season: bool = False,
-    target_year: int | None = None,
-    desc: str | None = None,
-) -> tuple[dict[int, dict], dict[int, list]]:
-    """Predict k=1..6 in one municipality pass (one .npy read per entry)."""
-    from itertools import islice
-
-    if batch_size < 1:
-        batch_size = 1
-    periods = [int(k) for k in num_periods_list]
-    predictions: dict[int, dict] = {k: {} for k in periods}
-    failed_entries: dict[int, list] = {k: [] for k in periods}
-    iterator = iter(municipality_list)
-    total = len(municipality_list)
-    progress = tqdm(total=total, desc=desc, leave=False) if desc else None
-
-    try:
-        while True:
-            batch = list(islice(iterator, batch_size))
-            if not batch:
-                break
-
-            if single_season:
-                if target_year is None:
-                    raise ValueError("target_year required for single_season batching")
-                entries = [(str(m), int(target_year)) for m in batch]
-                result_keys = list(batch)
-            else:
-                entries = [(str(m), int(y)) for m, y in batch]
-                result_keys = list(batch)
-
-            batch_results = predict_municipalities_all_periods(
-                model,
-                entries,
-                dataset,
-                periods,
-                chunk_size,
-                device,
-                reference_date,
-                args,
-            )
-            for k in periods:
-                k_results = batch_results.get(k, {})
-                for entry, result_key in zip(entries, result_keys):
-                    if entry in k_results:
-                        predictions[k][result_key] = k_results[entry]
-                    else:
-                        failed_entries[k].append(result_key)
 
             if progress is not None:
                 progress.update(len(batch))
@@ -478,12 +393,16 @@ def main():
     target, target_column, aggregation, target_unit = resolve_inference_target(
         run_config, checkpoint
     )
+    head_output = resolve_head_output(checkpoint, run_config)
+    target_mean = checkpoint.get("target_mean")
+    target_std = checkpoint.get("target_std")
     print(
         f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
     )
     print(
         f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
     )
+    print(f"Head output: {head_output}")
 
     if not args.yield_csv.exists():
         raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
@@ -582,30 +501,29 @@ def main():
     inference_args = inference_args_from_run_config(run_config)
     inference_batch_size = inference_batch_size_from_run_config(run_config)
 
-    print(f"\n{'='*60}")
-    print("Evaluating k=1..6 in one I/O pass (all harvest years)")
-    print(f"{'='*60}")
-    predictions_by_k, failed_by_k = batched_predict_all_periods(
-        model,
-        municipality_list,
-        dataset,
-        num_periods_list,
-        args.chunk_size,
-        device,
-        reference_date=args.reference_date,
-        args=inference_args,
-        batch_size=inference_batch_size,
-        single_season=single_season,
-        target_year=target_year,
-        desc="Predicting (k=1..6)",
-    )
-
     for num_periods in num_periods_list:
         print(f"\n{'='*60}")
-        print(f"Results for {num_periods} time periods")
+        print(f"Evaluating with {num_periods} time periods")
         print(f"{'='*60}")
-        predictions = predictions_by_k[num_periods]
-        failed_entries = failed_by_k[num_periods]
+
+        predictions, failed_entries = batched_predict_with_periods(
+            model,
+            municipality_list,
+            dataset,
+            num_periods,
+            args.chunk_size,
+            device,
+            reference_date=args.reference_date,
+            args=inference_args,
+            batch_size=inference_batch_size,
+            single_season=single_season,
+            target_year=target_year,
+            desc=f"Predicting ({num_periods} periods)",
+            aggregation=aggregation,
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
+        )
 
         # Compute metrics
         y_pred = []

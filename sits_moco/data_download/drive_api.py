@@ -1,7 +1,7 @@
 """
 Google Drive API helpers: auth, list folder, download file, delete file.
 
-Used by download_soy_gee_drive.py for GEE export downloads.
+Used by download_soy_gee_drive.py and download_s1_landsat_gee_drive.py.
 """
 
 from __future__ import annotations

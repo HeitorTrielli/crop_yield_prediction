@@ -43,7 +43,7 @@ from datasets import (
 )
 from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
 from evaluate_incomplete_series import (
-    batched_predict_all_periods,
+    batched_predict_with_periods,
     inference_args_from_run_config,
     inference_batch_size_from_run_config,
 )
@@ -62,6 +62,7 @@ from run_paths import (
 )
 from utils_aggregated import (
     regression_metrics,
+    resolve_head_output,
     resolve_inference_chunk_size,
     resolve_inference_target,
     resolve_model_kwargs,
@@ -102,6 +103,9 @@ class ModelContext:
     target_unit: str
     chunk_size: int
     reference_date: date
+    head_output: str
+    target_mean: float | None
+    target_std: float | None
 
 
 @dataclass
@@ -203,6 +207,9 @@ def load_model_context(
     target, target_column, aggregation, target_unit = resolve_inference_target(
         run_config, checkpoint_data
     )
+    head_output = resolve_head_output(checkpoint_data, run_config)
+    target_mean = checkpoint_data.get("target_mean")
+    target_std = checkpoint_data.get("target_std")
 
     return ModelContext(
         checkpoint=checkpoint,
@@ -223,6 +230,9 @@ def load_model_context(
         target_unit=target_unit,
         chunk_size=chunk_size,
         reference_date=reference_date,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
 
@@ -235,26 +245,11 @@ def resolve_harvest_years(
         return sorted(int(y) for y in harvest_years)
 
     computed = ctx.run_config.get("computed") or {}
-    cli = ctx.run_config.get("cli") or {}
-    split = computed.get("split_design") or {}
-
-    from_config = (
-        computed.get("harvest_years_set")
-        or cli.get("harvest_years_set")
-        or computed.get("harvest_years_filter")
-        or split.get("harvest_years_filter")
-        or computed.get("imagery_years_used")
+    from_config = computed.get("harvest_years_set") or computed.get(
+        "harvest_years_filter"
     )
     if from_config:
         return sorted(int(y) for y in from_config)
-
-    harvest_years_str = cli.get("harvest_years")
-    if harvest_years_str:
-        return sorted(
-            int(x.strip())
-            for x in str(harvest_years_str).split(",")
-            if x.strip()
-        )
 
     if not yield_csv.is_file():
         raise FileNotFoundError(f"Yield CSV not found: {yield_csv}")
@@ -373,7 +368,7 @@ def _build_dataset(
         feature_layout=ctx.feature_layout,
         target_column=ctx.target_column,
         harvest_years=harvest_years,
-        npy_cache_size=20,
+        npy_cache_size=128,
         min_coverage_ratio=min_coverage_ratio,
         max_coverage_ratio=max_coverage_ratio,
     )
@@ -471,28 +466,27 @@ def run_incomplete_series_evaluation(
         year: {} for year in harvest_years
     }
 
-    print(f"\n{'=' * 60}")
-    print("Incomplete series: k=1..6 in one I/O pass (all harvest years)")
-    print(f"{'=' * 60}")
-    predictions_by_k, failed_by_k = batched_predict_all_periods(
-        ctx.model,
-        municipality_list,
-        dataset,
-        NUM_PERIODS_LIST,
-        ctx.chunk_size,
-        ctx.device,
-        reference_date=ctx.reference_date,
-        args=inference_args,
-        batch_size=inference_batch_size,
-        desc="Predicting (k=1..6)",
-    )
-
     for num_periods in NUM_PERIODS_LIST:
         print(f"\n{'=' * 60}")
         print(f"Incomplete series: {num_periods} season month(s)")
         print(f"{'=' * 60}")
-        predictions = predictions_by_k[num_periods]
-        failed_entries = failed_by_k[num_periods]
+
+        predictions, failed_entries = batched_predict_with_periods(
+            ctx.model,
+            municipality_list,
+            dataset,
+            num_periods,
+            ctx.chunk_size,
+            ctx.device,
+            reference_date=ctx.reference_date,
+            args=inference_args,
+            batch_size=inference_batch_size,
+            desc=f"Predicting (k={num_periods})",
+            aggregation=ctx.aggregation,
+            head_output=ctx.head_output,
+            target_mean=ctx.target_mean,
+            target_std=ctx.target_std,
+        )
 
         y_pred = []
         y_true = []
@@ -636,6 +630,9 @@ def run_guarapuava_heatmaps(
             reference_date=reference_date,
             input_dim=ctx.input_dim,
             num_periods=num_periods,
+            head_output=ctx.head_output,
+            target_mean=ctx.target_mean,
+            target_std=ctx.target_std,
         )
         if bundle[0] is None:
             print(f"  Skipped {label}: inference failed")
@@ -895,10 +892,6 @@ def generate_results(
         print(f"Holdout year:  {holdout_year}")
         print(f"Leave-out years: {leave_out_years}")
         print(f"Pixel chunk size: {ctx.chunk_size}")
-        print(
-            "Incomplete-series k=1..6: one .npy read per municipality-year "
-            f"across {years}; tqdm is all harvest years, not one year."
-        )
 
     output = GenerateResultsOutput()
 
@@ -1018,7 +1011,7 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=None,
-        help="Pixels per GPU forward pass (default: training pixel_chunk_size, typically ~7k–8k)",
+        help="Pixels per GPU forward pass (default: pixel_chunk_size * chunks_per_grad from training config)",
     )
     p.add_argument("--reference-date", type=str, default=None)
     p.add_argument("--rc", action="store_true", default=None)

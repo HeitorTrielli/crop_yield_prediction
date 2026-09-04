@@ -25,10 +25,14 @@ from datasets.feature_layout import (
     feature_layout_input_dim,
     normalize_feature_layout,
 )
-from datasets.pixel_transform import DOY_CHANNEL, scale_xavier_climate_channels
+from datasets.pixel_transform import (
+    DOY_CHANNEL,
+    scale_xavier_climate_extras,
+    scale_xavier_rain_channels,
+)
+from datasets.extra_scaler import InputScaler
 from datasets.uscrops_aggregated_npy_polars import (
     _indices_first_n_months,
-    scale_xavier_rain_channels,
 )
 from models import STNetRegression
 from utils import recursive_todevice
@@ -44,6 +48,8 @@ from run_paths import (
     run_dir_from_path,
 )
 from utils_aggregated import (
+    denormalize_head_output,
+    resolve_head_output,
     resolve_inference_target,
     resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
@@ -483,7 +489,7 @@ def transform_pixel(
 ):
     """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY.
     If deterministic_head is True and x has more than sequencelength rows, keeps the earliest sequencelength rows.
-    ``input_dim`` must match the trained model (10 or 12 with Xavier).
+    ``input_dim`` must match the trained model (10, 12 with rain, or 16 with climate).
     """
     if seed is not None:
         np.random.seed(seed)
@@ -494,25 +500,24 @@ def transform_pixel(
     doy = raw[:, doy_col].astype(np.int32)
     x_spec = raw[:, :10] * 1e-4
 
-    mean = np.array(
-        [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]]
-    )
-    std = np.array([0.227, 0.219, 0.222, 0.22, 0.2, 0.193, 0.192, 0.182, 0.123, 0.106])
+    scaler = InputScaler.require_load()
+    mean = scaler.spectral_mean_row
+    std = scaler.spectral_std
 
     weight = getWeight(x_spec)
-    x_spec_n = (x_spec - mean) / std
-    if input_dim == 12:
+    x_spec_n = scaler.transform_spectral(x_spec)
+    if input_dim == 16:
+        if c_in >= 17:
+            extra = scale_xavier_climate_extras(raw[:, 11:17])
+        else:
+            extra = np.zeros((t_len, 6), dtype=np.float32)
+        x = np.concatenate([x_spec_n, extra], axis=-1)
+    elif input_dim == 12:
         if c_in >= 13:
             rain = scale_xavier_rain_channels(raw[:, 11:13])
         else:
             rain = np.zeros((t_len, 2), dtype=np.float32)
         x = np.concatenate([x_spec_n, rain], axis=-1)
-    elif input_dim == 16:
-        if c_in >= 17:
-            extra = scale_xavier_climate_channels(raw[:, 11:17])
-        else:
-            extra = np.zeros((t_len, 6), dtype=np.float32)
-        x = np.concatenate([x_spec_n, extra], axis=-1)
     else:
         x = x_spec_n
 
@@ -747,6 +752,14 @@ def should_include_pixel(timeseries):
     return True
 
 
+def _head_denorm_kwargs(checkpoint, run_config=None) -> dict:
+    return {
+        "head_output": resolve_head_output(checkpoint, run_config),
+        "target_mean": checkpoint.get("target_mean"),
+        "target_std": checkpoint.get("target_std"),
+    }
+
+
 def reconstruct_spatial_predictions(
     model,
     municipality_code,
@@ -763,6 +776,9 @@ def reconstruct_spatial_predictions(
     reference_date=None,
     input_dim: int = 10,
     num_periods=None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
@@ -815,17 +831,17 @@ def reconstruct_spatial_predictions(
         return None, None, None, None, None, None, None
 
     print(f"  Loaded {muni_npy_file} shape={municipality_data.shape}")
-    if input_dim == 12 and municipality_data.shape[-1] < 13:
-        print(
-            "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
-            f"{municipality_data.shape[-1]} channels per timestep. "
-            "Rebuild daily .npy with --xavier-pr-nc before heatmapping."
-        )
     if input_dim == 16 and municipality_data.shape[-1] < 17:
         print(
             "  ⚠️  Warning: checkpoint uses spectral_xavier_climate (16 inputs) but .npy has "
             f"{municipality_data.shape[-1]} channels per timestep. "
-            "Rebuild daily .npy with rain + Tmax/Tmin/Rs/ETo NetCDFs."
+            "Run data_download/append_xavier_climate_to_npy.py before heatmapping."
+        )
+    elif input_dim == 12 and municipality_data.shape[-1] < 13:
+        print(
+            "  ⚠️  Warning: checkpoint uses spectral_xavier (12 inputs) but .npy has "
+            f"{municipality_data.shape[-1]} channels per timestep. "
+            "Run data_download/xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
         )
 
     # Recompute keep-mask in the exact same way as preprocess_daily_to_npy
@@ -917,7 +933,14 @@ def reconstruct_spatial_predictions(
                             chunk_predictions = chunk_predictions.unsqueeze(0)
 
                     for i, key in enumerate(chunk_indices):
-                        prediction_map[key] = float(chunk_predictions[i].item())
+                        prediction_map[key] = float(
+                            denormalize_head_output(
+                                chunk_predictions[i].item(),
+                                target_mean,
+                                target_std,
+                                head_output,
+                            )
+                        )
 
                     current_chunk = []
                     chunk_indices = []
@@ -1659,6 +1682,10 @@ def run_municipality_inference(
     municipality_code: str,
     args,
     device: torch.device,
+    *,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ) -> dict | None:
     (
         prediction_map,
@@ -1683,6 +1710,9 @@ def run_municipality_inference(
         year_range=args.year_range,
         reference_date=args.reference_date,
         input_dim=input_dim,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
     if prediction_map is None:
         return None
@@ -1732,15 +1762,29 @@ def run_report_panel(args) -> None:
     print(f"  input_dim={dim_com}")
 
     print(f"\nInference (sem chuva) for {display_name} ({municipality_code})...")
+    ck_sem = torch.load(args.checkpoint, map_location=device, weights_only=False)
     bundle_sem = run_municipality_inference(
-        model_sem, dim_sem, municipality_code, args, device
+        model_sem,
+        dim_sem,
+        municipality_code,
+        args,
+        device,
+        **_head_denorm_kwargs(ck_sem, load_latest_run_config(args.checkpoint)),
     )
     if bundle_sem is None:
         raise SystemExit(f"Failed sem-chuva inference for {municipality_code}")
 
     print(f"Inference (com chuva) for {display_name} ({municipality_code})...")
+    ck_com = torch.load(args.compare_checkpoint, map_location=device, weights_only=False)
     bundle_com = run_municipality_inference(
-        model_com, dim_com, municipality_code, args, device
+        model_com,
+        dim_com,
+        municipality_code,
+        args,
+        device,
+        **_head_denorm_kwargs(
+            ck_com, load_latest_run_config(args.compare_checkpoint)
+        ),
     )
     if bundle_com is None:
         raise SystemExit(f"Failed com-chuva inference for {municipality_code}")
@@ -2073,10 +2117,12 @@ def main():
     _, _, args.aggregation, args.target_unit = resolve_inference_target(
         run_config, checkpoint
     )
+    head_denorm = _head_denorm_kwargs(checkpoint, run_config)
     print(
         f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
     )
     print(f"Target unit: {args.target_unit} (pixel aggregation: {args.aggregation})")
+    print(f"Head output: {head_denorm['head_output']}")
 
     if args.incomplete_series:
         if args.num_periods:
@@ -2184,6 +2230,7 @@ def main():
                 reference_date=args.reference_date,
                 input_dim=input_dim,
                 num_periods=num_periods,
+                **head_denorm,
             )
 
             if prediction_map is None:

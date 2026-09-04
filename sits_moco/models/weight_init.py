@@ -54,8 +54,8 @@ def weight_init(m):
 
 def weight_init_regression(m):
     """
-    Initializes a regression model's parameters with smaller output layer weights.
-    This helps prevent initial predictions from being too large.
+    Initializes a regression model's parameters with a near-zero last layer.
+    Bias 0 is climatology when the head emits z-scores of the municipal target.
 
     Usage:
         model = RegressionModel()
@@ -96,6 +96,7 @@ def weight_init_regression(m):
         init.constant_(m.bias.data, 0)
     elif isinstance(m, nn.Linear):
         if m.out_features == 1:
+            # Head emits z-scores: N(0, 0.01) weights + bias 0 → climatology.
             init.normal_(m.weight.data, mean=0.0, std=0.01)
             if m.bias is not None:
                 init.constant_(m.bias.data, 0.0)

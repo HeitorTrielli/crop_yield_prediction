@@ -1,0 +1,60 @@
+# Mega-pixel MEAN, from-scratch feature sweep (no MoCo).
+# One trial per derived layout in datasets/feature_recipes.py
+# (10 spectral/index groups × 17 climate encodings = 170 trials).
+#
+# Features are computed on the fly from 17-channel npy_muni_mean
+# (bands, NDVI/EVI/NDWI/…, rain, cum/delta/WB, heat/cold days, GDD).
+# Heat/cold days are interval-mean Tmax/Tmin proxies (between S2 dates
+# and season-to-date), not true daily counts.
+# Does not rewrite .npy files.
+#
+# Architecture is the best mega-pixel mean from-scratch trunk
+# (64/4/64 drop=0.4, val R² ~0.20 on spectral_xavier_full).
+# Sanity-check layout: mp_bands__cum ≈ spectral_xavier_full.
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_muni_mean_feature_sweep.yaml --list-trials
+#
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_muni_mean_feature_sweep.yaml --skip-completed
+
+name: productivity_muni_mean_feature_sweep
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 1.0e-5
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [150, 750]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  model_n_layers: 1
+  model_d_model: 64
+  model_n_head: 4
+  model_d_inner: 64
+  model_dropout: 0.4
+
+search:
+  strategy: feature_sweep

@@ -10,12 +10,13 @@ from typing import Any
 
 from tuning.config import BOOL_PARAMS, coerce_param_types
 
-from run_paths import run_dir_for_experiment
+from run_paths import ensure_dir, run_dir_for_experiment
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TARGET_PREFIX = {
     "productivity": "Productivity",
+    "productivity_dev": "ProductivityDev",
     "total_adj": "TotalAdj",
     "total": "Total",
 }
@@ -38,6 +39,16 @@ def predict_run_name(params: dict) -> str:
         parts.append(str(suffix))
     return "_".join(parts)
 
+# Tuner-only keys: never forwarded to the training script argparse.
+TUNER_ONLY_KEYS = frozenset(
+    {
+        "year_loo_folds",
+        "skip",
+        "skip_reason",
+        "suffix_prefix",
+    }
+)
+
 # CLI flags that differ from snake_case param names.
 FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "learning_rate": ("-lr", "--learning-rate"),
@@ -46,14 +57,19 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "workers": ("-j", "--workers"),
     "epochs": ("-e", "--epochs"),
     "logdir": ("-l", "--logdir"),
+    "run_dir": ("--run-dir",),
     "suffix": ("-s", "--suffix"),
     "target": ("--target",),
     "harvest_years": ("--harvest-years",),
+    "holdout_year": ("--holdout-year",),
     "feature_layout": ("--feature-layout",),
+    "extra_scaler": ("--extra-scaler",),
+    "refit_extra_scaler": ("--refit-extra-scaler",),
     "weight_decay": ("--weight-decay",),
     "sample_ratio": ("--sample-ratio",),
     "warmup_epochs": ("--warmup-epochs",),
     "early_stop_patience": ("--early-stop-patience",),
+    "checkpoint_every": ("--checkpoint-every",),
     "model_d_model": ("--model-d-model",),
     "model_n_head": ("--model-n-head",),
     "model_n_layers": ("--model-n-layers",),
@@ -65,7 +81,16 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "pretrained": ("--pretrained",),
     "datapath": ("--datapath",),
     "yield_csv": ("--yield-csv",),
+    "exclude_muni_years": ("--exclude-muni-years",),
     "seed": ("--seed",),
+    "min_coverage_ratio": ("--min-coverage-ratio",),
+    "max_coverage_ratio": ("--max-coverage-ratio",),
+    "train_mid_yield_keep_fraction": ("--train-mid-yield-keep-fraction",),
+    "train_mid_yield_lo": ("--train-mid-yield-lo",),
+    "train_mid_yield_hi": ("--train-mid-yield-hi",),
+    "train_mid_yield_bin_width": ("--train-mid-yield-bin-width",),
+    "min_images": ("--min-images",),
+    "min_months": ("--min-months",),
     "schedule": ("--schedule",),
     "pixel_chunk_size": ("--pixel-chunk-size",),
     "prefetch_chunks": ("--prefetch-chunks",),
@@ -128,7 +153,9 @@ def build_training_argv(
     # Required ordering: --target and --harvest-years first (argparse friendly).
     priority = ("target", "harvest_years")
     ordered_keys = [k for k in priority if k in params]
-    ordered_keys += sorted(k for k in params if k not in priority)
+    ordered_keys += sorted(
+        k for k in params if k not in priority and k not in TUNER_ONLY_KEYS
+    )
 
     for key in ordered_keys:
         argv.extend(_param_to_flags(key, params[key]))
@@ -137,6 +164,9 @@ def build_training_argv(
 
 def predict_run_dir(params: dict, *, logdir: str | Path = "./results") -> Path:
     """Predict results folder for a trial from its merged params."""
+    explicit = params.get("run_dir")
+    if explicit:
+        return Path(explicit)
     return run_dir_for_experiment(
         logdir,
         predict_run_name(params),
@@ -186,7 +216,7 @@ def run_trial_subprocess(
 
     stdout_path = capture_log
     if stdout_path is not None:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(stdout_path.parent, quiet=True)
         log_mode = "a" if append_log and stdout_path.is_file() else "w"
         with open(stdout_path, log_mode, encoding="utf-8") as log_f:
             if log_mode == "a":

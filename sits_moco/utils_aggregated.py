@@ -105,16 +105,123 @@ TARGET_SPECS = {
         "unit": "tons",
     },
     "productivity": {"column": "yield_t_ha", "aggregation": "mean", "unit": "t/ha"},
+    # Deviation from per-year train-set mean of yield_t_ha (yield anomaly).
+    # Column is derived at load time; see ensure_productivity_dev_column().
+    "productivity_dev": {
+        "column": "yield_t_ha_dev",
+        "aggregation": "mean",
+        "unit": "t/ha_dev",
+    },
 }
 
 
 def resolve_target(target: str) -> tuple[str, str, str]:
-    """Return (target_column, aggregation, unit) for a registered target name."""
+    """Return (target_column, aggregation, unit) for a target name."""
     spec = TARGET_SPECS.get(target)
     if spec is None:
         choices = ", ".join(TARGET_SPECS)
         raise ValueError(f"Unknown target {target!r}; expected one of: {choices}")
     return spec["column"], spec["aggregation"], spec["unit"]
+
+
+def resolve_target_bundle(target: str) -> dict:
+    """
+    Resolve a training target.
+
+    Returns dict with:
+      target, target_names, target_columns, aggregations, units, num_outputs
+    Lists have length 1; scalar aliases are also set
+    (target_column, aggregation, target_unit).
+    """
+    col, agg, unit = resolve_target(target)
+    return {
+        "target": target,
+        "target_names": [target],
+        "target_columns": [col],
+        "aggregations": [agg],
+        "units": [unit],
+        "num_outputs": 1,
+        "target_column": col,
+        "aggregation": agg,
+        "target_unit": unit,
+    }
+
+
+HEAD_OUTPUT_ZSCORE = "zscore"
+HEAD_OUTPUT_RAW = "raw"
+
+
+def resolve_head_output(
+    checkpoint: dict | None = None,
+    run_config: dict | None = None,
+    *,
+    default: str | None = None,
+) -> str:
+    """Return ``zscore`` or ``raw`` for the regression decoder.
+
+    New training emits z-scores of the municipal target (bias 0 = climatology).
+    Checkpoints and run configs without ``head_output`` are treated as ``raw``
+    so older models that emitted t/ha or tons keep working.
+    """
+    ck = checkpoint or {}
+    if ck.get("head_output"):
+        return str(ck["head_output"])
+    computed = (run_config or {}).get("computed") or {}
+    if computed.get("head_output"):
+        return str(computed["head_output"])
+    cli = (run_config or {}).get("cli") or {}
+    if cli.get("head_output"):
+        return str(cli["head_output"])
+    if default is not None:
+        return str(default)
+    if checkpoint is not None or run_config is not None:
+        return HEAD_OUTPUT_RAW
+    return HEAD_OUTPUT_ZSCORE
+
+
+def pixel_pool_for_head(aggregation, head_output: str):
+    """Z-score heads vote for the municipal scalar, so pixels are mean-pooled."""
+    if head_output != HEAD_OUTPUT_ZSCORE:
+        return aggregation
+    if isinstance(aggregation, str):
+        return "mean"
+    return type(aggregation)("mean" for _ in aggregation)
+
+
+def _stat_to_numpy(stat) -> np.ndarray:
+    if torch.is_tensor(stat):
+        return stat.detach().cpu().numpy()
+    return np.asarray(stat)
+
+
+def denormalize_head_output(values, target_mean, target_std, head_output: str):
+    """Map decoder outputs to original target units (z * σ + μ)."""
+    if head_output != HEAD_OUTPUT_ZSCORE:
+        return values
+    if target_mean is None or target_std is None:
+        return values
+
+    if torch.is_tensor(values):
+        mean = target_mean
+        std = target_std
+        if not torch.is_tensor(mean):
+            mean = torch.as_tensor(mean, dtype=values.dtype, device=values.device)
+        else:
+            mean = mean.to(device=values.device, dtype=values.dtype)
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, dtype=values.dtype, device=values.device)
+        else:
+            std = std.to(device=values.device, dtype=values.dtype)
+        return values * std + mean
+
+    if isinstance(values, np.ndarray):
+        mean = np.asarray(_stat_to_numpy(target_mean), dtype=values.dtype)
+        std = np.asarray(_stat_to_numpy(target_std), dtype=values.dtype)
+        return values * std + mean
+
+    mean = float(np.asarray(_stat_to_numpy(target_mean)).reshape(-1)[0])
+    std = float(np.asarray(_stat_to_numpy(target_std)).reshape(-1)[0])
+    return float(values) * std + mean
 
 
 def resolve_inference_target(
@@ -154,7 +261,7 @@ def resolve_inference_target(
     config_path = run_config.get("config_path", "training/config.json")
     raise ValueError(
         f"Cannot determine training target from {config_path} or checkpoint. "
-        "Re-train with --target total|total_adj|productivity."
+        "Re-train with --target total|total_adj|productivity|productivity_dev."
     )
 
 
@@ -240,12 +347,34 @@ def resolve_pixel_chunk_size(
     return resolve_inference_chunk_size(run_config, chunk_size)
 
 
-def aggregate_pixels(predictions: torch.Tensor, aggregation: str) -> torch.Tensor:
-    if aggregation == "sum":
-        return predictions.sum(dim=0)
-    if aggregation == "mean":
-        return predictions.mean(dim=0)
-    raise ValueError(f"aggregation must be 'sum' or 'mean', got {aggregation!r}")
+def aggregate_pixels(
+    predictions: torch.Tensor,
+    aggregation: str | list[str] | tuple[str, ...] = "sum",
+) -> torch.Tensor:
+    """Aggregate pixel predictions [N, C] → [C] with per-dim sum/mean."""
+    if isinstance(aggregation, str):
+        if aggregation == "sum":
+            return predictions.sum(dim=0)
+        if aggregation == "mean":
+            return predictions.mean(dim=0)
+        raise ValueError(f"aggregation must be 'sum' or 'mean', got {aggregation!r}")
+
+    aggs = list(aggregation)
+    summed = predictions.sum(dim=0)
+    n = float(predictions.shape[0])
+    if len(aggs) == 1:
+        return summed if aggs[0] == "sum" else summed / n
+    if len(aggs) != int(summed.numel()):
+        raise ValueError(
+            f"Got {summed.numel()} prediction dims but {len(aggs)} aggregations"
+        )
+    out = summed.clone()
+    for i, agg in enumerate(aggs):
+        if agg == "mean":
+            out[i] = out[i] / n
+        elif agg != "sum":
+            raise ValueError(f"aggregation must be 'sum' or 'mean', got {agg!r}")
+    return out
 
 
 def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
@@ -257,14 +386,22 @@ def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
 
 
 def aggregate_municipality_from_pixel_chunks(
-    model, pixel_chunks, device, aggregation: str = "sum"
+    model,
+    pixel_chunks,
+    device,
+    aggregation: str = "sum",
+    *,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
 ) -> float | None:
     """Run STNet on pixel chunks; aggregate to municipality prediction (sum or mean)."""
     from torch.amp import autocast
 
     from utils import recursive_todevice
 
-    acc = MunicipalityPixelAccumulator(aggregation)
+    pool = pixel_pool_for_head(aggregation, head_output)
+    acc = MunicipalityPixelAccumulator(pool)
     model.eval()
     with torch.no_grad():
         for pixel_chunk in pixel_chunks:
@@ -286,7 +423,11 @@ def aggregate_municipality_from_pixel_chunks(
     result = result.squeeze()
     if result.dim() > 0:
         result = result[0] if len(result) > 0 else torch.tensor(0.0)
-    return float(result.item())
+    return float(
+        denormalize_head_output(
+            result.item(), target_mean, target_std, head_output
+        )
+    )
 
 
 def sum_municipality_from_pixel_chunks(model, pixel_chunks, device) -> float | None:
@@ -317,9 +458,15 @@ def regression_metrics(y_pred, y_true, *, target_column: str = "production_t"):
     r2 = 1 - (ss_res / (ss_tot + 1e-10))
 
     # MAPE: Filter out values where y_true is too small (less than 1% of mean or absolute threshold)
-    # This prevents division by near-zero values that cause MAPE to explode
+    # This prevents division by near-zero values that cause MAPE to explode.
+    # Deviation targets cross zero often — MAPE is usually NaN / unreliable there.
     mean_y_true = np.mean(np.abs(y_true))
-    floor = 0.1 if target_column == "yield_t_ha" else 100.0
+    if target_column == "yield_t_ha":
+        floor = 0.1
+    elif target_column == "yield_t_ha_dev":
+        floor = 0.5
+    else:
+        floor = 100.0
     threshold = max(mean_y_true * 0.01, floor)
     mape_mask = np.abs(y_true) >= threshold
     if mape_mask.sum() > 0:
@@ -334,16 +481,73 @@ def regression_metrics(y_pred, y_true, *, target_column: str = "production_t"):
     return {"rmse": rmse, "mae": mae, "r2": r2, "mape": mape}
 
 
+def _metric_prefix_for_column(target_column: str) -> str:
+    if target_column == "yield_t_ha":
+        return "prod"
+    if target_column == "yield_t_ha_dev":
+        return "prod_dev"
+    if target_column == "production_t_s2_adj":
+        return "total_adj"
+    if target_column == "production_t":
+        return "total"
+    return "out"
+
+
+def regression_metrics_bundle(
+    y_pred,
+    y_true,
+    *,
+    target_columns: str | list[str] | tuple[str, ...],
+):
+    """
+    Metrics for one or more output heads.
+
+    The first column fills rmse/mae/r2/mape for trainlog compatibility.
+    Additional columns add prefixed keys (e.g. r2_total_adj).
+    """
+    if isinstance(target_columns, str):
+        cols = [target_columns]
+    else:
+        cols = list(target_columns)
+
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    y_true = np.asarray(y_true, dtype=np.float64)
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+
+    if y_pred.shape[1] != len(cols):
+        raise ValueError(
+            f"y_pred has {y_pred.shape[1]} dims but {len(cols)} target columns"
+        )
+
+    out: dict = {}
+    for i, col in enumerate(cols):
+        m = regression_metrics(y_pred[:, i], y_true[:, i], target_column=col)
+        if i == 0:
+            out.update(m)
+        prefix = _metric_prefix_for_column(col)
+        for k, v in m.items():
+            out[f"{k}_{prefix}"] = v
+    return out
+
+
 class AggregatedMSELoss(nn.Module):
-    """Loss: aggregate pixel predictions per municipality (sum or mean), compare to target."""
+    """Loss: aggregate pixel predictions per municipality, compare to target.
+
+    When ``head_output='zscore'`` the decoder already emits municipal z-scores,
+    so pixels are mean-pooled and the aggregate is not z-scored again.
+    """
 
     def __init__(
         self,
         reduction="mean",
         target_mean=None,
         target_std=None,
-        aggregation: str = "sum",
-        target_column: str = "production_t",
+        aggregation: str | list[str] | tuple[str, ...] = "sum",
+        target_column: str | list[str] | tuple[str, ...] = "production_t",
+        head_output: str = HEAD_OUTPUT_ZSCORE,
     ):
         super().__init__()
         self.reduction = reduction
@@ -353,16 +557,33 @@ class AggregatedMSELoss(nn.Module):
         self.normalize = target_mean is not None and target_std is not None
         self.aggregation = aggregation
         self.target_column = target_column
+        self.head_output = head_output
+
+    def _norm_stats_tensors(self, ref: torch.Tensor):
+        mean = self.target_mean
+        std = self.target_std
+        if not torch.is_tensor(mean):
+            mean = torch.as_tensor(mean, dtype=ref.dtype, device=ref.device)
+        else:
+            mean = mean.to(device=ref.device, dtype=ref.dtype)
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, dtype=ref.dtype, device=ref.device)
+        else:
+            std = std.to(device=ref.device, dtype=ref.dtype)
+        return mean, std
 
     def forward(self, predictions_list, targets, num_pixels_list=None):
         """
         Args:
             predictions_list: List of tensors, one per municipality [num_pixels, num_outputs]
-            targets: [batch_size] - Municipality-level targets (already normalized if normalize=True)
+            targets: [batch_size] or [batch_size, num_outputs] (already normalized if normalize=True)
         """
+        pool = pixel_pool_for_head(
+            self.aggregation, getattr(self, "head_output", HEAD_OUTPUT_RAW)
+        )
         aggregated_predictions = []
         for pred in predictions_list:
-            aggregated_predictions.append(aggregate_pixels(pred, self.aggregation))
+            aggregated_predictions.append(aggregate_pixels(pred, pool))
 
         aggregated = torch.stack(aggregated_predictions)  # [batch_size, num_outputs]
 
@@ -371,11 +592,11 @@ class AggregatedMSELoss(nn.Module):
         if targets.dim() > 1 and targets.size(1) == 1:
             targets = targets.squeeze(1)
 
-        # Normalize predictions if normalization is enabled (targets are already normalized)
-        if self.normalize:
-            aggregated = (aggregated - self.target_mean) / self.target_std
+        head_output = getattr(self, "head_output", HEAD_OUTPUT_RAW)
+        if head_output != HEAD_OUTPUT_ZSCORE and self.normalize:
+            mean, std = self._norm_stats_tensors(aggregated)
+            aggregated = (aggregated - mean) / std
 
-        # Compute loss directly on normalized values
         loss = self.mse(aggregated, targets)
 
         if self.reduction == "mean":
@@ -421,7 +642,7 @@ def train_epoch_aggregated(
     target_std=None,
     run_stats: dict | None = None,
 ):
-    """Training epoch: process municipalities, sum pixel predictions, compare to targets."""
+    """Training epoch: mean-pool pixel z-scores per municipality, MSE vs z-scored labels."""
     from torch.amp import GradScaler
 
     from training.train_batch import process_train_batch
@@ -431,6 +652,7 @@ def train_epoch_aggregated(
     losses = AverageMeter("Loss", ":.4e")
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
+    head_output = getattr(criterion, "head_output", HEAD_OUTPUT_RAW)
     scaler = GradScaler("cuda")
     chunk_size = _pixel_chunk_size(args)
 
@@ -462,6 +684,7 @@ def train_epoch_aggregated(
             chunk_size=chunk_size,
             batch_idx=idx,
             run_stats=run_stats,
+            head_output=head_output,
         )
 
         if num_municipalities > 0 and total_loss >= 0:
@@ -537,6 +760,7 @@ def run_training_vram_probe(
 
     model.train()
     aggregation = getattr(criterion, "aggregation", "sum")
+    head_output = getattr(criterion, "head_output", HEAD_OUTPUT_RAW)
     scaler = GradScaler("cuda")
     chunk_size = _pixel_chunk_size(args)
     state = {
@@ -573,6 +797,7 @@ def run_training_vram_probe(
             chunk_size=chunk_size,
             batch_idx=batch_idx,
             vram_probe_state=state,
+            head_output=head_output,
         )
         if state["over_limit"] or state["complete"]:
             break
@@ -598,12 +823,21 @@ def test_epoch_aggregated(
     losses = AverageMeter("Loss", ":.4e")
     model.eval()
     aggregation = getattr(criterion, "aggregation", "sum")
+    head_output = getattr(criterion, "head_output", HEAD_OUTPUT_RAW)
+    pixel_pool = pixel_pool_for_head(aggregation, head_output)
     target_column = getattr(criterion, "target_column", "production_t")
     all_aggregated_preds = []
     all_targets = []
     chunk_size = _pixel_chunk_size(args)
     batch_total = len(dataloader)
     epoch_start = time.perf_counter()
+
+    def _to_stats_tensor(stat, ref: torch.Tensor):
+        if stat is None:
+            return None
+        if not torch.is_tensor(stat):
+            return torch.as_tensor(stat, dtype=ref.dtype, device=ref.device)
+        return stat.to(device=ref.device, dtype=ref.dtype)
 
     with torch.no_grad():
         for idx, (municipalities, targets, num_pixels_list, years) in enumerate(
@@ -642,27 +876,35 @@ def test_epoch_aggregated(
             )
 
             aggregated_preds = torch.stack(
-                [aggregate_pixels(pred, aggregation) for pred in predictions_list]
+                [aggregate_pixels(pred, pixel_pool) for pred in predictions_list]
             )
             if aggregated_preds.dim() > 1 and aggregated_preds.size(1) == 1:
                 aggregated_preds = aggregated_preds.squeeze(1)
+            if targets.dim() > 1 and targets.size(1) == 1:
+                targets = targets.squeeze(1)
 
             if target_mean is not None and target_std is not None:
-                aggregated_preds_normalized = (
-                    aggregated_preds - target_mean
-                ) / target_std
-                aggregated_preds = (
-                    aggregated_preds_normalized * target_std + target_mean
-                )
-                targets = targets * target_std + target_mean
+                if head_output == HEAD_OUTPUT_ZSCORE:
+                    aggregated_preds = denormalize_head_output(
+                        aggregated_preds, target_mean, target_std, head_output
+                    )
+                    targets = denormalize_head_output(
+                        targets, target_mean, target_std, head_output
+                    )
+                else:
+                    mean_t = _to_stats_tensor(target_mean, aggregated_preds)
+                    std_t = _to_stats_tensor(target_std, aggregated_preds)
+                    aggregated_preds_normalized = (aggregated_preds - mean_t) / std_t
+                    aggregated_preds = aggregated_preds_normalized * std_t + mean_t
+                    targets = targets * std_t + mean_t
 
             all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
             all_targets.append(targets.cpu().numpy())
 
         all_aggregated_preds = np.concatenate(all_aggregated_preds)
         all_targets = np.concatenate(all_targets)
-        scores = regression_metrics(
-            all_aggregated_preds, all_targets, target_column=target_column
+        scores = regression_metrics_bundle(
+            all_aggregated_preds, all_targets, target_columns=target_column
         )
 
     return losses.avg, scores

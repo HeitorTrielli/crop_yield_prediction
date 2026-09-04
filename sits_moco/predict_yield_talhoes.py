@@ -49,7 +49,9 @@ from run_paths import (
     run_dir_from_path,
 )
 from utils_aggregated import (
+    denormalize_head_output,
     regression_metrics,
+    resolve_head_output,
     resolve_inference_target,
     resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
@@ -539,6 +541,9 @@ def predict_pixel_grid_daily(
     talhao_only: bool = True,
     reproject_tiffs: bool = False,
     use_mask_cache: bool = True,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ) -> tuple[np.ndarray, np.ndarray, object, object] | None:
     """
     Returns (pred_grid, keep_mask, transform, crs).
@@ -600,7 +605,9 @@ def predict_pixel_grid_daily(
             take = slice(None)
         preds = _run_model_chunk(model, batch, device)[take]
         for (r, c), p in zip(chunk_rc, preds):
-            pred_grid[r, c] = float(p)
+            pred_grid[r, c] = float(
+                denormalize_head_output(p, target_mean, target_std, head_output)
+            )
         current_chunk = []
         chunk_rc = []
 
@@ -781,13 +788,17 @@ def run_talhao_predictions(
     if run_config is not None and checkpoint is not None:
         ck = torch.load(checkpoint, map_location=device, weights_only=False)
         target, _, _, target_unit = resolve_inference_target(run_config, ck)
+        head_output = resolve_head_output(ck, run_config)
+        target_mean = ck.get("target_mean")
+        target_std = ck.get("target_std")
     else:
         target, target_unit = "production", "t"
+        head_output, target_mean, target_std = "raw", None, None
 
     if verbose:
         print(
             f"Model ready (input_dim={input_dim}, pixel aggregation={aggregation}, "
-            f"target={target}, unit={target_unit})"
+            f"target={target}, unit={target_unit}, head={head_output})"
         )
         print("Mode: talhão-only (infer pixels inside plot polygons only)")
 
@@ -857,6 +868,9 @@ def run_talhao_predictions(
             talhao_only=True,
             reproject_tiffs=reproject_tiffs,
             use_mask_cache=use_mask_cache,
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
         )
         if grid_out is None:
             for _, row in group.iterrows():

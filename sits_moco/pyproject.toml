@@ -21,10 +21,18 @@ dependencies = [
 
     # Geospatial
     "geopandas>=0.10.2",
+    "geobr>=0.2.0",         # IBGE municipal/state boundaries (download_*_shapefile*)
     "rasterio>=1.2.10",
     "shapely>=1.8.0",
     "pyproj>=3.3.0",
     "fiona>=1.8.20",
+    "pystac-client>=0.7.0",
+
+    # Google Earth Engine + Drive (download_soy_gee_*)
+    "earthengine-api>=0.1.370",
+    "google-api-python-client>=2.100.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.1.0",
 
     # Visualization
     "matplotlib>=3.5.1",
