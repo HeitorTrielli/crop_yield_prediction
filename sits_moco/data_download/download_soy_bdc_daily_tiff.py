@@ -36,6 +36,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# PostgreSQL/PostGIS often sets PROJ_LIB to an incompatible proj.db on Windows.
+# Fix before geopandas/rasterio import CRS databases.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bdc_zonal import fix_proj_gdal_data_env  # noqa: E402
+
+fix_proj_gdal_data_env()
+
 import geopandas as gpd
 from tqdm import tqdm
 
@@ -244,6 +251,24 @@ def read_geometry(shapefile: Path):
 def tiff_name(prefix: str, date_str: str) -> str:
     y, m, d = date_str.split("-")
     return f"{prefix}_{y}_{m}_{d}.tiff"
+
+
+def daily_tiff_has_valid_pixels(path: Path, nodata: float = -9999.0) -> bool:
+    """True if the GeoTIFF has any non-nodata reflectance (not an empty shell)."""
+    import numpy as np
+    import rasterio
+
+    try:
+        with rasterio.open(path) as src:
+            if src.count < 1 or src.width < 1 or src.height < 1:
+                return False
+            # Downsample: full 33k×20k SP mosaics are too large to scan every skip.
+            h = max(1, src.height // 40)
+            w = max(1, src.width // 40)
+            band = src.read(1, out_shape=(h, w))
+            return bool(np.any((band != nodata) & np.isfinite(band)))
+    except Exception:
+        return False
 
 
 def tiff_dates_on_disk(season_root: Path, prefix: str) -> set[str]:
@@ -732,8 +757,8 @@ def run_season(args: argparse.Namespace, season_year: int, geometry) -> None:
     log(f"{len(items)} STAC items -> {len(dates)} dates with usable granules")
     if not items:
         log(
-            "BDC S2_L2A-1 has no daily COGs for this polygon/dates "
-            "(RS coverage starts ~Oct 2021; earlier years exist in other regions). "
+            "BDC S2_L2A-1 returned 0 items for this polygon/dates "
+            "(catalog gaps are common before ~2021-10 in the South/Southeast). "
             "Use GEE for those seasons, or S2-16D-2 16-day composites."
         )
 
@@ -742,10 +767,17 @@ def run_season(args: argparse.Namespace, season_year: int, geometry) -> None:
     for date_str in dates:
         dest = season_root / tiff_name(prefix, date_str)
         if args.skip_existing and dest.is_file():
-            summary.append(
-                {"date": date_str, "status": "success", "note": "already on disk"}
-            )
-            continue
+            if daily_tiff_has_valid_pixels(dest):
+                summary.append(
+                    {"date": date_str, "status": "success", "note": "already on disk"}
+                )
+                continue
+            log(f"  removing empty/all-nodata shell: {dest.name}")
+            try:
+                dest.unlink()
+            except Exception as exc:
+                log(f"  could not remove {dest.name}: {exc}")
+                # Fall through and try to overwrite.
         n_granules = len(by_date[date_str])
         jobs.append(
             {

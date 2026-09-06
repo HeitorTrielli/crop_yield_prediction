@@ -18,7 +18,43 @@ import re
 import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+
+def fix_proj_gdal_data_env() -> None:
+    """Prefer Python's pyproj/rasterio data dirs over PostGIS's stale proj.db.
+
+    On Windows, installing PostgreSQL+PostGIS often sets system ``PROJ_LIB`` /
+    ``GDAL_DATA`` to an old ``proj.db`` (layout v2). Modern rasterio/pyproj need
+    layout >= 4 and then fail with ``EPSG code is unknown``. Override those
+    vars before CRS ops (and again in ProcessPoolExecutor workers).
+    """
+    try:
+        import pyproj
+
+        proj_dir = Path(pyproj.datadir.get_data_dir())
+        if (proj_dir / "proj.db").is_file():
+            os.environ["PROJ_LIB"] = str(proj_dir)
+            os.environ["PROJ_DATA"] = str(proj_dir)
+            try:
+                pyproj.datadir.set_data_dir(str(proj_dir))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import rasterio as _rio
+
+        gdal_dir = Path(_rio.__file__).resolve().parent / "gdal_data"
+        if gdal_dir.is_dir():
+            os.environ["GDAL_DATA"] = str(gdal_dir)
+    except Exception:
+        pass
+
+
+# Must run before rasterio/geopandas CRS lookups in this process / workers.
+fix_proj_gdal_data_env()
 
 import geopandas as gpd
 import numpy as np
@@ -36,6 +72,7 @@ os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.TIF")
 
 def silence_bdc_numpy_warnings() -> None:
     """Worker processes re-import this module; also call as ProcessPoolExecutor initializer."""
+    fix_proj_gdal_data_env()
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message=".*All-NaN.*")
     np.seterr(all="ignore")
@@ -97,6 +134,35 @@ def get_stac_client(url: str = BDC_STAC_URL):
     return Client.open(url)
 
 
+# BDC's nginx rejects large request bodies with "413 Request Entity Too Large"
+# (detailed state boundaries easily exceed the limit). Search with the axis-
+# aligned bbox only; exact spatial filtering happens later via soy mask / clipping.
+_MAX_SEARCH_GEOJSON_BYTES = 8_000
+
+
+def _search_geometry(geometry):
+    """Return a tiny STAC footprint that still covers ``geometry``.
+
+    Prefer the axis-aligned envelope (a few bytes). If a caller somehow
+    needs a polygon, fall back to progressive simplify+buffer.
+    """
+    import json
+
+    full = _as_shapely(geometry)
+    envelope = full.envelope
+    if len(json.dumps(mapping(envelope))) <= _MAX_SEARCH_GEOJSON_BYTES:
+        return envelope
+    g = full
+    tol = 0.01  # degrees (~1 km)
+    for _ in range(8):
+        candidate = g.simplify(tol, preserve_topology=True).buffer(tol).simplify(tol / 2)
+        if len(json.dumps(mapping(candidate))) <= _MAX_SEARCH_GEOJSON_BYTES:
+            return candidate
+        g = candidate
+        tol *= 4.0
+    return envelope
+
+
 def search_s2_items(
     geometry,
     start_date: str,
@@ -105,13 +171,18 @@ def search_s2_items(
     collection: str = S2_L2A_COLLECTION,
     client=None,
 ) -> list:
-    """STAC items intersecting ``geometry`` in [start_date, end_date] (inclusive)."""
+    """STAC items intersecting ``geometry`` in [start_date, end_date] (inclusive).
+
+    Uses ``bbox`` (not a detailed GeoJSON polygon) so large state shapefiles
+    do not trigger BDC nginx 413 Request Entity Too Large.
+    """
     if client is None:
         client = get_stac_client()
-    geo = mapping(_as_shapely(geometry))
+    full = _as_shapely(geometry)
+    minx, miny, maxx, maxy = full.bounds
     search = client.search(
         collections=[collection],
-        intersects=geo,
+        bbox=(float(minx), float(miny), float(maxx), float(maxy)),
         datetime=f"{start_date}/{end_date}",
         query={"eo:cloud_cover": {"lt": float(cloud_pct)}},
     )

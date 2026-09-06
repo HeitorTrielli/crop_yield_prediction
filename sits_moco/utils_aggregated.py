@@ -281,6 +281,8 @@ _MODEL_KWARG_FIELDS = (
     ("model_n_layers", "n_layers", int),
     ("model_d_inner", "d_inner", int),
     ("model_dropout", "dropout", float),
+    ("temporal_pooling", "temporal_pooling", str),
+    ("attn_pool_queries", "attn_pool_queries", int),
 )
 
 
@@ -305,6 +307,9 @@ def resolve_model_kwargs(
             "n_layers": int(mk["n_layers"]),
             "d_inner": int(mk["d_inner"]),
             "dropout": float(mk["dropout"]),
+            # absent in configs from before learned attention pooling existed
+            "temporal_pooling": str(mk.get("temporal_pooling", "ndvi")),
+            "attn_pool_queries": int(mk.get("attn_pool_queries", 4)),
         }
 
     kwargs: dict = {}

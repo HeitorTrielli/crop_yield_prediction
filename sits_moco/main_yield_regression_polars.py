@@ -469,6 +469,23 @@ def parse_args():
         help="STNet dropout probability (default: 0.2)",
     )
     parser.add_argument(
+        "--temporal-pooling",
+        type=str,
+        choices=["ndvi", "attention"],
+        default="ndvi",
+        help=(
+            "Temporal pooling before the decoder: 'ndvi' = fixed exp(NDVI)-weighted "
+            "mean (legacy), 'attention' = learned multi-query attention pooling "
+            "(keeps exp(NDVI) as a learnable prior). Default: ndvi."
+        ),
+    )
+    parser.add_argument(
+        "--attn-pool-queries",
+        type=int,
+        default=4,
+        help="Number of learned pooling queries for --temporal-pooling attention (default: 4)",
+    )
+    parser.add_argument(
         "--aux-loss",
         type=str,
         default="none",
@@ -924,6 +941,8 @@ def model_kwargs_from_args(args) -> dict:
         "n_layers": int(args.model_n_layers),
         "d_inner": int(args.model_d_inner),
         "dropout": float(args.model_dropout),
+        "temporal_pooling": str(getattr(args, "temporal_pooling", "ndvi")),
+        "attn_pool_queries": int(getattr(args, "attn_pool_queries", 4)),
     }
 
 
