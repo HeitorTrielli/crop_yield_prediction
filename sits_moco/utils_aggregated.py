@@ -533,6 +533,8 @@ class AggregatedMSELoss(nn.Module):
 
     When ``head_output='zscore'`` the decoder already emits municipal z-scores,
     so pixels are mean-pooled and the aggregate is not z-scored again.
+    When ``head_output='raw'`` and ``normalize_targets=False``, both the
+    decoder and labels stay in original units (t/ha).
     """
 
     def __init__(
@@ -543,6 +545,7 @@ class AggregatedMSELoss(nn.Module):
         aggregation: str | list[str] | tuple[str, ...] = "sum",
         target_column: str | list[str] | tuple[str, ...] = "production_t",
         head_output: str = HEAD_OUTPUT_ZSCORE,
+        normalize_targets: bool | None = None,
     ):
         super().__init__()
         self.reduction = reduction
@@ -550,6 +553,9 @@ class AggregatedMSELoss(nn.Module):
         self.target_mean = target_mean if target_mean is not None else 0.0
         self.target_std = target_std if target_std is not None else 1.0
         self.normalize = target_mean is not None and target_std is not None
+        self.normalize_targets = (
+            self.normalize if normalize_targets is None else bool(normalize_targets)
+        )
         self.aggregation = aggregation
         self.target_column = target_column
         self.head_output = head_output
@@ -588,7 +594,8 @@ class AggregatedMSELoss(nn.Module):
             targets = targets.squeeze(1)
 
         head_output = getattr(self, "head_output", HEAD_OUTPUT_RAW)
-        if head_output != HEAD_OUTPUT_ZSCORE and self.normalize:
+        labels_zscored = bool(getattr(self, "normalize_targets", self.normalize))
+        if head_output != HEAD_OUTPUT_ZSCORE and labels_zscored:
             mean, std = self._norm_stats_tensors(aggregated)
             aggregated = (aggregated - mean) / std
 
@@ -879,6 +886,7 @@ def test_epoch_aggregated(
                 targets = targets.squeeze(1)
 
             if target_mean is not None and target_std is not None:
+                labels_zscored = bool(getattr(args, "normalize_targets", True))
                 if head_output == HEAD_OUTPUT_ZSCORE:
                     aggregated_preds = denormalize_head_output(
                         aggregated_preds, target_mean, target_std, head_output
@@ -886,7 +894,7 @@ def test_epoch_aggregated(
                     targets = denormalize_head_output(
                         targets, target_mean, target_std, head_output
                     )
-                else:
+                elif labels_zscored:
                     mean_t = _to_stats_tensor(target_mean, aggregated_preds)
                     std_t = _to_stats_tensor(target_std, aggregated_preds)
                     aggregated_preds_normalized = (aggregated_preds - mean_t) / std_t

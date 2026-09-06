@@ -577,6 +577,7 @@ class USCropsAggregatedNPY(Dataset):
         train_mid_yield_bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
         holdout_year: Optional[int] = None,
         exclude_muni_years: str | None = None,
+        normalize_targets: bool | None = None,
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
@@ -614,11 +615,16 @@ class USCropsAggregatedNPY(Dataset):
         )
         self._temporal_filter_enabled = self.min_images > 0 or self.min_months > 0
 
-        # Store normalization parameters (scalar or per-head vectors).
-        # Labels are z-scored here; the decoder also emits z-scores.
+        # Labels are z-scored here when normalize_targets is True (default if
+        # train μ/σ are provided). --head-output raw keeps yield_t_ha as-is.
         self.target_mean = target_mean if target_mean is not None else 0.0
         self.target_std = target_std if target_std is not None else 1.0
-        self.normalize_targets = target_mean is not None and target_std is not None
+        if normalize_targets is None:
+            self.normalize_targets = target_mean is not None and target_std is not None
+        else:
+            self.normalize_targets = bool(normalize_targets) and (
+                target_mean is not None and target_std is not None
+            )
 
         if isinstance(target_column, (list, tuple)):
             self.target_columns = list(target_column)

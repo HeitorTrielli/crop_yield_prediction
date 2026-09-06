@@ -232,10 +232,12 @@ def process_train_batch(
             target_normalized = _as_1d(target).to(torch.float32)
             if head_output == HEAD_OUTPUT_ZSCORE:
                 municipality_agg_normalized = municipality_agg.to(torch.float32)
-            else:
+            elif bool(getattr(args, "normalize_targets", True)):
                 municipality_agg_normalized = _normalize_pred(
                     municipality_agg.to(torch.float32), target_mean, target_std
                 )
+            else:
+                municipality_agg_normalized = municipality_agg.to(torch.float32)
             final_loss = torch.nn.functional.mse_loss(
                 municipality_agg_normalized, target_normalized
             )
@@ -245,7 +247,9 @@ def process_train_batch(
                     f"  ❌ DEBUG: Municipality {municipality_code} final loss is invalid: {final_loss.item()}"
                 )
             else:
-                if target_mean is not None and target_std is not None:
+                if bool(getattr(args, "normalize_targets", True)) and (
+                    target_mean is not None and target_std is not None
+                ):
                     target_denorm = denormalize_head_output(
                         target_normalized, target_mean, target_std, HEAD_OUTPUT_ZSCORE
                     )
@@ -415,10 +419,12 @@ def process_train_batch(
             target_normalized = _as_1d(target).to(torch.float32)
             if head_output == HEAD_OUTPUT_ZSCORE:
                 municipality_agg_normalized = municipality_agg.to(torch.float32)
-            else:
+            elif bool(getattr(args, "normalize_targets", True)):
                 municipality_agg_normalized = _normalize_pred(
                     municipality_agg.to(torch.float32), target_mean, target_std
                 )
+            else:
+                municipality_agg_normalized = municipality_agg.to(torch.float32)
 
             fraction_processed = (
                 pixel_acc.pixel_count / num_pixels if num_pixels > 0 else 1.0

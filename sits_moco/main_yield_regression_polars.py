@@ -39,7 +39,7 @@ from datasets.uscrops_aggregated_npy_polars import (
     undersample_train_mid_yield_band,
 )
 from models.moco_transfer import remap_moco_encoder_state
-from models.weight_init import weight_init_regression
+from models.weight_init import set_regression_output_bias, weight_init_regression
 from run_paths import (
     ensure_run_layout,
     experiment_dir,
@@ -337,6 +337,17 @@ def parse_args():
             "'total_adj' = production_t_s2_adj (tons scaled to S2 coverage, sum pixels); "
             "'productivity' = yield_t_ha (t/ha, mean pixels); "
             "'productivity_dev' = yield_t_ha minus per-year train mean (t/ha_dev)"
+        ),
+    )
+    parser.add_argument(
+        "--head-output",
+        type=str,
+        choices=(HEAD_OUTPUT_ZSCORE, HEAD_OUTPUT_RAW),
+        default=None,
+        help=(
+            "Decoder units. zscore (default for new runs): train on (y-μ)/σ, "
+            "report RMSE/R² in original t/ha. raw: train and score on unnormalized "
+            "productivity (t/ha)."
         ),
     )
     parser.add_argument(
@@ -1046,6 +1057,13 @@ def train(args):
         f"(columns={args.target_columns}, aggregations={args.aggregations}, "
         f"units={args.units}, num_outputs={args.num_outputs})"
     )
+    normalize_targets = args.head_output != HEAD_OUTPUT_RAW
+    args.normalize_targets = bool(normalize_targets)
+    if not normalize_targets:
+        print(
+            "  Labels stay in raw units (no z-score); "
+            "loss and RMSE/R² are on the same scale."
+        )
 
     print("=> creating dataloader (Polars-optimized)")
     from training_runtime import dataloader_options_from_args
@@ -1077,6 +1095,7 @@ def train(args):
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         holdout_year=args.holdout_year,
         exclude_muni_years=args.exclude_muni_years,
+        normalize_targets=normalize_targets,
         **dl_opts,
     )
     valdataloader, val_meta = get_aggregated_dataloader(
@@ -1104,6 +1123,7 @@ def train(args):
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         holdout_year=args.holdout_year,
         exclude_muni_years=args.exclude_muni_years,
+        normalize_targets=normalize_targets,
         **dl_opts,
     )
     testdataloader, test_meta = get_aggregated_dataloader(
@@ -1131,6 +1151,7 @@ def train(args):
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         holdout_year=args.holdout_year,
         exclude_muni_years=args.exclude_muni_years,
+        normalize_targets=normalize_targets,
         **dl_opts,
     )
 
@@ -1314,9 +1335,12 @@ def train(args):
     print(f"  predictions: {predictions_dir_path}")
     print(f"  figures:     {figures_dir_path}")
 
-    # Fresh runs and MoCo encoder init emit z-scores. Resuming a yield checkpoint
-    # without the key keeps the legacy raw (t/ha or tons) head.
-    if pretrained_checkpoint is not None:
+    # Fresh runs emit z-scores unless --head-output raw. Resuming a yield
+    # checkpoint without the key keeps the legacy raw (t/ha) head that still
+    # trains against z-scored labels in the loss.
+    if args.head_output:
+        head_output = args.head_output
+    elif pretrained_checkpoint is not None:
         head_output = resolve_head_output(
             pretrained_checkpoint, default=HEAD_OUTPUT_RAW
         )
@@ -1328,8 +1352,15 @@ def train(args):
             f"original units = z * σ + μ "
             f"(μ={target_mean}, σ={target_std}). Init bias 0 is climatology."
         )
+    elif not normalize_targets:
+        if pretrained_checkpoint is None or moco_weight_init:
+            set_regression_output_bias(model, target_mean)
+        print(
+            f"  Decoder emits raw {args.target} "
+            f"(μ={target_mean}, σ={target_std}). Init bias is climatology in original units."
+        )
     else:
-        print("  Decoder emits raw target units (legacy checkpoint).")
+        print("  Decoder emits raw target units (legacy checkpoint; labels still z-scored).")
 
     # Pass normalization stats for denormalization in evaluation
     criterion = AggregatedMSELoss(
@@ -1338,6 +1369,7 @@ def train(args):
         aggregation=args.aggregation,
         target_column=args.target_column,
         head_output=head_output,
+        normalize_targets=normalize_targets,
     )
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -1640,6 +1672,7 @@ def train(args):
             ),
             "exclude_muni_years": args.exclude_muni_years,
             "head_output": head_output,
+            "normalize_targets": bool(normalize_targets),
             "productivity_dev_baseline": productivity_dev_meta,
             "min_images": int(args.min_images),
             "min_months": int(args.min_months),
@@ -1746,6 +1779,7 @@ def train(args):
                     target_column=args.target_column,
                     aggregation=args.aggregation,
                     head_output=head_output,
+                    normalize_targets=normalize_targets,
                 )
                 val_loss_min = val_loss
                 print(f"lowest val loss in epoch {epoch + 1}\n")
@@ -1780,6 +1814,7 @@ def train(args):
                     target_column=args.target_column,
                     aggregation=args.aggregation,
                     head_output=head_output,
+                    normalize_targets=normalize_targets,
                 )
                 print(f"Saved checkpoint at epoch {epoch + 1} to {checkpoint_path.name}")
 
@@ -1865,6 +1900,7 @@ def get_aggregated_dataloader(
     prefetch_factor: int | None = 4,
     holdout_year: int | None = None,
     exclude_muni_years: str | None = None,
+    normalize_targets: bool | None = None,
 ):
     """Create dataloader for aggregated regression (Polars-optimized)."""
     dataset = USCropsAggregatedNPY(
@@ -1894,6 +1930,7 @@ def get_aggregated_dataloader(
         train_mid_yield_bin_width=train_mid_yield_bin_width,
         holdout_year=holdout_year,
         exclude_muni_years=exclude_muni_years,
+        normalize_targets=normalize_targets,
     )
 
     # Use QueueSampler for training if sample_ratio < 1.0

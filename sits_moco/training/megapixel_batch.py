@@ -399,7 +399,12 @@ def process_train_megapixel_batch(
     preds = torch.nan_to_num(preds, nan=0.0, posinf=1e4, neginf=-1e4)
     pred_n = _as_2d(preds).to(torch.float32)
     tgt_n = _as_2d(targets[kept]).to(torch.float32)
-    if head_output != HEAD_OUTPUT_ZSCORE and target_mean is not None and target_std is not None:
+    if (
+        head_output != HEAD_OUTPUT_ZSCORE
+        and bool(getattr(args, "normalize_targets", True))
+        and target_mean is not None
+        and target_std is not None
+    ):
         mean = _stats_on(target_mean, pred_n)
         std = _stats_on(target_std, pred_n)
         pred_n = (pred_n - mean) / std

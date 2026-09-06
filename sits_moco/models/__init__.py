@@ -4,7 +4,7 @@ from .STNet import STNet
 from .STNetRegression import STNetRegression
 from .TempCNN import TempCNN
 from .Transformer import TransformerModel
-from .weight_init import weight_init, weight_init_regression
+from .weight_init import set_regression_output_bias, weight_init, weight_init_regression
 
 __all__ = [
     "LSTM",
@@ -15,4 +15,5 @@ __all__ = [
     "TransformerModel",
     "weight_init",
     "weight_init_regression",
+    "set_regression_output_bias",
 ]

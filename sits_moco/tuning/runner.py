@@ -60,6 +60,7 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "run_dir": ("--run-dir",),
     "suffix": ("-s", "--suffix"),
     "target": ("--target",),
+    "head_output": ("--head-output",),
     "harvest_years": ("--harvest-years",),
     "holdout_year": ("--holdout-year",),
     "feature_layout": ("--feature-layout",),
