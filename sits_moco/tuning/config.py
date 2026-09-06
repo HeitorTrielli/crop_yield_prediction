@@ -68,6 +68,7 @@ INT_PARAMS = frozenset(
         "min_images",
         "min_months",
         "holdout_year",
+        "attn_pool_queries",
     }
 )
 

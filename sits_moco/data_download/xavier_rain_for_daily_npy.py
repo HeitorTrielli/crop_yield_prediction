@@ -14,6 +14,7 @@ Spec (see project discussion):
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -104,13 +105,11 @@ def pixel_centroids_lonlat(
     src_crs,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Centers (lon, lat) WGS84 for raster integer (row, col) indices."""
-    rows = np.asarray(rows, dtype=np.int64)
-    cols = np.asarray(cols, dtype=np.int64)
-    xs = np.empty_like(rows, dtype=np.float64)
-    ys = np.empty_like(rows, dtype=np.float64)
-    for i in range(len(rows)):
-        x, y = transform * (cols[i] + 0.5, rows[i] + 0.5)
-        xs[i], ys[i] = x, y
+    cols_f = np.asarray(cols, dtype=np.float64) + 0.5
+    rows_f = np.asarray(rows, dtype=np.float64) + 0.5
+    xs, ys = transform * (cols_f, rows_f)
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
     if src_crs is None or str(src_crs).upper() == "EPSG:4326":
         return xs, ys
     t = pyproj.Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
@@ -239,6 +238,157 @@ def rain_channels_for_observations(
     return cum, dry_streak
 
 
+def _load_climate_xyz(
+    nc_path: Path,
+    var_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (vals[time,y,x], time_values, x_coord, y_coord)."""
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+    p = Path(nc_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Climate work copy missing: {p}")
+    with xr.open_dataset(os.fspath(p), decode_times=True, engine="netcdf4") as ds:
+        if var_name not in ds:
+            candidates = [
+                n
+                for n, da in ds.data_vars.items()
+                if getattr(da, "ndim", 0) >= 3 and n != "spatial_ref"
+            ]
+            raise ValueError(
+                f"{p} has no variable {var_name!r}. 3D vars: {candidates}"
+            )
+        da = ds[var_name].squeeze()
+        if da.ndim != 3:
+            raise ValueError(f"Expected 3D {var_name}, got shape {da.shape}")
+        if "time" not in da.dims:
+            raise ValueError(f"{var_name} dims {da.dims}: expected 'time'")
+        dim_names = list(da.dims)
+        if dim_names[0] != "time":
+            da = da.transpose("time", *[d for d in dim_names if d != "time"])
+        vals = np.asarray(da.values, dtype=np.float32)
+        time_values = np.asarray(ds["time"].values)
+        x_da = ds["x"] if "x" in ds.coords else ds["longitude"]
+        y_da = ds["y"] if "y" in ds.coords else ds["latitude"]
+        x_coord = np.asarray(x_da.values, dtype=np.float64)
+        y_coord = np.asarray(y_da.values, dtype=np.float64)
+    return vals, time_values, x_coord, y_coord
+
+
+# Process-local cache: Windows spawn workers reload each cube once, not per municipality.
+_CLIMATE_CUBE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+
+
+def load_climate_xyz_cached(
+    nc_path: Path,
+    var_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    key = (os.fspath(nc_path), var_name)
+    hit = _CLIMATE_CUBE_CACHE.get(key)
+    if hit is None:
+        hit = _load_climate_xyz(nc_path, var_name)
+        _CLIMATE_CUBE_CACHE[key] = hit
+    return hit
+
+
+def preload_climate_cubes(pairs: list[tuple[str, str]]) -> None:
+    """Load NetCDF cubes into this process (call from a ProcessPool initializer)."""
+    for path, var_name in pairs:
+        if path and var_name:
+            load_climate_xyz_cached(Path(path), var_name)
+
+
+def write_climate_mmap_pack(pairs: list[tuple[str, str]], pack_dir: Path) -> Path:
+    """Dump climate cubes to .npy so workers mmap them (avoids HDF5 lock contention)."""
+    pack_dir = Path(pack_dir)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict[str, str]] = []
+    for i, (path, var_name) in enumerate(pairs):
+        if not path or not var_name:
+            continue
+        vals, time_values, x_coord, y_coord = load_climate_xyz_cached(Path(path), var_name)
+        prefix = f"{i}_{var_name}"
+        np.save(pack_dir / f"{prefix}_vals.npy", np.asarray(vals))
+        np.save(pack_dir / f"{prefix}_time.npy", np.asarray(time_values))
+        np.save(pack_dir / f"{prefix}_x.npy", np.asarray(x_coord))
+        np.save(pack_dir / f"{prefix}_y.npy", np.asarray(y_coord))
+        manifest.append({"path": os.fspath(path), "var": var_name, "prefix": prefix})
+    (pack_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return pack_dir
+
+
+def load_climate_mmap_pack(pack_dir: Path | str) -> None:
+    pack_dir = Path(pack_dir)
+    manifest = json.loads((pack_dir / "manifest.json").read_text(encoding="utf-8"))
+    for item in manifest:
+        prefix = item["prefix"]
+        _CLIMATE_CUBE_CACHE[(item["path"], item["var"])] = (
+            np.load(pack_dir / f"{prefix}_vals.npy", mmap_mode="r"),
+            np.load(pack_dir / f"{prefix}_time.npy", mmap_mode="r"),
+            np.load(pack_dir / f"{prefix}_x.npy", mmap_mode="r"),
+            np.load(pack_dir / f"{prefix}_y.npy", mmap_mode="r"),
+        )
+
+
+def compute_cumulative_block_for_municipality(
+    nc_path: Path,
+    var_name: str,
+    year_range: str,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    transform,
+    src_crs,
+    obs_dates: list[date],
+    lon: np.ndarray | None = None,
+    lat: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Build [N, T] cumulative sum from Oct 1 through each S2 date (same window as rain).
+    NaN days are skipped (not propagated). Missing cells stay NaN.
+    """
+    n = len(rows)
+    t = len(obs_dates)
+    out = np.full((n, t), np.nan, dtype=np.float32)
+    if n == 0 or t == 0:
+        return out
+
+    window_start, window_end = climate_window_dates(year_range)
+    oct1 = window_start
+    vals, time_values, x_coord, y_coord = load_climate_xyz_cached(nc_path, var_name)
+    if lon is None or lat is None:
+        lon, lat = pixel_centroids_lonlat(rows, cols, transform, src_crs)
+
+    cell_to_indices: dict[tuple[int, int], list[int]] = {}
+    for i in range(n):
+        try:
+            ix, iy = lonlat_to_pr_indices(
+                float(lon[i]), float(lat[i]), x_coord, y_coord
+            )
+        except Exception:
+            continue
+        cell_to_indices.setdefault((ix, iy), []).append(i)
+
+    ny, nx = int(vals.shape[1]), int(vals.shape[2])
+    for (ix, iy), idx_list in cell_to_indices.items():
+        if iy < 0 or iy >= ny or ix < 0 or ix >= nx:
+            continue
+        try:
+            by_date = build_pr_lookup_for_cell(
+                vals, time_values, ix, iy, window_start, window_end
+            )
+            cum = np.array(
+                [
+                    _cumulative_to_date(by_date, oct1, obs_dates[k])
+                    for k in range(t)
+                ],
+                dtype=np.float32,
+            )
+            for i in idx_list:
+                out[i, :] = cum
+        except Exception:
+            continue
+    return out
+
+
 def compute_rain_block_for_municipality(
     nc_path: Path,
     year_range: str,
@@ -247,6 +397,8 @@ def compute_rain_block_for_municipality(
     transform,
     src_crs,
     obs_dates: list[date],
+    lon: np.ndarray | None = None,
+    lat: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Build [N, T, 2] rain features aligned to final .npy pixel order.
@@ -265,32 +417,9 @@ def compute_rain_block_for_municipality(
     window_start, window_end = climate_window_dates(year_range)
     oct1 = window_start
 
-    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
-    p = Path(nc_path)
-    if not p.is_file():
-        raise FileNotFoundError(f"Xavier work copy missing: {p}")
-
-    with xr.open_dataset(
-        os.fspath(p), decode_times=True, engine="netcdf4"
-    ) as ds:
-        pr = ds["pr"]
-        if pr.ndim != 3:
-            raise ValueError(f"Expected 3D pr, got shape {pr.shape}")
-        da = pr.squeeze()
-        if "time" not in da.dims:
-            raise ValueError(f"pr dims {da.dims}: expected a 'time' dimension")
-        dim_names = list(da.dims)
-        if dim_names[0] != "time":
-            da = da.transpose("time", *[d for d in dim_names if d != "time"])
-        pr_vals = np.asarray(da.values, dtype=np.float32)
-        time_values = np.asarray(ds["time"].values)
-
-        x_da = ds["x"] if "x" in ds.coords else ds["longitude"]
-        y_da = ds["y"] if "y" in ds.coords else ds["latitude"]
-        x_coord = np.asarray(x_da.values, dtype=np.float64)
-        y_coord = np.asarray(y_da.values, dtype=np.float64)
-
-    lon, lat = pixel_centroids_lonlat(rows, cols, transform, src_crs)
+    pr_vals, time_values, x_coord, y_coord = load_climate_xyz_cached(nc_path, "pr")
+    if lon is None or lat is None:
+        lon, lat = pixel_centroids_lonlat(rows, cols, transform, src_crs)
 
     # Unique cells -> compute once
     cell_to_indices: dict[tuple[int, int], list[int]] = {}

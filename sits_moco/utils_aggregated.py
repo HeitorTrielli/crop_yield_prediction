@@ -281,6 +281,8 @@ _MODEL_KWARG_FIELDS = (
     ("model_n_layers", "n_layers", int),
     ("model_d_inner", "d_inner", int),
     ("model_dropout", "dropout", float),
+    ("temporal_pooling", "temporal_pooling", str),
+    ("attn_pool_queries", "attn_pool_queries", int),
 )
 
 
@@ -305,6 +307,9 @@ def resolve_model_kwargs(
             "n_layers": int(mk["n_layers"]),
             "d_inner": int(mk["d_inner"]),
             "dropout": float(mk["dropout"]),
+            # absent in configs from before learned attention pooling existed
+            "temporal_pooling": str(mk.get("temporal_pooling", "ndvi")),
+            "attn_pool_queries": int(mk.get("attn_pool_queries", 4)),
         }
 
     kwargs: dict = {}
@@ -319,18 +324,23 @@ def resolve_inference_chunk_size(
     chunk_size: int | None = None,
 ) -> int:
     """
-    Chunk size for forward-only inference.
+    Pixels per GPU forward pass during inference.
 
-    Training VRAM is shaped by ``pixel_chunk_size * chunks_per_grad``; without
-    gradients we can use that full width (or any larger ``--chunk-size``).
+    Defaults to training ``pixel_chunk_size`` (one training micro-batch), **not**
+    ``pixel_chunk_size * chunks_per_grad`` (that product is the gradient
+    accumulation budget and can exhaust VRAM during results generation).
     """
     if chunk_size is not None:
         return int(chunk_size)
+    computed = (run_config or {}).get("computed") or {}
     cli = (run_config or {}).get("cli") or {}
+    chunk_pipeline = computed.get("chunk_pipeline") or {}
+    px_eff = chunk_pipeline.get("pixel_chunk_size_effective")
+    if px_eff is not None:
+        return int(px_eff)
     px = cli.get("pixel_chunk_size")
     if px is not None:
-        cpg = max(int(cli.get("chunks_per_grad") or 1), 1)
-        return int(px) * cpg
+        return int(px)
     return 400
 
 
