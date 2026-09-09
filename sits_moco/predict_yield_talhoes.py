@@ -25,7 +25,6 @@ Only pixels inside talhão polygons are sent through the model. Valid-pixel alig
 from __future__ import annotations
 
 import argparse
-import importlib.util
 from datetime import date
 from pathlib import Path
 
@@ -39,6 +38,10 @@ from rasterio.warp import Resampling, reproject
 from torch.amp import autocast
 from tqdm import tqdm
 
+from datasets.feature_layout import (
+    feature_layout_input_dim,
+    normalize_feature_layout,
+)
 from datasets.pixel_transform import PixelTransform
 from models import STNetRegression
 from run_paths import (
@@ -63,25 +66,6 @@ def recursive_todevice(x, device):
         return x.to(device)
     return [recursive_todevice(c, device) for c in x]
 
-
-def _load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_REPO = Path(__file__).resolve().parent
-_feature_layout = _load_module(
-    "feature_layout", _REPO / "datasets" / "feature_layout.py"
-)
-_datautils = _load_module("datautils", _REPO / "datasets" / "datautils.py")
-feature_layout_choices = _feature_layout.feature_layout_choices
-feature_layout_input_dim = _feature_layout.feature_layout_input_dim
-normalize_feature_layout = _feature_layout.normalize_feature_layout
-getWeight = _datautils.getWeight
 
 NO_DATA_VALUE = -9999
 NUM_SPECTRAL_BANDS = 10
@@ -718,6 +702,7 @@ def run_talhao_predictions(
     aggregation: str | None = None,
     run_config: dict | None = None,
     verbose: bool = True,
+    legacy_input_scaling: bool = False,
 ) -> pd.DataFrame:
     """
     Predict yield per talhão for one harvest season and optionally write a CSV.
@@ -808,6 +793,7 @@ def run_talhao_predictions(
         randomchoice=rc,
         interp=interp,
         seed=seed,
+        legacy_input_scaling=legacy_input_scaling,
     )
 
     results: list[dict] = []

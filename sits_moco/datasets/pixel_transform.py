@@ -26,8 +26,8 @@ NUM_SPECTRAL_CHANNELS = 10
 NO_DATA_VALUE = -9999
 
 
-# Legacy hardcoded S2 stats (pre-train-split scaler). PixelTransform reads
-# mean/std from files/train_input_scaler.json once the scaler is loaded.
+# Legacy hardcoded S2 stats (pre-train-split scaler / commit 05a1ea2).
+# Default path loads mean/std from files/train_input_scaler.json once the scaler is loaded.
 SPECTRAL_MEAN = np.array(
     [[0.147, 0.169, 0.186, 0.221, 0.273, 0.297, 0.308, 0.316, 0.256, 0.188]],
     dtype=np.float32,
@@ -36,6 +36,37 @@ SPECTRAL_STD = np.array(
     [0.227, 0.219, 0.222, 0.22, 0.2, 0.193, 0.192, 0.182, 0.123, 0.106],
     dtype=np.float32,
 )
+
+
+def scale_xavier_rain_channels_legacy(rain: np.ndarray) -> np.ndarray:
+    """Hardcoded rain/dry divisors from pre-JSON-scaler training (05a1ea2)."""
+    out = np.asarray(rain, dtype=np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
+    out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
+    return out.astype(np.float32)
+
+
+def scale_xavier_climate_extras_legacy(extra: np.ndarray) -> np.ndarray:
+    """
+    Hardcoded rain+climate divisors from pre-JSON-scaler training (05a1ea2).
+
+    Channels: rain, dry streak, cum ETo, Rs, Tmax, Tmin.
+    """
+    out = np.asarray(extra, dtype=np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if out.shape[-1] < 6:
+        raise ValueError(
+            f"Expected at least 6 Xavier climate extras (rain+ETo/Rs/T), got {out.shape[-1]}"
+        )
+    out[..., 0] = np.clip(out[..., 0] / 2500.0, 0.0, 4.0)
+    out[..., 1] = np.clip(out[..., 1] / 60.0, 0.0, 2.0)
+    out[..., 2] = np.clip(out[..., 2] / 1500.0, 0.0, 4.0)  # cum ETo (mm)
+    out[..., 3] = np.clip(out[..., 3] / 5000.0, 0.0, 4.0)  # cum Rs (MJ/m^2)
+    out[..., 4] = np.clip(out[..., 4] / 5000.0, 0.0, 4.0)  # cum Tmax (°C·day)
+    out[..., 5] = np.clip(out[..., 5] / 5000.0, -1.0, 4.0)  # cum Tmin (°C·day)
+    return out.astype(np.float32)
+
 
 PixelTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 BatchChunk = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -54,6 +85,7 @@ class PixelTransform:
         seed: int = 27,
         extra_scaler: InputScaler | None = None,
         extra_scaler_path: str | Path | None = None,
+        legacy_input_scaling: bool = False,
     ):
         self.sequencelength = int(sequencelength)
         self.feature_layout = normalize_feature_layout(feature_layout)
@@ -64,6 +96,7 @@ class PixelTransform:
         self.rc = bool(randomchoice)
         self.interp = bool(interp)
         self.getWeight_batch = getWeight_batch
+        self.legacy_input_scaling = bool(legacy_input_scaling)
         self.mean = SPECTRAL_MEAN
         self.std = SPECTRAL_STD
         self._extra_scaler = extra_scaler
@@ -72,7 +105,14 @@ class PixelTransform:
             if extra_scaler_path is not None
             else DEFAULT_INPUT_SCALER_PATH
         )
-        if extra_scaler is not None:
+        if self.legacy_input_scaling:
+            if self._recipe is not None:
+                raise ValueError(
+                    "legacy_input_scaling only supports slice layouts "
+                    "(spectral / spectral_xavier / spectral_xavier_climate), not recipes"
+                )
+            self._extra_scaler = None
+        elif extra_scaler is not None:
             self._apply_spectral_stats(extra_scaler)
 
     def _apply_spectral_stats(self, scaler: InputScaler) -> None:
@@ -80,6 +120,8 @@ class PixelTransform:
         self.std = scaler.spectral_std
 
     def set_extra_scaler(self, scaler: InputScaler | None) -> None:
+        if self.legacy_input_scaling:
+            return
         self._extra_scaler = scaler
         if scaler is not None:
             self._apply_spectral_stats(scaler)
@@ -87,6 +129,10 @@ class PixelTransform:
                 self.extra_scaler_path = scaler.path
 
     def extra_scaler(self) -> InputScaler:
+        if self.legacy_input_scaling:
+            raise RuntimeError(
+                "legacy_input_scaling is on: train_input_scaler.json is not used"
+            )
         if self._extra_scaler is None:
             self._extra_scaler = InputScaler.require_load(self.extra_scaler_path)
             self._apply_spectral_stats(self._extra_scaler)
@@ -104,8 +150,12 @@ class PixelTransform:
         invalid = (x_spec == NO_DATA_VALUE) | ~np.isfinite(x_spec)
         x_spec = np.where(invalid, 0.0, x_spec) * 1e-4
         weight = self.getWeight_batch(x_spec)
-        scaler = self.extra_scaler()
-        x_spec_n = scaler.transform_spectral(x_spec)
+        if self.legacy_input_scaling:
+            x_spec_n = ((x_spec - self.mean) / self.std).astype(np.float32)
+            scaler = None
+        else:
+            scaler = self.extra_scaler()
+            x_spec_n = scaler.transform_spectral(x_spec)
         if self._recipe is not None:
             extras = extras_from_chunk(chunk_arr)
             recipe_scaler = (
@@ -137,9 +187,15 @@ class PixelTransform:
                     (extra == NO_DATA_VALUE) | ~np.isfinite(extra), 0.0, extra
                 )
                 if (lo, hi) == (11, 13):
-                    extra = scale_xavier_rain_channels(extra, scaler=scaler)
+                    if self.legacy_input_scaling:
+                        extra = scale_xavier_rain_channels_legacy(extra)
+                    else:
+                        extra = scale_xavier_rain_channels(extra, scaler=scaler)
                 elif (lo, hi) == (11, 17):
-                    extra = scale_xavier_climate_extras(extra, scaler=scaler)
+                    if self.legacy_input_scaling:
+                        extra = scale_xavier_climate_extras_legacy(extra)
+                    else:
+                        extra = scale_xavier_climate_extras(extra, scaler=scaler)
                 else:
                     extra = np.nan_to_num(extra, nan=0.0, posinf=0.0, neginf=0.0)
             else:

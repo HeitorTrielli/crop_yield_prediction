@@ -27,8 +27,12 @@ from datasets.feature_layout import (
 )
 from datasets.pixel_transform import (
     DOY_CHANNEL,
+    SPECTRAL_MEAN,
+    SPECTRAL_STD,
     scale_xavier_climate_extras,
+    scale_xavier_climate_extras_legacy,
     scale_xavier_rain_channels,
+    scale_xavier_rain_channels_legacy,
 )
 from datasets.extra_scaler import InputScaler
 from datasets.uscrops_aggregated_npy_polars import (
@@ -486,6 +490,7 @@ def transform_pixel(
     seed=None,
     input_dim: int = 10,
     deterministic_head=False,
+    legacy_input_scaling: bool = False,
 ):
     """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY.
     If deterministic_head is True and x has more than sequencelength rows, keeps the earliest sequencelength rows.
@@ -500,21 +505,30 @@ def transform_pixel(
     doy = raw[:, doy_col].astype(np.int32)
     x_spec = raw[:, :10] * 1e-4
 
-    scaler = InputScaler.require_load()
-    mean = scaler.spectral_mean_row
-    std = scaler.spectral_std
+    if legacy_input_scaling:
+        mean = SPECTRAL_MEAN
+        std = SPECTRAL_STD
+        x_spec_n = ((x_spec - mean) / std).astype(np.float32)
+        scale_rain = scale_xavier_rain_channels_legacy
+        scale_clim = scale_xavier_climate_extras_legacy
+    else:
+        scaler = InputScaler.require_load()
+        mean = scaler.spectral_mean_row
+        std = scaler.spectral_std
+        x_spec_n = scaler.transform_spectral(x_spec)
+        scale_rain = scale_xavier_rain_channels
+        scale_clim = scale_xavier_climate_extras
 
     weight = getWeight(x_spec)
-    x_spec_n = scaler.transform_spectral(x_spec)
     if input_dim == 16:
         if c_in >= 17:
-            extra = scale_xavier_climate_extras(raw[:, 11:17])
+            extra = scale_clim(raw[:, 11:17])
         else:
             extra = np.zeros((t_len, 6), dtype=np.float32)
         x = np.concatenate([x_spec_n, extra], axis=-1)
     elif input_dim == 12:
         if c_in >= 13:
-            rain = scale_xavier_rain_channels(raw[:, 11:13])
+            rain = scale_rain(raw[:, 11:13])
         else:
             rain = np.zeros((t_len, 2), dtype=np.float32)
         x = np.concatenate([x_spec_n, rain], axis=-1)
@@ -779,6 +793,7 @@ def reconstruct_spatial_predictions(
     head_output: str = "raw",
     target_mean=None,
     target_std=None,
+    legacy_input_scaling: bool = False,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
@@ -904,6 +919,7 @@ def reconstruct_spatial_predictions(
                         seed=seed,
                         input_dim=input_dim,
                         deterministic_head=True,
+                        legacy_input_scaling=legacy_input_scaling,
                     )
                     current_chunk.append(X_tuple)
                     chunk_indices.append(("grid", row, col))

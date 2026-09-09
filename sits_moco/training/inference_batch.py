@@ -9,6 +9,7 @@ import torch
 from datasets.pixel_chunk import prepare_chunk_on_device
 from training.accumulator import MunicipalityPixelAccumulator
 from training.pipeline import (
+    iter_inference_multiperiod_batch_chunks,
     iter_inference_period_batch_chunks,
     iter_training_batch_chunks,
     pipeline_h2d,
@@ -205,6 +206,112 @@ def run_period_inference_batch(
         )
         if value is not None:
             out[entry] = value
+    return out
+
+
+def run_multiperiod_inference_batch(
+    *,
+    model,
+    dataset,
+    entries: list[tuple[str, int]],
+    device: torch.device,
+    args,
+    chunk_size: int,
+    period_list: list[int] | tuple[int, ...],
+    reference_date: date,
+    aggregation: str,
+    head_output: str = HEAD_OUTPUT_RAW,
+    target_mean=None,
+    target_std=None,
+) -> dict[int, dict[tuple[str, int], float]]:
+    """
+    Forward a batch once for every incomplete-series k in ``period_list``.
+
+    Each municipality .npy is mmap'd and DOY-sorted once; prefixes yield k=1..K.
+    """
+    periods = sorted({int(k) for k in period_list if int(k) >= 1})
+    if not periods:
+        return {}
+
+    municipalities = [code for code, _year in entries]
+    years = [year for _code, year in entries]
+    num_pixels_list = [
+        _entry_pixel_count(dataset, code, year) for code, year in entries
+    ]
+
+    # Megapixel fast-path still goes one k at a time (tiny payload).
+    if max(num_pixels_list, default=0) <= 1:
+        out: dict[int, dict[tuple[str, int], float]] = {}
+        for k in periods:
+            out[k] = run_period_inference_batch(
+                model=model,
+                dataset=dataset,
+                entries=entries,
+                device=device,
+                args=args,
+                chunk_size=chunk_size,
+                num_periods=k,
+                reference_date=reference_date,
+                aggregation=aggregation,
+                head_output=head_output,
+                target_mean=target_mean,
+                target_std=target_std,
+            )
+        return out
+
+    from torch.amp import autocast
+
+    pool = pixel_pool_for_head(aggregation, head_output)
+    accumulators: dict[int, dict[int, MunicipalityPixelAccumulator]] = {
+        k: {
+            muni_idx: MunicipalityPixelAccumulator(pool)
+            for muni_idx in range(len(entries))
+        }
+        for k in periods
+    }
+    use_pipeline_h2d = pipeline_h2d(args, device)
+
+    chunk_stream = iter_inference_multiperiod_batch_chunks(
+        dataset,
+        municipalities,
+        years,
+        num_pixels_list,
+        chunk_size,
+        args,
+        device,
+        period_list=periods,
+        reference_date=reference_date,
+    )
+
+    model.eval()
+    with torch.no_grad():
+        for muni_idx, num_periods, chunk_item in chunk_stream:
+            if use_pipeline_h2d:
+                municipality_X_chunk = chunk_item
+            else:
+                municipality_X_chunk = prepare_chunk_on_device(chunk_item, device)
+
+            with (
+                autocast("cuda", dtype=torch.bfloat16)
+                if device.type == "cuda"
+                else torch.no_grad()
+            ):
+                chunk_predictions = model(municipality_X_chunk)
+            accumulators[int(num_periods)][muni_idx].add(chunk_predictions)
+
+    out = {}
+    for k in periods:
+        preds: dict[tuple[str, int], float] = {}
+        for muni_idx, entry in enumerate(entries):
+            value = _finalize_accumulator(
+                accumulators[k][muni_idx],
+                head_output=head_output,
+                target_mean=target_mean,
+                target_std=target_std,
+            )
+            if value is not None:
+                preds[entry] = value
+        out[k] = preds
     return out
 
 
