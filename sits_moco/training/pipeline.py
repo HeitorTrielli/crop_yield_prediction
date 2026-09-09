@@ -206,6 +206,44 @@ def iter_inference_period_batch_chunks(
     )
 
 
+def iter_inference_multiperiod_batch_chunks(
+    dataset,
+    municipalities,
+    years,
+    num_pixels_list,
+    chunk_size: int,
+    args,
+    device: torch.device,
+    *,
+    period_list: list[int] | tuple[int, ...],
+    reference_date,
+    skip_muni_indices: set[int] | None = None,
+):
+    """Yield ``(muni_idx, num_periods, chunk)`` with one sort per pixel block for all k."""
+    from training_runtime import h2d_pin_host
+
+    skip = skip_muni_indices or set()
+    use_pipeline = pipeline_h2d(args, device)
+    mmap_lookahead = bool(getattr(args, "mmap_lookahead", True))
+    from datasets.pixel_chunk import iter_batch_municipality_multiperiod_chunks
+
+    yield from iter_batch_municipality_multiperiod_chunks(
+        dataset,
+        municipalities,
+        years,
+        num_pixels_list,
+        chunk_size=chunk_size,
+        period_list=period_list,
+        reference_date=reference_date,
+        prefetch_depth=prefetch_depth(args),
+        device=device,
+        pipeline_h2d=use_pipeline,
+        pin_host=h2d_pin_host(args),
+        skip_muni_indices=skip,
+        mmap_lookahead=mmap_lookahead,
+    )
+
+
 def iter_sorted_season_inference_chunks(
     dataset,
     municipalities,

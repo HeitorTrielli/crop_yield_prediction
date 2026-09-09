@@ -43,7 +43,7 @@ from datasets import (
 )
 from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
 from evaluate_incomplete_series import (
-    batched_predict_with_periods,
+    batched_predict_all_periods,
     inference_args_from_run_config,
     inference_batch_size_from_run_config,
 )
@@ -106,6 +106,7 @@ class ModelContext:
     head_output: str
     target_mean: float | None
     target_std: float | None
+    legacy_input_scaling: bool = False
 
 
 @dataclass
@@ -133,6 +134,7 @@ def load_model_context(
     reference_date: date | str | None = None,
     rc: bool | None = None,
     interp: bool | None = None,
+    legacy_input_scaling: bool = False,
 ) -> ModelContext:
     """Load checkpoint, run config, and STNet model once for reuse across pipeline steps."""
     checkpoint = resolve_checkpoint_path(checkpoint)
@@ -233,6 +235,7 @@ def load_model_context(
         head_output=head_output,
         target_mean=target_mean,
         target_std=target_std,
+        legacy_input_scaling=bool(legacy_input_scaling),
     )
 
 
@@ -371,6 +374,7 @@ def _build_dataset(
         npy_cache_size=128,
         min_coverage_ratio=min_coverage_ratio,
         max_coverage_ratio=max_coverage_ratio,
+        legacy_input_scaling=ctx.legacy_input_scaling,
     )
 
 
@@ -466,27 +470,34 @@ def run_incomplete_series_evaluation(
         year: {} for year in harvest_years
     }
 
+    print(f"\n{'=' * 60}")
+    print(f"Incomplete series: k={NUM_PERIODS_LIST} (single mmap/sort pass)")
+    print(f"{'=' * 60}")
+
+    predictions_by_k, failed_by_k = batched_predict_all_periods(
+        ctx.model,
+        municipality_list,
+        dataset,
+        NUM_PERIODS_LIST,
+        ctx.chunk_size,
+        ctx.device,
+        reference_date=ctx.reference_date,
+        args=inference_args,
+        batch_size=inference_batch_size,
+        desc="Predicting (k=1..6)",
+        aggregation=ctx.aggregation,
+        head_output=ctx.head_output,
+        target_mean=ctx.target_mean,
+        target_std=ctx.target_std,
+    )
+
     for num_periods in NUM_PERIODS_LIST:
+        predictions = predictions_by_k.get(num_periods, {})
+        failed_entries = failed_by_k.get(num_periods, [])
+
         print(f"\n{'=' * 60}")
         print(f"Incomplete series: {num_periods} season month(s)")
         print(f"{'=' * 60}")
-
-        predictions, failed_entries = batched_predict_with_periods(
-            ctx.model,
-            municipality_list,
-            dataset,
-            num_periods,
-            ctx.chunk_size,
-            ctx.device,
-            reference_date=ctx.reference_date,
-            args=inference_args,
-            batch_size=inference_batch_size,
-            desc=f"Predicting (k={num_periods})",
-            aggregation=ctx.aggregation,
-            head_output=ctx.head_output,
-            target_mean=ctx.target_mean,
-            target_std=ctx.target_std,
-        )
 
         y_pred = []
         y_true = []
@@ -633,6 +644,7 @@ def run_guarapuava_heatmaps(
             head_output=ctx.head_output,
             target_mean=ctx.target_mean,
             target_std=ctx.target_std,
+            legacy_input_scaling=ctx.legacy_input_scaling,
         )
         if bundle[0] is None:
             print(f"  Skipped {label}: inference failed")
@@ -738,6 +750,7 @@ def run_talhao_evaluations(
             model=ctx.model,
             aggregation=ctx.aggregation,
             run_config=ctx.run_config,
+            legacy_input_scaling=ctx.legacy_input_scaling,
         )
         outputs[harvest_year] = output_csv
     return outputs
@@ -855,6 +868,7 @@ def generate_results(
     verbose: bool = True,
     min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
     max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+    legacy_input_scaling: bool = False,
 ) -> GenerateResultsOutput:
     """
     Load one checkpoint and produce all post-training result artifacts.
@@ -881,6 +895,7 @@ def generate_results(
         reference_date=reference_date,
         rc=rc,
         interp=interp,
+        legacy_input_scaling=legacy_input_scaling,
     )
 
     years = resolve_harvest_years(ctx, harvest_years, yield_csv_path)
@@ -890,6 +905,11 @@ def generate_results(
         print(f"Run dir:    {ctx.run_dir}")
         print(f"Harvest years: {years}")
         print(f"Holdout year:  {holdout_year}")
+        if ctx.legacy_input_scaling:
+            print(
+                "Input scaling: legacy hardcoded SPECTRAL_MEAN/STD + Xavier divisors "
+                "(05a1ea2; no train_input_scaler.json)"
+            )
         print(f"Leave-out years: {leave_out_years}")
         print(f"Pixel chunk size: {ctx.chunk_size}")
 
@@ -1011,7 +1031,10 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=None,
-        help="Pixels per GPU forward pass (default: pixel_chunk_size * chunks_per_grad from training config)",
+        help=(
+            "Pixels per GPU forward pass (default: training pixel_chunk_size_effective, "
+            "e.g. 6600 — not pixel_chunk_size * chunks_per_grad)"
+        ),
     )
     p.add_argument("--reference-date", type=str, default=None)
     p.add_argument("--rc", action="store_true", default=None)
@@ -1041,6 +1064,14 @@ def parse_args() -> argparse.Namespace:
         "--no-coverage-filter",
         action="store_true",
         help="Do not filter yield CSV rows by coverage_ratio (default behavior)",
+    )
+    p.add_argument(
+        "--legacy-input-scaling",
+        action="store_true",
+        help=(
+            "Use pre-JSON-scaler input normalization (hardcoded SPECTRAL_MEAN/STD "
+            "+ Xavier divide/clip from commit 05a1ea2). Needed for trial_003-era checkpoints."
+        ),
     )
     return p.parse_args()
 
@@ -1075,6 +1106,7 @@ def main() -> None:
         map_dpi=args.map_dpi,
         min_coverage_ratio=min_cov,
         max_coverage_ratio=max_cov,
+        legacy_input_scaling=args.legacy_input_scaling,
     )
 
 

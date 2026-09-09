@@ -577,12 +577,14 @@ class USCropsAggregatedNPY(Dataset):
         train_mid_yield_bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
         holdout_year: Optional[int] = None,
         exclude_muni_years: str | None = None,
+        legacy_input_scaling: bool = False,
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
         mode = mode.lower()
         assert mode in ["train", "valid", "eval", "test", "all"]
 
+        self.legacy_input_scaling = bool(legacy_input_scaling)
         self.feature_layout = normalize_feature_layout(feature_layout)
         _lay = resolve_feature_layout(self.feature_layout)
         self.input_feature_dim = int(_lay["input_dim"])
@@ -987,7 +989,13 @@ class USCropsAggregatedNPY(Dataset):
             randomchoice=randomchoice,
             interp=interp,
             seed=seed,
+            legacy_input_scaling=self.legacy_input_scaling,
         )
+        if self.legacy_input_scaling:
+            print(
+                "Input scaling: legacy hardcoded SPECTRAL_MEAN/STD + Xavier divisors "
+                "(no train_input_scaler.json)"
+            )
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
         self.npy_cache = OrderedDict()
@@ -1250,6 +1258,62 @@ class USCropsAggregatedNPY(Dataset):
             end = min(start + chunk_size, num_pixels)
             yield self._transform_chunk(municipality_data[start:end])
 
+    def _pack_sorted_in_season_chunk(
+        self,
+        chunk_arr: np.ndarray,
+        reference_date: date,
+        *,
+        max_periods: int = 6,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        Sort in-season days by DOY (vectorized).
+
+        Season months are non-decreasing in DOY (Oct=1 … Mar=6), so the
+        incomplete-series cut for month ``k`` is a prefix of this packing.
+        Returns ``(gathered [N,T,C], season_sorted [N,T])`` or None if empty.
+        """
+        if chunk_arr.size == 0:
+            return None
+        if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
+            chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
+        season_lut = _season_month_lut(reference_date)
+        doy_i = np.clip(
+            chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
+            0,
+            season_lut.shape[0] - 1,
+        )
+        season_m = season_lut[doy_i]
+        in_season = (season_m >= 1) & (season_m <= int(max_periods))
+        if not np.any(in_season):
+            return None
+        # Push out-of-season timesteps to the end so a prefix is the filtered series.
+        sort_key = np.where(in_season, doy_i, np.iinfo(np.int64).max)
+        order = np.argsort(sort_key, axis=1, kind="stable")
+        gathered = np.take_along_axis(chunk_arr, order[:, :, None], axis=1)
+        season_sorted = np.take_along_axis(season_m, order, axis=1)
+        return gathered, season_sorted
+
+    def _yield_period_transforms_from_packed(
+        self,
+        gathered: np.ndarray,
+        season_sorted: np.ndarray,
+        num_periods: int,
+    ):
+        """Yield STNet batches for one k from a DOY-sorted in-season packing."""
+        k = int(num_periods)
+        counts = ((season_sorted >= 1) & (season_sorted <= k)).sum(axis=1)
+        # Keep earliest sequencelength days (matches incomplete-series docstring).
+        counts_eff = np.minimum(counts, int(self.sequencelength))
+        for length in np.unique(counts_eff):
+            length = int(length)
+            if length <= 0:
+                continue
+            idx = np.flatnonzero(counts_eff == length)
+            if idx.size == 0:
+                continue
+            stacked = np.ascontiguousarray(gathered[idx, :length])
+            yield self._transform_chunk(stacked)
+
     def iter_period_pixel_chunks_from_data(
         self,
         municipality_data,
@@ -1266,40 +1330,61 @@ class USCropsAggregatedNPY(Dataset):
         if municipality_data is None or len(municipality_data) == 0:
             return
 
-        season_lut = _season_month_lut(reference_date)
         num_pixels = len(municipality_data)
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
             chunk_view = municipality_data[start:end]
-            if chunk_view.dtype == np.float32:
-                chunk_arr = np.ascontiguousarray(chunk_view)
-            else:
-                chunk_arr = np.asarray(chunk_view, dtype=np.float32)
-            n_pixels = chunk_arr.shape[0]
-            doy_i = np.clip(
-                chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
-                0,
-                season_lut.shape[0] - 1,
+            packed = self._pack_sorted_in_season_chunk(
+                chunk_view, reference_date, max_periods=int(num_periods)
             )
-            season_m = season_lut[doy_i]
-            valid = (season_m >= 1) & (season_m <= num_periods)
-            filtered: list[np.ndarray | None] = [None] * n_pixels
-            for i in range(n_pixels):
-                idx = np.flatnonzero(valid[i])
-                if idx.size == 0:
-                    continue
-                sub = chunk_arr[i, idx, :]
-                order = np.argsort(sub[:, DOY_CHANNEL], kind="stable")
-                filtered[i] = sub[order]
-            by_len: dict[int, list[int]] = defaultdict(list)
-            for i, sub in enumerate(filtered):
-                if sub is not None:
-                    by_len[sub.shape[0]].append(i)
-            for indices in by_len.values():
-                stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
-                if stacked.shape[0] == 0:
-                    continue
-                yield self._transform_chunk(stacked)
+            if packed is None:
+                continue
+            gathered, season_sorted = packed
+            yield from self._yield_period_transforms_from_packed(
+                gathered, season_sorted, num_periods
+            )
+
+    def iter_multiperiod_pixel_chunks_from_data(
+        self,
+        municipality_data,
+        *,
+        period_list: list[int] | tuple[int, ...],
+        chunk_size: int,
+        reference_date: date,
+        cache_key=None,
+    ):
+        """
+        Yield ``(num_periods, STNet_chunk)`` for every k in ``period_list``.
+
+        Reads / sorts each pixel block once (full 6-month window), then takes
+        DOY-sorted prefixes for each k. Avoids the old 6× remmap + per-pixel loop.
+        """
+        periods = sorted({int(k) for k in period_list if int(k) >= 1})
+        if not periods:
+            return
+        municipality_data = self.filter_municipality_data(
+            municipality_data, cache_key=cache_key
+        )
+        if municipality_data is None or len(municipality_data) == 0:
+            return
+
+        max_periods = max(periods)
+        num_pixels = len(municipality_data)
+        for start in range(0, num_pixels, chunk_size):
+            end = min(start + chunk_size, num_pixels)
+            packed = self._pack_sorted_in_season_chunk(
+                municipality_data[start:end],
+                reference_date,
+                max_periods=max_periods,
+            )
+            if packed is None:
+                continue
+            gathered, season_sorted = packed
+            for num_periods in periods:
+                for pixel_chunk in self._yield_period_transforms_from_packed(
+                    gathered, season_sorted, num_periods
+                ):
+                    yield int(num_periods), pixel_chunk
 
     def load_pixels_from_municipality_with_periods(
         self, municipality_code, year, num_periods, chunk_size=400, reference_date=None
