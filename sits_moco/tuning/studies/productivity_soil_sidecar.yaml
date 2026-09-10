@@ -1,0 +1,142 @@
+# Architecture + LR sweep for MapBiomas Solo sidecars
+# (feature_layout spectral_xavier_climate_soil → STNet input_dim=20).
+#
+# Early fusion grid (soil through MLP+transformer):
+#   3 d_model × 2 n_head × 2 d_inner × 2 dropout × 2 LR = 48 trials
+# plus 8 late-fusion extras (soil after temporal pooling → decoder only).
+# Total: 56 trials.
+#
+# Requires {code}_soil.npy under SITS_MOCO_DATAPATH (pixel or muni_mean).
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_soil_sidecar.yaml --list-trials
+#
+# Run (fresh after the 1-trial smoke):
+#   python run_tuning_study.py run tuning/studies/productivity_soil_sidecar.yaml --rerun-all
+#
+# Resume:
+#   python run_tuning_study.py run tuning/studies/productivity_soil_sidecar.yaml --skip-completed
+
+name: productivity_soil_sidecar
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral_xavier_climate_soil
+  soil_fusion: early
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 100
+  workers: 5
+  sequencelength: 45
+  batchsize: 40
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [20, 75]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 15
+  prefetch_chunks: 6
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
+  quiet_training: true
+  refit_extra_scaler: true
+  suffix_prefix: soil
+  model_n_layers: 1
+
+search:
+  strategy: grid
+
+  parameters:
+    model_d_model:
+      type: choice
+      values: [64, 96, 128]
+
+    model_n_head:
+      type: choice
+      values: [4, 8]
+
+    model_d_inner:
+      type: choice
+      values: [64, 128]
+
+    model_dropout:
+      type: choice
+      values: [0.3, 0.4]
+
+    learning_rate:
+      type: choice
+      values: [1.0e-4, 5.0e-4]
+
+  # Late soil fusion ablation (appended after the early grid → trials 049–056).
+  # Corners of the arch grid × both LRs; dropout fixed at 0.3.
+  extra_trials:
+    - soil_fusion: late
+      model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.3
+      learning_rate: 1.0e-4
+
+    - soil_fusion: late
+      model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.3
+      learning_rate: 5.0e-4
+
+    - soil_fusion: late
+      model_d_model: 96
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 1.0e-4
+
+    - soil_fusion: late
+      model_d_model: 96
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 5.0e-4
+
+    - soil_fusion: late
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 1.0e-4
+
+    - soil_fusion: late
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 5.0e-4
+
+    - soil_fusion: late
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 5.0e-4
+
+    - soil_fusion: late
+      model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 64
+      model_dropout: 0.4
+      learning_rate: 5.0e-4

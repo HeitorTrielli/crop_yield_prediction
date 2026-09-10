@@ -15,6 +15,8 @@ from .datautils import getWeight_batch
 from .extra_scaler import (
     DEFAULT_INPUT_SCALER_PATH,
     InputScaler,
+    scale_soil_channels,
+    scale_soil_channels_legacy,
     scale_xavier_climate_extras,
     scale_xavier_rain_channels,
 )
@@ -24,6 +26,7 @@ from .feature_recipes import assemble_recipe, extras_from_chunk
 DOY_CHANNEL = 10
 NUM_SPECTRAL_CHANNELS = 10
 NO_DATA_VALUE = -9999
+N_SOIL = 4
 
 
 # Legacy hardcoded S2 stats (pre-train-split scaler / commit 05a1ea2).
@@ -92,6 +95,7 @@ class PixelTransform:
         lay = resolve_feature_layout(self.feature_layout)
         self.input_feature_dim = int(lay["input_dim"])
         self._extra_channels_slice: tuple[int, int] | None = lay["extra_channels_slice"]
+        self._soil_sidecar = bool(lay.get("soil_sidecar"))
         self._recipe = lay.get("recipe")
         self.rc = bool(randomchoice)
         self.interp = bool(interp)
@@ -109,7 +113,8 @@ class PixelTransform:
             if self._recipe is not None:
                 raise ValueError(
                     "legacy_input_scaling only supports slice layouts "
-                    "(spectral / spectral_xavier / spectral_xavier_climate), not recipes"
+                    "(spectral / spectral_xavier / spectral_xavier_climate / "
+                    "spectral_xavier_climate_soil), not recipes"
                 )
             self._extra_scaler = None
         elif extra_scaler is not None:
@@ -139,7 +144,9 @@ class PixelTransform:
         return self._extra_scaler
 
     def features_from_chunk(
-        self, chunk_arr: np.ndarray
+        self,
+        chunk_arr: np.ndarray,
+        soil: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Normalized features (N,T,F), reflectance weights (N,T), DOY (N,T)."""
         _n, _t, c = chunk_arr.shape
@@ -157,6 +164,11 @@ class PixelTransform:
             scaler = self.extra_scaler()
             x_spec_n = scaler.transform_spectral(x_spec)
         if self._recipe is not None:
+            if self._soil_sidecar:
+                raise ValueError(
+                    f"Layout {self.feature_layout!r} uses soil_sidecar with a recipe; "
+                    "soil is not supported for mp_* recipes."
+                )
             extras = extras_from_chunk(chunk_arr)
             recipe_scaler = (
                 scaler
@@ -203,14 +215,50 @@ class PixelTransform:
             x = np.concatenate([x_spec_n, extra], axis=-1)
         else:
             x = x_spec_n
+
+        if self._soil_sidecar:
+            if soil is None:
+                raise ValueError(
+                    f"Layout {self.feature_layout!r} requires a soil sidecar "
+                    f"[N,{N_SOIL}] passed to features_from_chunk/transform_chunk"
+                )
+            soil_arr = np.asarray(soil, dtype=np.float32)
+            if soil_arr.ndim != 2 or soil_arr.shape[0] != _n:
+                raise ValueError(
+                    f"soil must be [N,{N_SOIL}] with N={_n}, got shape {soil_arr.shape}"
+                )
+            if soil_arr.shape[1] < N_SOIL:
+                raise ValueError(
+                    f"soil must have >= {N_SOIL} channels, got {soil_arr.shape[1]}"
+                )
+            soil_arr = soil_arr[:, :N_SOIL]
+            soil_arr = np.where(
+                (soil_arr == NO_DATA_VALUE) | ~np.isfinite(soil_arr), 0.0, soil_arr
+            )
+            if self.legacy_input_scaling:
+                soil_s = scale_soil_channels_legacy(soil_arr)
+            else:
+                soil_s = scale_soil_channels(soil_arr, scaler=scaler)
+            soil_bt = np.broadcast_to(soil_s[:, None, :], (_n, _t, N_SOIL))
+            x = np.concatenate([x, np.ascontiguousarray(soil_bt)], axis=-1)
+
+        if x.shape[-1] != self.input_feature_dim:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} produced {x.shape[-1]} features, "
+                f"expected input_dim={self.input_feature_dim}"
+            )
         return x, weight, doy
 
-    def transform_chunk(self, chunk_arr: np.ndarray) -> BatchChunk:
+    def transform_chunk(
+        self,
+        chunk_arr: np.ndarray,
+        soil: np.ndarray | None = None,
+    ) -> BatchChunk:
         """Return (x, mask, doy, weight) each [N, T, ...] — batched, no per-pixel list."""
         if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
             chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
         n, t, _ = chunk_arr.shape
-        x, weight, doy = self.features_from_chunk(chunk_arr)
+        x, weight, doy = self.features_from_chunk(chunk_arr, soil=soil)
         fdim = self.input_feature_dim
         seq_len = self.sequencelength
 

@@ -34,7 +34,11 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from datasets.pixel_transform import DOY_CHANNEL, NO_DATA_VALUE, NUM_SPECTRAL_CHANNELS
+# Keep constants local so this script does not import datasets/ (pulls torch).
+DOY_CHANNEL = 10
+NUM_SPECTRAL_CHANNELS = 10
+NO_DATA_VALUE = -9999
+
 from preprocessing.preprocess_daily_to_npy import _save_npy_atomic
 from preprocessing.preprocess_tiff_to_npy import (
     date_to_season_doy,

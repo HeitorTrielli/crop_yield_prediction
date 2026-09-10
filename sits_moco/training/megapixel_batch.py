@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -89,8 +90,15 @@ def _transform_raw(
     path: str | None,
     num_periods: int | None,
     reference_date: date | None,
+    soil: np.ndarray | None = None,
 ) -> BatchChunk | None:
-    if hasattr(dataset, "filter_municipality_data"):
+    if getattr(dataset, "_soil_sidecar", False) and soil is None and path is not None:
+        soil_path = Path(path).with_name(f"{Path(path).stem}_soil.npy")
+        if soil_path.is_file():
+            soil = np.load(soil_path, mmap_mode="r")
+    if hasattr(dataset, "filter_municipality_pair"):
+        arr, soil = dataset.filter_municipality_pair(arr, soil, cache_key=path)
+    elif hasattr(dataset, "filter_municipality_data"):
         arr = dataset.filter_municipality_data(arr, cache_key=path)
     if arr is None or len(arr) == 0:
         return None
@@ -102,10 +110,11 @@ def _transform_raw(
             chunk_size=max(1, len(arr)),
             reference_date=reference_date,
             cache_key=path,
+            soil=soil,
         ):
             return unpack_pixel_chunk(pixel_chunk)
         return None
-    return unpack_pixel_chunk(dataset._transform_chunk(arr))
+    return unpack_pixel_chunk(dataset._transform_chunk(arr, soil=soil))
 
 
 def ensure_megapixel_ram_cache(dataset, *, workers: int = 8) -> dict | None:
@@ -165,12 +174,23 @@ def ensure_megapixel_ram_cache(dataset, *, workers: int = 8) -> dict | None:
             cache[key] = unpacked
             nbytes += sum(int(t.numel() * t.element_size()) for t in unpacked)
         else:
-            if hasattr(dataset, "filter_municipality_data"):
+            soil = None
+            if path is not None:
+                soil_path = Path(path).with_name(f"{Path(path).stem}_soil.npy")
+                if soil_path.is_file():
+                    soil = np.load(soil_path, mmap_mode="r")
+            if hasattr(dataset, "filter_municipality_pair"):
+                arr, soil = dataset.filter_municipality_pair(arr, soil, cache_key=path)
+            elif hasattr(dataset, "filter_municipality_data"):
                 arr = dataset.filter_municipality_data(arr, cache_key=path)
             if arr is None or len(arr) == 0:
                 continue
             arr = np.ascontiguousarray(arr, dtype=np.float32)
-            cache[key] = arr
+            if soil is not None:
+                soil = np.ascontiguousarray(soil, dtype=np.float32)
+                cache[key] = (arr, soil)
+            else:
+                cache[key] = arr
             nbytes += int(arr.nbytes)
 
     setattr(dataset, _RAM_CACHE_ATTR, cache)
@@ -222,8 +242,20 @@ def load_stacked_megapixel_batch(
                 entry = ram.get(_cache_key(code, None))
             if entry is None:
                 continue
-            if isinstance(entry, tuple) and len(entry) == 4:
+            if isinstance(entry, tuple) and len(entry) == 4 and all(
+                hasattr(t, "numel") for t in entry
+            ):
                 unpacked = entry
+            elif isinstance(entry, tuple) and len(entry) == 2:
+                arr, soil = entry
+                unpacked = _transform_raw(
+                    dataset,
+                    arr,
+                    path=None,
+                    num_periods=None,
+                    reference_date=None,
+                    soil=soil,
+                )
             else:
                 unpacked = _transform_raw(
                     dataset,

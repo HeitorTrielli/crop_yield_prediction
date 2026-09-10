@@ -20,6 +20,7 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from datasets.datautils import getWeight
+from datasets.extra_scaler import InputScaler, scale_soil_channels, scale_soil_channels_legacy
 from datasets.feature_layout import (
     feature_layout_choices,
     feature_layout_input_dim,
@@ -34,7 +35,6 @@ from datasets.pixel_transform import (
     scale_xavier_rain_channels,
     scale_xavier_rain_channels_legacy,
 )
-from datasets.extra_scaler import InputScaler
 from datasets.uscrops_aggregated_npy_polars import (
     _indices_first_n_months,
 )
@@ -491,10 +491,11 @@ def transform_pixel(
     input_dim: int = 10,
     deterministic_head=False,
     legacy_input_scaling: bool = False,
+    soil: np.ndarray | None = None,
 ):
     """Transform pixel data: normalize, pad/sample to sequencelength, extract DOY.
     If deterministic_head is True and x has more than sequencelength rows, keeps the earliest sequencelength rows.
-    ``input_dim`` must match the trained model (10, 12 with rain, or 16 with climate).
+    ``input_dim`` must match the trained model (10, 12 with rain, 16 with climate, 20 with climate+soil).
     """
     if seed is not None:
         np.random.seed(seed)
@@ -511,6 +512,8 @@ def transform_pixel(
         x_spec_n = ((x_spec - mean) / std).astype(np.float32)
         scale_rain = scale_xavier_rain_channels_legacy
         scale_clim = scale_xavier_climate_extras_legacy
+        scale_soil = scale_soil_channels_legacy
+        scaler = None
     else:
         scaler = InputScaler.require_load()
         mean = scaler.spectral_mean_row
@@ -518,17 +521,34 @@ def transform_pixel(
         x_spec_n = scaler.transform_spectral(x_spec)
         scale_rain = scale_xavier_rain_channels
         scale_clim = scale_xavier_climate_extras
+        scale_soil = scale_soil_channels
 
     weight = getWeight(x_spec)
-    if input_dim == 16:
+    if input_dim == 20:
         if c_in >= 17:
-            extra = scale_clim(raw[:, 11:17])
+            extra = scale_clim(raw[:, 11:17], scaler=scaler) if scaler is not None else scale_clim(raw[:, 11:17])
+        else:
+            extra = np.zeros((t_len, 6), dtype=np.float32)
+        if soil is None:
+            soil_row = np.zeros((4,), dtype=np.float32)
+        else:
+            soil_arr = np.asarray(soil, dtype=np.float32).reshape(-1)[:4]
+            soil_row = (
+                scale_soil(soil_arr[None, :], scaler=scaler)[0]
+                if scaler is not None
+                else scale_soil(soil_arr[None, :])[0]
+            )
+        soil_bt = np.broadcast_to(soil_row[None, :], (t_len, 4))
+        x = np.concatenate([x_spec_n, extra, soil_bt], axis=-1)
+    elif input_dim == 16:
+        if c_in >= 17:
+            extra = scale_clim(raw[:, 11:17], scaler=scaler) if scaler is not None else scale_clim(raw[:, 11:17])
         else:
             extra = np.zeros((t_len, 6), dtype=np.float32)
         x = np.concatenate([x_spec_n, extra], axis=-1)
     elif input_dim == 12:
         if c_in >= 13:
-            rain = scale_rain(raw[:, 11:13])
+            rain = scale_rain(raw[:, 11:13], scaler=scaler) if scaler is not None else scale_rain(raw[:, 11:13])
         else:
             rain = np.zeros((t_len, 2), dtype=np.float32)
         x = np.concatenate([x_spec_n, rain], axis=-1)
@@ -841,6 +861,23 @@ def reconstruct_spatial_predictions(
         print(f"  ⚠️  Warning: Could not load {muni_npy_file}: {e}")
         return None, None, None, None, None, None, None
 
+    soil_data = None
+    soil_path = Path(muni_npy_file).with_name(f"{Path(muni_npy_file).stem}_soil.npy")
+    if input_dim == 20:
+        if soil_path.is_file():
+            try:
+                soil_data = np.load(soil_path, mmap_mode="r")
+                if len(soil_data) != len(municipality_data):
+                    print(
+                        f"  ⚠️  Warning: soil sidecar N={len(soil_data)} != "
+                        f"npy N={len(municipality_data)}; soil channels will be zeros"
+                    )
+                    soil_data = None
+            except Exception as e:
+                print(f"  ⚠️  Warning: Could not load soil sidecar {soil_path}: {e}")
+        else:
+            print(f"  ⚠️  Warning: missing soil sidecar {soil_path}")
+
     if len(municipality_data) == 0:
         print(f"  ⚠️  Warning: {municipality_code} has 0 pixels")
         return None, None, None, None, None, None, None
@@ -851,6 +888,12 @@ def reconstruct_spatial_predictions(
             "  ⚠️  Warning: checkpoint uses spectral_xavier_climate (16 inputs) but .npy has "
             f"{municipality_data.shape[-1]} channels per timestep. "
             "Run data_download/append_xavier_climate_to_npy.py before heatmapping."
+        )
+    elif input_dim == 20 and municipality_data.shape[-1] < 17:
+        print(
+            "  ⚠️  Warning: checkpoint uses spectral_xavier_climate_soil (20 inputs) but .npy has "
+            f"{municipality_data.shape[-1]} channels per timestep. "
+            "Need 17-ch .npy + {code}_soil.npy sidecars."
         )
     elif input_dim == 12 and municipality_data.shape[-1] < 13:
         print(
@@ -920,6 +963,11 @@ def reconstruct_spatial_predictions(
                         input_dim=input_dim,
                         deterministic_head=True,
                         legacy_input_scaling=legacy_input_scaling,
+                        soil=(
+                            None
+                            if soil_data is None
+                            else soil_data[npy_pixel_idx]
+                        ),
                     )
                     current_chunk.append(X_tuple)
                     chunk_indices.append(("grid", row, col))

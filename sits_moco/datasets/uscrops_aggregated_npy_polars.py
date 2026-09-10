@@ -21,6 +21,7 @@ from torch.utils.data import Dataset
 
 from .feature_layout import (
     feature_layout_choices,
+    feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
     resolve_feature_layout,
 )
@@ -592,6 +593,9 @@ class USCropsAggregatedNPY(Dataset):
         self._extra_channels_slice: tuple[int, int] | None = _lay[
             "extra_channels_slice"
         ]
+        self._soil_sidecar = bool(_lay.get("soil_sidecar")) or feature_layout_needs_soil_sidecar(
+            self.feature_layout
+        )
         # Backward-compatible flag for logging / meta (any Xavier extras starting at ch 11)
         self.use_xavier = (
             self._extra_channels_slice is not None
@@ -988,6 +992,8 @@ class USCropsAggregatedNPY(Dataset):
             f"({n_layouts} registered layouts)"
         )
         self._validate_npy_channel_requirement()
+        if self._soil_sidecar:
+            self._validate_soil_sidecar_requirement()
 
         self.pixel_transform = PixelTransform(
             sequencelength,
@@ -1002,10 +1008,16 @@ class USCropsAggregatedNPY(Dataset):
                 "Input scaling: legacy hardcoded SPECTRAL_MEAN/STD + Xavier divisors "
                 "(no train_input_scaler.json)"
             )
+        if self._soil_sidecar:
+            print(
+                "  Soil sidecars: enabled "
+                f"(layout {self.feature_layout!r} → +4 channels from {{code}}_soil.npy)"
+            )
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
         self.npy_cache = OrderedDict()
         self.npy_cache_max_size = int(npy_cache_size)
+        self.soil_cache = OrderedDict()
         self._temporal_keep_cache: OrderedDict = OrderedDict()
         self._temporal_keep_cache_max = 64
 
@@ -1077,6 +1089,50 @@ class USCropsAggregatedNPY(Dataset):
                 return candidate
         return None
 
+    def _resolve_soil_path(self, municipality_code, year):
+        """Return Path to {code}_soil.npy sidecar beside the time-series .npy."""
+        npy_path = self._resolve_npy_path(municipality_code, year)
+        if npy_path is None:
+            return None
+        soil = npy_path.with_name(f"{npy_path.stem}_soil.npy")
+        return soil if soil.is_file() else None
+
+    def _validate_soil_sidecar_requirement(self) -> None:
+        """Drop municipality–years missing {code}_soil.npy when layout needs soil."""
+        dropped: list[tuple[object, str]] = []
+        keep: list = []
+        for key in self.municipality_list:
+            if isinstance(key, tuple):
+                code, year = key
+            else:
+                code = key
+                year = self.municipality_years.get(code, self.year)
+            npy = self._resolve_npy_path(code, year)
+            soil = self._resolve_soil_path(code, year)
+            if npy is not None and soil is None:
+                dropped.append((key, str(npy.with_name(f"{npy.stem}_soil.npy"))))
+                continue
+            keep.append(key)
+
+        if dropped:
+            for key, _path in dropped:
+                self.municipality_pixel_counts.pop(key, None)
+                self.municipality_years.pop(key, None)
+            self.municipality_list = sorted(keep)
+            examples = "; ".join(path for _, path in dropped[:3])
+            print(
+                f"  Dropped {len(dropped)} municipality–year(s) missing soil sidecar "
+                f"(layout {self.feature_layout!r}), e.g. {examples}"
+            )
+
+        if not self.municipality_list:
+            examples = "; ".join(path for _, path in dropped[:5])
+            raise ValueError(
+                f"Feature layout {self.feature_layout!r} requires {{code}}_soil.npy "
+                f"sidecars next to each .npy. Build them with "
+                f"data_download/build_mapbiomas_solo_sidecars.py. Missing e.g.: {examples}"
+            )
+
     def _validate_npy_channel_requirement(self) -> None:
         """Drop municipality–years whose .npy is too narrow for the layout.
 
@@ -1141,9 +1197,9 @@ class USCropsAggregatedNPY(Dataset):
                 f"  ⚠️  Could not read any .npy to verify channel count for layout {self.feature_layout!r}."
             )
 
-    def _transform_chunk(self, chunk_arr):
+    def _transform_chunk(self, chunk_arr, soil=None):
         """Vectorized transform (delegates to PixelTransform — same as training)."""
-        return self.pixel_transform.transform_chunk(chunk_arr)
+        return self.pixel_transform.transform_chunk(chunk_arr, soil=soil)
 
     def _temporal_keep_mask(self, municipality_data) -> np.ndarray:
         """Boolean keep-mask for temporal image/month thresholds."""
@@ -1164,17 +1220,33 @@ class USCropsAggregatedNPY(Dataset):
             )
         return keep
 
-    def filter_municipality_data(self, municipality_data, *, cache_key=None):
+    def filter_municipality_data(self, municipality_data, *, cache_key=None, soil=None):
         """
         Return municipality pixels after optional min_images / min_months filter.
 
-        When no temporal filter is configured, returns ``municipality_data`` unchanged
-        (including mmap views). Otherwise returns a contiguous subset of kept rows.
+        When ``soil`` is passed, returns ``(data, soil)`` with the same keep-index.
+        Otherwise returns data only.
         """
+        data_out, soil_out = self.filter_municipality_pair(
+            municipality_data, soil, cache_key=cache_key
+        )
+        if soil is not None:
+            return data_out, soil_out
+        return data_out
+
+    def filter_municipality_pair(
+        self, municipality_data, soil=None, *, cache_key=None
+    ):
+        """Filter time-series rows and aligned soil rows with the same keep-index."""
         if municipality_data is None or len(municipality_data) == 0:
-            return municipality_data
+            empty_soil = None if soil is None else soil[:0]
+            return municipality_data, empty_soil
+        if soil is not None and len(soil) != len(municipality_data):
+            raise ValueError(
+                f"soil N={len(soil)} != municipality_data N={len(municipality_data)}"
+            )
         if not self._temporal_filter_enabled:
-            return municipality_data
+            return municipality_data, soil
 
         idx = None
         if cache_key is not None:
@@ -1191,10 +1263,14 @@ class USCropsAggregatedNPY(Dataset):
                 self._temporal_keep_cache[cache_key] = idx
 
         if idx.size == 0:
-            return municipality_data[:0]
+            empty_data = municipality_data[:0]
+            empty_soil = None if soil is None else soil[:0]
+            return empty_data, empty_soil
         if idx.size == len(municipality_data):
-            return municipality_data
-        return np.ascontiguousarray(municipality_data[idx])
+            return municipality_data, soil
+        data_out = np.ascontiguousarray(municipality_data[idx])
+        soil_out = None if soil is None else np.ascontiguousarray(soil[idx])
+        return data_out, soil_out
 
     def _resolve_load_year(self, municipality_code, year=None):
         """Return the harvest year used to locate a municipality .npy file."""
@@ -1238,6 +1314,29 @@ class USCropsAggregatedNPY(Dataset):
             return None
         return municipality_data
 
+    def mmap_soil(self, municipality_code, year=None):
+        """Memory-map {code}_soil.npy [N,4] (LRU-cached). None if missing / unused."""
+        if not self._soil_sidecar:
+            return None
+        year = self._resolve_load_year(municipality_code, year)
+        if year is None:
+            return None
+        soil_path = self._resolve_soil_path(municipality_code, year)
+        if soil_path is None:
+            return None
+        if self.npy_cache_max_size <= 0:
+            soil = np.load(soil_path, mmap_mode="r")
+        else:
+            if soil_path not in self.soil_cache:
+                if len(self.soil_cache) >= self.npy_cache_max_size:
+                    self.soil_cache.popitem(last=False)
+                self.soil_cache[soil_path] = np.load(soil_path, mmap_mode="r")
+            self.soil_cache.move_to_end(soil_path)
+            soil = self.soil_cache[soil_path]
+        if soil.ndim != 2 or soil.shape[0] == 0:
+            return None
+        return soil
+
     def load_pixels_from_municipality(
         self, municipality_code, year=None, chunk_size=10000
     ):
@@ -1253,16 +1352,32 @@ class USCropsAggregatedNPY(Dataset):
             return
         year_resolved = self._resolve_load_year(municipality_code, year)
         cache_key = self._resolve_npy_path(municipality_code, year_resolved)
-        municipality_data = self.filter_municipality_data(
-            municipality_data, cache_key=cache_key
-        )
+        soil = self.mmap_soil(municipality_code, year=year_resolved)
+        if self._soil_sidecar:
+            if soil is None:
+                return
+            if len(soil) != len(municipality_data):
+                raise ValueError(
+                    f"Soil sidecar N={len(soil)} != npy N={len(municipality_data)} "
+                    f"for {municipality_code} year={year_resolved}"
+                )
+            municipality_data, soil = self.filter_municipality_pair(
+                municipality_data, soil, cache_key=cache_key
+            )
+        else:
+            municipality_data = self.filter_municipality_data(
+                municipality_data, cache_key=cache_key
+            )
         if municipality_data is None or len(municipality_data) == 0:
             return
 
         num_pixels = len(municipality_data)
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
-            yield self._transform_chunk(municipality_data[start:end])
+            soil_chunk = None if soil is None else soil[start:end]
+            yield self._transform_chunk(
+                municipality_data[start:end], soil=soil_chunk
+            )
 
     def _pack_sorted_in_season_chunk(
         self,
@@ -1304,6 +1419,7 @@ class USCropsAggregatedNPY(Dataset):
         gathered: np.ndarray,
         season_sorted: np.ndarray,
         num_periods: int,
+        soil: np.ndarray | None = None,
     ):
         """Yield STNet batches for one k from a DOY-sorted in-season packing."""
         k = int(num_periods)
@@ -1318,7 +1434,8 @@ class USCropsAggregatedNPY(Dataset):
             if idx.size == 0:
                 continue
             stacked = np.ascontiguousarray(gathered[idx, :length])
-            yield self._transform_chunk(stacked)
+            soil_chunk = None if soil is None else np.ascontiguousarray(soil[idx])
+            yield self._transform_chunk(stacked, soil=soil_chunk)
 
     def iter_period_pixel_chunks_from_data(
         self,
@@ -1328,10 +1445,16 @@ class USCropsAggregatedNPY(Dataset):
         chunk_size: int,
         reference_date: date,
         cache_key=None,
+        soil=None,
     ):
         """Yield batched STNet inputs after incomplete-series month filtering."""
-        municipality_data = self.filter_municipality_data(
-            municipality_data, cache_key=cache_key
+        if self._soil_sidecar and soil is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires soil sidecar rows "
+                "aligned with municipality_data"
+            )
+        municipality_data, soil = self.filter_municipality_pair(
+            municipality_data, soil, cache_key=cache_key
         )
         if municipality_data is None or len(municipality_data) == 0:
             return
@@ -1340,6 +1463,7 @@ class USCropsAggregatedNPY(Dataset):
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
             chunk_view = municipality_data[start:end]
+            soil_view = None if soil is None else soil[start:end]
             packed = self._pack_sorted_in_season_chunk(
                 chunk_view, reference_date, max_periods=int(num_periods)
             )
@@ -1347,7 +1471,7 @@ class USCropsAggregatedNPY(Dataset):
                 continue
             gathered, season_sorted = packed
             yield from self._yield_period_transforms_from_packed(
-                gathered, season_sorted, num_periods
+                gathered, season_sorted, num_periods, soil=soil_view
             )
 
     def iter_multiperiod_pixel_chunks_from_data(
@@ -1358,6 +1482,7 @@ class USCropsAggregatedNPY(Dataset):
         chunk_size: int,
         reference_date: date,
         cache_key=None,
+        soil=None,
     ):
         """
         Yield ``(num_periods, STNet_chunk)`` for every k in ``period_list``.
@@ -1368,8 +1493,13 @@ class USCropsAggregatedNPY(Dataset):
         periods = sorted({int(k) for k in period_list if int(k) >= 1})
         if not periods:
             return
-        municipality_data = self.filter_municipality_data(
-            municipality_data, cache_key=cache_key
+        if self._soil_sidecar and soil is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires soil sidecar rows "
+                "aligned with municipality_data"
+            )
+        municipality_data, soil = self.filter_municipality_pair(
+            municipality_data, soil, cache_key=cache_key
         )
         if municipality_data is None or len(municipality_data) == 0:
             return
@@ -1378,6 +1508,7 @@ class USCropsAggregatedNPY(Dataset):
         num_pixels = len(municipality_data)
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
+            soil_view = None if soil is None else soil[start:end]
             packed = self._pack_sorted_in_season_chunk(
                 municipality_data[start:end],
                 reference_date,
@@ -1388,7 +1519,7 @@ class USCropsAggregatedNPY(Dataset):
             gathered, season_sorted = packed
             for num_periods in periods:
                 for pixel_chunk in self._yield_period_transforms_from_packed(
-                    gathered, season_sorted, num_periods
+                    gathered, season_sorted, num_periods, soil=soil_view
                 ):
                     yield int(num_periods), pixel_chunk
 
@@ -1409,12 +1540,14 @@ class USCropsAggregatedNPY(Dataset):
             return
         year_resolved = self._resolve_load_year(municipality_code, year)
         cache_key = self._resolve_npy_path(municipality_code, year_resolved)
+        soil = self.mmap_soil(municipality_code, year=year_resolved)
         yield from self.iter_period_pixel_chunks_from_data(
             municipality_data,
             num_periods=num_periods,
             chunk_size=chunk_size,
             reference_date=reference_date,
             cache_key=cache_key,
+            soil=soil,
         )
 
     def __len__(self):

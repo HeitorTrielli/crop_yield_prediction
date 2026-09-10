@@ -411,6 +411,8 @@ def parse_args():
             "'spectral_xavier' = 10 bands + 2 rain channels (requires 13-channel daily .npy); "
             "'spectral_xavier_climate' / 'spectral_xavier_full' = rain + cum ETo/Rs/Tmax/Tmin "
             "(requires 17-channel .npy); "
+            "'spectral_xavier_climate_soil' = climate + MapBiomas Solo sidecars "
+            "(use --soil-fusion early|late); "
             "'mp_*' = derived index/climate recipes (see datasets/feature_recipes.py). "
             "See datasets/feature_layout.py."
         ),
@@ -495,6 +497,18 @@ def parse_args():
         type=int,
         default=4,
         help="Number of learned pooling queries for --temporal-pooling attention (default: 4)",
+    )
+    parser.add_argument(
+        "--soil-fusion",
+        type=str,
+        choices=["early", "late"],
+        default="early",
+        help=(
+            "How MapBiomas Solo channels enter STNet when using a soil layout "
+            "(spectral_xavier_climate_soil, input_dim=20): "
+            "'early' = soil through MLP+transformer with spectral/climate (default); "
+            "'late' = soil concatenated after temporal pooling into the decoder only."
+        ),
     )
     parser.add_argument(
         "--aux-loss",
@@ -954,6 +968,7 @@ def model_kwargs_from_args(args) -> dict:
         "dropout": float(args.model_dropout),
         "temporal_pooling": str(getattr(args, "temporal_pooling", "ndvi")),
         "attn_pool_queries": int(getattr(args, "attn_pool_queries", 4)),
+        "soil_fusion": str(getattr(args, "soil_fusion", "early")),
     }
 
 
@@ -1200,6 +1215,7 @@ def train(args):
     input_dim = int(traindataloader.dataset.input_feature_dim)
     print(
         f"Model input_dim={input_dim} (--feature-layout {args.feature_layout}; "
+        f"soil_fusion={getattr(args, 'soil_fusion', 'early')}; "
         "see datasets/feature_layout.py)"
     )
     model_kw = model_kwargs_from_args(args)

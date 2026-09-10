@@ -78,6 +78,7 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "model_dropout": ("--model-dropout",),
     "temporal_pooling": ("--temporal-pooling",),
     "attn_pool_queries": ("--attn-pool-queries",),
+    "soil_fusion": ("--soil-fusion",),
     "aux_loss": ("--aux-loss",),
     "aux_loss_weight": ("--aux-loss-weight",),
     "aux_min_std": ("--aux-min-std",),

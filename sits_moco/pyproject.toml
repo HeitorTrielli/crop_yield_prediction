@@ -2,7 +2,9 @@
 name = "sits-moco"
 version = "0.1.0"
 description = "Satellite Image Time Series for Yield Prediction using MoCo"
-requires-python = ">=3.8,<3.13"
+# geobr>=0.2.1 needs Python>=3.9; geobr>=1.0 needs >=3.10. Keep >=3.10 so uv
+# does not try to resolve the geobr 0.2.0 + geopandas<0.8 dead-end on 3.8.
+requires-python = ">=3.10,<3.13"
 dependencies = [
     # Core ML/DL
     "torch>=1.11.0",
@@ -21,7 +23,7 @@ dependencies = [
 
     # Geospatial
     "geopandas>=0.10.2",
-    "geobr>=0.2.0",         # IBGE municipal/state boundaries (download_*_shapefile*)
+    "geobr>=1.0.0",         # IBGE boundaries; 1.x needs Python>=3.10 + modern geopandas
     "rasterio>=1.2.10",
     "shapely>=1.8.0",
     "pyproj>=3.3.0",
@@ -55,12 +57,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["black>=23.3.0", "pytest>=7.3.0", "pytest-benchmark>=3.4.0"]
 
+[dependency-groups]
+dev = ["black>=23.3.0", "pytest>=7.3.0", "pytest-benchmark>=3.4.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["datasets", "models", "moco"]
-
-[tool.uv]
-dev-dependencies = []

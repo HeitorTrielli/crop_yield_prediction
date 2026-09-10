@@ -283,6 +283,7 @@ _MODEL_KWARG_FIELDS = (
     ("model_dropout", "dropout", float),
     ("temporal_pooling", "temporal_pooling", str),
     ("attn_pool_queries", "attn_pool_queries", int),
+    ("soil_fusion", "soil_fusion", str),
 )
 
 
@@ -295,13 +296,12 @@ def resolve_model_kwargs(
 
     Precedence: computed.model_kwargs > cli model_* fields > {} (class defaults).
     """
-    _ = checkpoint  # reserved for future checkpoint-side metadata
     computed = (run_config or {}).get("computed") or {}
     cli = (run_config or {}).get("cli") or {}
 
     mk = computed.get("model_kwargs")
     if mk:
-        return {
+        kwargs = {
             "d_model": int(mk["d_model"]),
             "n_head": int(mk["n_head"]),
             "n_layers": int(mk["n_layers"]),
@@ -310,13 +310,41 @@ def resolve_model_kwargs(
             # absent in configs from before learned attention pooling existed
             "temporal_pooling": str(mk.get("temporal_pooling", "ndvi")),
             "attn_pool_queries": int(mk.get("attn_pool_queries", 4)),
+            "soil_fusion": str(mk.get("soil_fusion", "early")),
         }
+    else:
+        kwargs = {}
+        for cli_key, ctor_key, caster in _MODEL_KWARG_FIELDS:
+            if cli_key in cli and cli[cli_key] is not None:
+                kwargs[ctor_key] = caster(cli[cli_key])
 
-    kwargs: dict = {}
-    for cli_key, ctor_key, caster in _MODEL_KWARG_FIELDS:
-        if cli_key in cli and cli[cli_key] is not None:
-            kwargs[ctor_key] = caster(cli[cli_key])
+    # Older checkpoints may omit soil_fusion; infer late from weight shapes.
+    if kwargs.get("soil_fusion", "early") == "early" and checkpoint is not None:
+        state = checkpoint.get("model_state") or checkpoint
+        if isinstance(state, dict) and soil_fusion_from_state_dict(state) == "late":
+            kwargs["soil_fusion"] = "late"
     return kwargs
+
+
+def soil_fusion_from_state_dict(state_dict: dict, *, soil_dim: int = 4) -> str:
+    """Infer early vs late soil fusion from STNetRegression weight shapes."""
+    mlp_w = state_dict.get("mlp1.0.lin.weight")
+    dec_w = state_dict.get("decoder.0.weight")
+    d_model_w = state_dict.get("mlp1.2.lin.weight")
+    if mlp_w is None or dec_w is None or d_model_w is None:
+        return "early"
+    mlp_in = int(mlp_w.shape[1])
+    decoder_in = int(dec_w.shape[1])
+    d_model = int(d_model_w.shape[0])
+    if "attn_pool.queries" in state_dict:
+        n_q = int(state_dict["attn_pool.queries"].shape[0])
+        pooled = n_q * d_model
+    else:
+        pooled = d_model
+    if decoder_in == pooled + int(soil_dim):
+        return "late"
+    _ = mlp_in  # unused; kept for readability / future checks
+    return "early"
 
 
 def resolve_inference_chunk_size(
@@ -382,12 +410,23 @@ def aggregate_pixels(
     return out
 
 
-def stnet_regression_input_dim_from_state_dict(state_dict: dict) -> int:
-    """Infer STNetRegression MLP input width (10 spectral vs 12 with Xavier) from saved weights."""
+def stnet_regression_input_dim_from_state_dict(
+    state_dict: dict, *, soil_dim: int = 4
+) -> int:
+    """
+    Infer STNetRegression **feature-cube** width from saved weights.
+
+    For early fusion this equals the MLP input width. For late soil fusion the
+    MLP sees ``cube_dim - soil_dim`` while the batch still has ``cube_dim``
+    channels (soil concatenated after temporal pooling).
+    """
     w = state_dict.get("mlp1.0.lin.weight")
-    if w is not None:
-        return int(w.shape[1])
-    return 10
+    if w is None:
+        return 10
+    mlp_in = int(w.shape[1])
+    if soil_fusion_from_state_dict(state_dict, soil_dim=soil_dim) == "late":
+        return mlp_in + int(soil_dim)
+    return mlp_in
 
 
 def aggregate_municipality_from_pixel_chunks(

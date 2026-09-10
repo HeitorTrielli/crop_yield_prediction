@@ -67,6 +67,12 @@ class STNetRegression(nn.Module):
     - Output layer outputs num_outputs (default 1) instead of num_classes
     - No softmax activation
     - Returns continuous z-scores instead of class logits
+
+    Soil fusion (``soil_fusion``), when the last ``soil_dim`` input channels are
+    MapBiomas Solo sidecars:
+    - ``early``: all channels through the MLP + transformer (default).
+    - ``late``: spectral/climate through the transformer; soil concatenated
+      after temporal pooling into the decoder.
     """
 
     def __init__(
@@ -85,6 +91,8 @@ class STNetRegression(nn.Module):
         max_temporal_shift=30,
         temporal_pooling="ndvi",
         attn_pool_queries=4,
+        soil_fusion="early",
+        soil_dim=4,
     ):
         super(STNetRegression, self).__init__()
         self.modelname = "STNetRegression"
@@ -93,9 +101,26 @@ class STNetRegression(nn.Module):
             raise ValueError(
                 f"temporal_pooling must be 'ndvi' or 'attention', got {temporal_pooling!r}"
             )
+        if soil_fusion not in ("early", "late"):
+            raise ValueError(
+                f"soil_fusion must be 'early' or 'late', got {soil_fusion!r}"
+            )
         self.temporal_pooling = temporal_pooling
+        self.soil_fusion = soil_fusion
+        self.soil_dim = int(soil_dim)
+        self.input_dim = int(input_dim)
 
-        self.mlp_dim = [input_dim, 32, 64, d_model]
+        if self.soil_fusion == "late":
+            if self.input_dim <= self.soil_dim:
+                raise ValueError(
+                    f"late soil_fusion needs input_dim > soil_dim "
+                    f"({self.input_dim} <= {self.soil_dim})"
+                )
+            seq_dim = self.input_dim - self.soil_dim
+        else:
+            seq_dim = self.input_dim
+
+        self.mlp_dim = [seq_dim, 32, 64, d_model]
         layers = []
         for i in range(len(self.mlp_dim) - 1):
             layers.append(linlayer(self.mlp_dim[i], self.mlp_dim[i + 1]))
@@ -125,6 +150,9 @@ class STNetRegression(nn.Module):
             self.attn_pool = None
             decoder_in = d_model
 
+        if self.soil_fusion == "late":
+            decoder_in = decoder_in + self.soil_dim
+
         # Regression decoder: LayerNorm (not BatchNorm) so train/eval use the
         # same normalization under pixel-chunked, variable-size batches.
         layers = []
@@ -143,6 +171,12 @@ class STNetRegression(nn.Module):
 
     def forward(self, x, is_bert=False):
         x, mask, doy, weight = x
+
+        soil = None
+        if self.soil_fusion == "late":
+            # Soil is static across T; last soil_dim channels of the cube.
+            soil = x[:, 0, -self.soil_dim :]
+            x = x[:, :, : -self.soil_dim]
 
         x = x.permute((0, 2, 1))
         x = self.mlp1(x)
@@ -163,6 +197,9 @@ class STNetRegression(nn.Module):
                 weight_sum = torch.clamp(weight_sum, min=1e-8)  # Prevent division by zero
                 weight /= weight_sum
                 x = torch.bmm(weight.unsqueeze(1), x).squeeze(1)
+
+        if soil is not None:
+            x = torch.cat([x, soil], dim=-1)
 
         output = self.decoder(x)
 

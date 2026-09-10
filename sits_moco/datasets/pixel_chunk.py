@@ -259,16 +259,33 @@ def _iter_tagged_chunks_with_mmap_lookahead(
             year = entries[i][2]
             year_resolved = dataset._resolve_load_year(muni_code, year)
             cache_key = dataset._resolve_npy_path(muni_code, year_resolved)
-            municipality_data = dataset.filter_municipality_data(
-                municipality_data, cache_key=cache_key
-            )
+            soil = None
+            if getattr(dataset, "_soil_sidecar", False):
+                soil = dataset.mmap_soil(muni_code, year=year_resolved)
+                if soil is None:
+                    continue
+                if len(soil) != len(municipality_data):
+                    raise ValueError(
+                        f"Soil sidecar N={len(soil)} != npy N={len(municipality_data)} "
+                        f"for {muni_code} year={year_resolved}"
+                    )
+                municipality_data, soil = dataset.filter_municipality_pair(
+                    municipality_data, soil, cache_key=cache_key
+                )
+            else:
+                municipality_data = dataset.filter_municipality_data(
+                    municipality_data, cache_key=cache_key
+                )
             if municipality_data is None or len(municipality_data) == 0:
                 continue
             num_pixels = len(municipality_data)
             for start in range(0, num_pixels, chunk_size):
                 end = min(start + chunk_size, num_pixels)
+                soil_chunk = None if soil is None else soil[start:end]
                 unpacked = unpack_pixel_chunk(
-                    dataset._transform_chunk(municipality_data[start:end])
+                    dataset._transform_chunk(
+                        municipality_data[start:end], soil=soil_chunk
+                    )
                 )
                 if unpacked is not None:
                     yield muni_idx, unpacked
@@ -303,12 +320,18 @@ def _iter_tagged_period_chunks_with_mmap_lookahead(
             year = entries[i][2]
             year_resolved = dataset._resolve_load_year(muni_code, year)
             cache_key = dataset._resolve_npy_path(muni_code, year_resolved)
+            soil = None
+            if getattr(dataset, "_soil_sidecar", False):
+                soil = dataset.mmap_soil(muni_code, year=year_resolved)
+                if soil is None:
+                    continue
             for pixel_chunk in dataset.iter_period_pixel_chunks_from_data(
                 municipality_data,
                 num_periods=num_periods,
                 chunk_size=chunk_size,
                 reference_date=reference_date,
                 cache_key=cache_key,
+                soil=soil,
             ):
                 unpacked = unpack_pixel_chunk(pixel_chunk)
                 if unpacked is not None:
@@ -519,12 +542,18 @@ def _iter_raw_batch_multiperiod_cpu_chunks(
             return
         year_resolved = dataset._resolve_load_year(municipality_code, year)
         cache_key = dataset._resolve_npy_path(municipality_code, year_resolved)
+        soil = None
+        if getattr(dataset, "_soil_sidecar", False):
+            soil = dataset.mmap_soil(municipality_code, year=year_resolved)
+            if soil is None:
+                return
         for num_periods, pixel_chunk in dataset.iter_multiperiod_pixel_chunks_from_data(
             municipality_data,
             period_list=periods,
             chunk_size=chunk_size,
             reference_date=reference_date,
             cache_key=cache_key,
+            soil=soil,
         ):
             unpacked = unpack_pixel_chunk(pixel_chunk)
             if unpacked is not None:

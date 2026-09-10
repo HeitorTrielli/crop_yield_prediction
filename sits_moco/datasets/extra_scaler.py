@@ -30,6 +30,7 @@ NO_DATA_VALUE = -9999
 STD_FLOOR = 1e-6
 N_SPECTRAL = 10
 N_EXTRA = 6
+N_SOIL = 4
 
 SPECTRAL_CHANNEL_NAMES: tuple[str, ...] = (
     "B2",
@@ -50,6 +51,12 @@ EXTRA_CHANNEL_NAMES: tuple[str, ...] = (
     "rs_cum_mjm2",
     "tmax_cum_cday",
     "tmin_cum_cday",
+)
+SOIL_CHANNEL_NAMES: tuple[str, ...] = (
+    "clay_pct",
+    "silt_pct",
+    "sand_pct",
+    "soc_t_ha",
 )
 DERIVED_CHANNEL_NAMES: tuple[str, ...] = ("wb_mm", "dtr_cday", "tmean_cday")
 CHANNEL_NAMES = EXTRA_CHANNEL_NAMES  # ExtraScaler / older call sites
@@ -140,6 +147,9 @@ class InputScaler:
         derived_mean: dict[str, float] | None = None,
         derived_std: dict[str, float] | None = None,
         derived_var: dict[str, float] | None = None,
+        soil_mean: np.ndarray | None = None,
+        soil_std: np.ndarray | None = None,
+        soil_var: np.ndarray | None = None,
         n_frames: int | dict[str, int] = 0,
         path: Path | str | None = None,
         meta: dict[str, Any] | None = None,
@@ -161,6 +171,14 @@ class InputScaler:
         self.extra_delta_var = _var_or_sq(
             extra_delta_var, self.extra_delta_std, N_EXTRA
         )
+
+        if soil_mean is None:
+            soil_mean = np.zeros(N_SOIL, dtype=np.float32)
+            soil_std = np.ones(N_SOIL, dtype=np.float32)
+            soil_var = np.ones(N_SOIL, dtype=np.float32)
+        self.soil_mean = _vec(soil_mean, N_SOIL, "soil mean")
+        self.soil_std = _std_vec(soil_std, N_SOIL, "soil std")
+        self.soil_var = _var_or_sq(soil_var, self.soil_std, N_SOIL)
 
         d_mean = dict(derived_mean or {})
         d_std = dict(derived_std or {})
@@ -226,6 +244,16 @@ class InputScaler:
             np.float32
         )
 
+    def transform_soil(self, soil: np.ndarray) -> np.ndarray:
+        """Z-score soil features [..., 4]. No clip."""
+        out = np.asarray(soil, dtype=np.float32)
+        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        if int(out.shape[-1]) != N_SOIL:
+            raise ValueError(
+                f"Expected last dim {N_SOIL} (soil), got {out.shape[-1]}"
+            )
+        return ((out - self.soil_mean) / self.soil_std).astype(np.float32)
+
     def to_dict(self) -> dict[str, Any]:
         n_frames = self.n_frames
         if isinstance(n_frames, dict):
@@ -258,6 +286,13 @@ class InputScaler:
                 self.extra_delta_var,
                 np.zeros(N_EXTRA, dtype=int),
             ),
+            "soil": _block(
+                SOIL_CHANNEL_NAMES,
+                self.soil_mean,
+                self.soil_std,
+                self.soil_var,
+                np.zeros(N_SOIL, dtype=int),
+            ),
             "derived": {
                 name: {
                     "mean": self.derived_mean[name],
@@ -269,6 +304,7 @@ class InputScaler:
             "units": {
                 "spectral": "reflectance_0_1_after_1e-4",
                 "extras": "raw_npy_units",
+                "soil": "mapbiomas_solo_pct_and_t_ha",
             },
         }
         # Prefer per-channel counts stored in meta when present.
@@ -277,6 +313,7 @@ class InputScaler:
             ("spectral_n_frames_per_channel", "spectral"),
             ("extras_n_frames_per_channel", "extras"),
             ("extras_delta_n_frames_per_channel", "extras_delta"),
+            ("soil_n_frames_per_channel", "soil"),
         ):
             if key in meta:
                 payload[block]["n_frames_per_channel"] = meta.pop(key)
@@ -311,6 +348,7 @@ class InputScaler:
         extra = payload["extras"]
         delta = payload.get("extras_delta") or {}
         derived = payload.get("derived") or {}
+        soil = payload.get("soil") or {}
         reserved = {
             "version",
             "aggregation",
@@ -319,6 +357,7 @@ class InputScaler:
             "spectral",
             "extras",
             "extras_delta",
+            "soil",
             "derived",
             "units",
             "channels",
@@ -340,6 +379,9 @@ class InputScaler:
             extra_delta_mean=delta.get("mean"),
             extra_delta_std=delta.get("std"),
             extra_delta_var=delta.get("var"),
+            soil_mean=soil.get("mean"),
+            soil_std=soil.get("std"),
+            soil_var=soil.get("var"),
             derived_mean=d_mean,
             derived_std=d_std,
             derived_var=d_var,
@@ -380,6 +422,11 @@ class InputScaler:
         lines.append("  extras (raw npy)")
         for name, mu, sd, va in zip(EXTRA_CHANNEL_NAMES, self.mean, self.std, self.var):
             lines.append(f"    {name:18s}  mean={mu:12.4f}  std={sd:12.4f}  var={va:12.4f}")
+        lines.append("  soil (sidecar)")
+        for name, mu, sd, va in zip(
+            SOIL_CHANNEL_NAMES, self.soil_mean, self.soil_std, self.soil_var
+        ):
+            lines.append(f"    {name:18s}  mean={mu:12.4f}  std={sd:12.4f}  var={va:12.4f}")
         lines.append("  extras_delta")
         for name, mu, sd, va in zip(
             EXTRA_CHANNEL_NAMES,
@@ -418,6 +465,27 @@ def scale_xavier_climate_extras(
     return scaler.transform(extra)
 
 
+def scale_soil_channels(
+    soil: np.ndarray, scaler: InputScaler | None = None
+) -> np.ndarray:
+    """Z-score MapBiomas Solo sidecar channels. No clip."""
+    scaler = scaler or InputScaler.require_load()
+    return scaler.transform_soil(soil)
+
+
+def scale_soil_channels_legacy(soil: np.ndarray) -> np.ndarray:
+    """Simple divisors when train_input_scaler.json has no soil block."""
+    out = np.asarray(soil, dtype=np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if out.shape[-1] < N_SOIL:
+        raise ValueError(f"Expected {N_SOIL} soil channels, got {out.shape[-1]}")
+    out[..., 0] = out[..., 0] / 100.0
+    out[..., 1] = out[..., 1] / 100.0
+    out[..., 2] = out[..., 2] / 100.0
+    out[..., 3] = out[..., 3] / 60.0
+    return out.astype(np.float32)
+
+
 def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputScaler:
     """
     Fit mean/std on the train dataset for S2 + extras.
@@ -441,6 +509,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
     spec_frames: list[np.ndarray] = []
     extra_frames: list[np.ndarray] = []
     delta_frames: list[np.ndarray] = []
+    soil_rows: list[np.ndarray] = []
     n_series = 0
     n_missing = 0
     for key in iterator:
@@ -474,6 +543,26 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
             if np.isfinite(spatial_e).any():
                 extra_frames.append(spatial_e.astype(np.float32, copy=False))
                 delta_frames.append(_diff_t_2d(spatial_e))
+        soil_path = None
+        resolve_soil = getattr(dataset, "_resolve_soil_path", None)
+        if callable(resolve_soil):
+            soil_path = resolve_soil(code, year)
+        elif path is not None:
+            soil_path = path.with_name(f"{path.stem}_soil.npy")
+        if soil_path is not None and Path(soil_path).is_file():
+            try:
+                soil = np.load(soil_path, mmap_mode="r")
+                soil = np.asarray(soil, dtype=np.float32)
+                if soil.ndim == 2 and soil.shape[1] >= N_SOIL:
+                    soil = soil[:, :N_SOIL]
+                    invalid = (soil == NO_DATA_VALUE) | ~np.isfinite(soil)
+                    soil = np.where(invalid, np.nan, soil)
+                    with np.errstate(all="ignore"):
+                        spatial_soil = np.nanmean(soil, axis=0)
+                    if np.isfinite(spatial_soil).any():
+                        soil_rows.append(spatial_soil.astype(np.float32, copy=False))
+            except OSError:
+                pass
         n_series += 1
 
     if not spec_frames:
@@ -515,6 +604,15 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         d_n = np.zeros(N_EXTRA, dtype=np.int64)
         derived_mean = derived_std = derived_var = None
 
+    if soil_rows:
+        soil_mat = np.stack(soil_rows, axis=0)
+        soil_mean, soil_std, soil_var, soil_n = _moments(soil_mat)
+    else:
+        soil_mean = np.zeros(N_SOIL)
+        soil_std = np.ones(N_SOIL)
+        soil_var = np.ones(N_SOIL)
+        soil_n = np.zeros(N_SOIL, dtype=np.int64)
+
     harvest_years: list[int] = []
     if keys and isinstance(keys[0], tuple):
         harvest_years = sorted({int(y) for _, y in keys})
@@ -523,6 +621,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         "spectral": int(s_n.max()) if s_n.size else 0,
         "extras": int(e_n.max()) if e_n.size else 0,
         "extras_delta": int(d_n.max()) if d_n.size else 0,
+        "soil": int(soil_n.max()) if soil_n.size else 0,
     }
     meta = {
         "datapath": str(Path(dataset.root).expanduser().resolve()),
@@ -531,6 +630,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         "spectral_n_frames_per_channel": [int(x) for x in s_n],
         "extras_n_frames_per_channel": [int(x) for x in e_n],
         "extras_delta_n_frames_per_channel": [int(x) for x in d_n],
+        "soil_n_frames_per_channel": [int(x) for x in soil_n],
         "harvest_years": harvest_years,
         "feature_layout": getattr(dataset, "feature_layout", None),
     }
@@ -544,6 +644,9 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         extra_delta_mean=d_mean,
         extra_delta_std=d_std,
         extra_delta_var=d_var,
+        soil_mean=soil_mean,
+        soil_std=soil_std,
+        soil_var=soil_var,
         derived_mean=derived_mean,
         derived_std=derived_std,
         derived_var=derived_var,

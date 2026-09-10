@@ -135,6 +135,7 @@ def load_study_config(path: Path | str) -> dict:
 
     n_trials = search.get("n_trials")
     explicit_trials = search.get("trials")
+    extra_trials = search.get("extra_trials")
     year_loo = search.get("year_loo")
     skip_holdout_years_missing_climate = search.get(
         "skip_holdout_years_missing_climate"
@@ -160,6 +161,12 @@ def load_study_config(path: Path | str) -> dict:
             ]
     if extra_scaler_template is not None:
         extra_scaler_template = str(extra_scaler_template)
+    if extra_trials is not None:
+        if not isinstance(extra_trials, list):
+            raise ValueError("search.extra_trials must be a list")
+        for i, trial in enumerate(extra_trials):
+            if not isinstance(trial, dict):
+                raise ValueError(f"search.extra_trials[{i}] must be a mapping")
     if strategy == "random":
         if n_trials is None or int(n_trials) < 1:
             raise ValueError("random search requires search.n_trials >= 1")
@@ -196,6 +203,7 @@ def load_study_config(path: Path | str) -> dict:
             "n_trials": int(n_trials) if n_trials is not None else None,
             "parameters": deepcopy(parameters or {}),
             "trials": deepcopy(explicit_trials) if explicit_trials is not None else None,
+            "extra_trials": deepcopy(extra_trials) if extra_trials is not None else None,
             "seed": int(search.get("seed", 42)),
             "year_loo": deepcopy(year_loo) if year_loo is not None else None,
             "skip_holdout_years_missing_climate": deepcopy(

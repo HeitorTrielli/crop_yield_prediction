@@ -107,8 +107,12 @@ def generate_trials(search: dict) -> list[dict[str, Any]]:
     """
     Return a list of parameter dicts to merge onto study base config.
 
-    search keys: strategy, n_trials, parameters, trials, seed,
+    search keys: strategy, n_trials, parameters, trials, extra_trials, seed,
     year_loo (feature_sweep only)
+
+    ``extra_trials`` (optional list of dicts) is appended after the strategy's
+    main trials — useful for adding a few late-fusion / ablation points onto a
+    grid without doubling the whole search space.
     """
     strategy = search["strategy"]
     parameters: dict = search.get("parameters") or {}
@@ -117,23 +121,17 @@ def generate_trials(search: dict) -> list[dict[str, Any]]:
         trials = [dict(t) for t in (search.get("trials") or [])]
         if not trials:
             raise ValueError("list search requires a non-empty search.trials list")
-        return _filter_invalid_trials(trials, search)
-
-    if strategy == "feature_sweep":
-        return _filter_invalid_trials(_feature_sweep_trials(search), search)
-
-    if not parameters:
-        return [{}]
-
-    if strategy == "grid":
+    elif strategy == "feature_sweep":
+        trials = _feature_sweep_trials(search)
+    elif not parameters:
+        trials = [{}]
+    elif strategy == "grid":
         keys = sorted(parameters.keys())
         value_lists = [_grid_values(parameters[k]) for k in keys]
         trials = []
         for combo in itertools.product(*value_lists):
             trials.append(dict(zip(keys, combo)))
-        return _filter_invalid_trials(trials, search)
-
-    if strategy == "random":
+    elif strategy == "random":
         n_trials = int(search["n_trials"])
         rng = random.Random(int(search.get("seed", 42)))
         trials = []
@@ -155,9 +153,19 @@ def generate_trials(search: dict) -> list[dict[str, Any]]:
                 f"Could only sample {len(trials)} unique random trials "
                 f"(requested {n_trials})"
             )
-        return trials
+    else:
+        raise ValueError(f"Unknown strategy {strategy!r}")
 
-    raise ValueError(f"Unknown strategy {strategy!r}")
+    extra = search.get("extra_trials") or []
+    if extra:
+        if not isinstance(extra, list):
+            raise ValueError("search.extra_trials must be a list of trial dicts")
+        for i, trial in enumerate(extra):
+            if not isinstance(trial, dict):
+                raise ValueError(f"search.extra_trials[{i}] must be a mapping")
+            trials.append(dict(trial))
+
+    return _filter_invalid_trials(trials, search)
 
 
 def _trial_is_valid(sample: dict, search: dict) -> bool:

@@ -37,6 +37,18 @@ _LAYOUT: dict[str, dict[str, Any]] = {
             "Requires 17-channel daily .npy."
         ),
     },
+    "spectral_xavier_climate_soil": {
+        "input_dim": 20,
+        "extra_channels_slice": (11, 17),
+        "soil_sidecar": True,
+        "description": (
+            "spectral_xavier_climate + 4 MapBiomas Solo channels "
+            "(clay/silt/sand % + SOC t/ha) from {code}_soil.npy sidecars; "
+            "joined at transform time (17-ch .npy unchanged). DOY → PE. "
+            "Use --soil-fusion early|late to pass soil through the transformer "
+            "or only into the decoder after temporal pooling."
+        ),
+    },
 }
 
 
@@ -68,6 +80,10 @@ _ALIASES: dict[str, str] = {
     "spectral_xavier_full": "spectral_xavier_climate",
     "xavier_full": "spectral_xavier_climate",
     "full": "spectral_xavier_climate",
+    "xavier_climate_soil": "spectral_xavier_climate_soil",
+    "s2_xavier_climate_soil": "spectral_xavier_climate_soil",
+    "full_soil": "spectral_xavier_climate_soil",
+    "spectral_xavier_full_soil": "spectral_xavier_climate_soil",
 }
 
 
@@ -113,3 +129,8 @@ def feature_layout_extra_slice(name: str) -> tuple[int, int] | None:
         return None
     lo, hi = sl
     return (int(lo), int(hi))
+
+
+def feature_layout_needs_soil_sidecar(name: str) -> bool:
+    """True when layout expects {code}_soil.npy joined at transform time."""
+    return bool(resolve_feature_layout(name).get("soil_sidecar"))
