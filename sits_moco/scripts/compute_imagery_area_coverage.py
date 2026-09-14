@@ -58,6 +58,7 @@ OUTPUT_COLUMNS = [
     "yield_t_ha",
     "area_planted_ha",
     "pixel_area_ha",
+    "coverage_ratio",
     "production_t_s2_adj",
     "split",
 ]
@@ -222,7 +223,7 @@ def enrich_yield_csv(
     out["municipality_code"] = out["municipality_code"].astype(int)
     out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
 
-    drop_cols = [c for c in LEGACY_IMAGERY_COLUMNS + ["pixel_area_ha", "production_t_s2_adj"] if c in out.columns]
+    drop_cols = [c for c in LEGACY_IMAGERY_COLUMNS + ["pixel_area_ha", "coverage_ratio", "production_t_s2_adj"] if c in out.columns]
     out = out.drop(columns=drop_cols)
 
     keys = ["municipality_code", "year"]
@@ -234,6 +235,7 @@ def enrich_yield_csv(
         & out["pixel_area_ha"].notna()
     )
     coverage = np.where(valid, out["pixel_area_ha"] / out["area_planted_ha"], np.nan)
+    out["coverage_ratio"] = coverage
     coverage_capped = np.where(valid, np.minimum(coverage, 1.0), np.nan)
     out["production_t_s2_adj"] = np.where(
         valid & out["production_t"].notna(),

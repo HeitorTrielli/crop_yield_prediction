@@ -2,19 +2,25 @@
 Script to evaluate model performance with incomplete time series.
 Uses daily rows per season: for k=1..6, all observations in season months 1..k are
 concatenated in time (sorted by DOY), up to --sequencelength (default 45) earliest days.
-Municipality prediction = sum of per-pixel model outputs, compared to CSV label.
+Municipality prediction = mean of per-pixel z-scores, denormalized to the CSV unit.
 """
 
 import argparse
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
 
-from datasets import USCropsAggregatedNPY
+from datasets import (
+    DEFAULT_MAX_COVERAGE_RATIO,
+    DEFAULT_MIN_COVERAGE_RATIO,
+    USCropsAggregatedNPY,
+    filter_yield_pandas_by_coverage,
+)
 from datasets.feature_layout import (
     feature_layout_choices,
     feature_layout_input_dim,
@@ -29,10 +35,13 @@ from run_paths import (
     run_dir_from_path,
 )
 from utils_aggregated import (
-    aggregate_municipality_from_pixel_chunks,
     aggregation_for_target_column,
     regression_metrics,
+    resolve_head_output,
+    resolve_inference_chunk_size,
     resolve_inference_target,
+    resolve_model_kwargs,
+    resolve_pixel_chunk_size,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -77,8 +86,11 @@ def parse_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=400,
-        help="Number of pixels to process at once (default: 400, match training)",
+        default=None,
+        help=(
+            "Pixels per GPU forward pass (default: training pixel_chunk_size_effective; "
+            "not pixel_chunk_size * chunks_per_grad)"
+        ),
     )
     parser.add_argument(
         "-d",
@@ -107,6 +119,26 @@ def parse_args():
         default="2022-10-01",
         help="Date where DOY 1 falls, YYYY-MM-DD (default: 2022-10-01)",
     )
+    parser.add_argument(
+        "--min-coverage-ratio",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE_RATIO,
+        help=(
+            "Keep rows with coverage_ratio >= this (default: no filter). "
+            "Example: --min-coverage-ratio 0.8 --max-coverage-ratio 1.2"
+        ),
+    )
+    parser.add_argument(
+        "--max-coverage-ratio",
+        type=float,
+        default=DEFAULT_MAX_COVERAGE_RATIO,
+        help="Keep rows with coverage_ratio <= this (default: no filter)",
+    )
+    parser.add_argument(
+        "--no-coverage-filter",
+        action="store_true",
+        help="Do not filter yield CSV rows by coverage_ratio (default behavior)",
+    )
     args = parser.parse_args()
     args.reference_date = datetime.strptime(args.reference_date, "%Y-%m-%d").date()
     args.checkpoint = resolve_checkpoint_path(args.checkpoint)
@@ -119,11 +151,108 @@ def parse_args():
     if args.yield_csv is None:
         args.yield_csv = YIELD_CSV
     args.datapath = Path(args.datapath).resolve()
+    if args.no_coverage_filter:
+        args.min_coverage_ratio = None
+        args.max_coverage_ratio = None
     args.yield_csv = Path(args.yield_csv)
     if args.feature_layout is not None:
         normalize_feature_layout(args.feature_layout)
 
+    args.chunk_size = resolve_inference_chunk_size(run_config, args.chunk_size)
+
     return args, run_config
+
+
+def inference_args_from_run_config(
+    run_config: dict, *, quiet: bool = True
+) -> SimpleNamespace:
+    """Minimal args namespace for training's chunk prefetch / H2D pipeline."""
+    cli = run_config.get("cli") or {}
+    # Training often sets prefetch_chunks=30 for micro-batch pipelining. That
+    # depth with large inference --chunk-size pins many host/GPU tensors and
+    # spills into Windows shared GPU memory — keep inference shallow.
+    raw_prefetch = int(cli.get("prefetch_chunks", 2))
+    return SimpleNamespace(
+        prefetch_chunks=max(0, min(raw_prefetch, 2)),
+        disable_pipeline_h2d=bool(cli.get("disable_pipeline_h2d", False)),
+        quiet_training=quiet,
+        h2d_pin_host=bool(cli.get("h2d_pin_host", False)),
+    )
+
+
+def inference_batch_size_from_run_config(run_config: dict, default: int = 10) -> int:
+    cli = run_config.get("cli") or {}
+    return int(cli.get("batchsize", default))
+
+
+def predict_municipalities_with_periods(
+    model,
+    entries: list[tuple[str, int]],
+    dataset,
+    num_periods: int,
+    chunk_size: int,
+    device,
+    reference_date,
+    args,
+    aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
+) -> dict[tuple[str, int], float]:
+    """Batched incomplete-series inference (training chunk/H2D pipeline)."""
+    from training.inference_batch import run_period_inference_batch
+
+    if aggregation is None:
+        aggregation = aggregation_for_target_column(dataset.target_column)
+    return run_period_inference_batch(
+        model=model,
+        dataset=dataset,
+        entries=entries,
+        device=device,
+        args=args,
+        chunk_size=chunk_size,
+        num_periods=num_periods,
+        reference_date=reference_date,
+        aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
+    )
+
+
+def predict_municipalities_all_periods(
+    model,
+    entries: list[tuple[str, int]],
+    dataset,
+    period_list: list[int] | tuple[int, ...],
+    chunk_size: int,
+    device,
+    reference_date,
+    args,
+    aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
+) -> dict[int, dict[tuple[str, int], float]]:
+    """Batched incomplete-series inference for every k in one mmap/sort pass."""
+    from training.inference_batch import run_multiperiod_inference_batch
+
+    if aggregation is None:
+        aggregation = aggregation_for_target_column(dataset.target_column)
+    return run_multiperiod_inference_batch(
+        model=model,
+        dataset=dataset,
+        entries=entries,
+        device=device,
+        args=args,
+        chunk_size=chunk_size,
+        period_list=period_list,
+        reference_date=reference_date,
+        aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
+    )
 
 
 def predict_municipality_with_periods(
@@ -135,17 +264,183 @@ def predict_municipality_with_periods(
     chunk_size,
     device,
     reference_date,
+    args=None,
+    run_config: dict | None = None,
 ):
-    """Predict yield using first num_periods season months (same PixelTransform as training)."""
-    chunks = dataset.load_pixels_from_municipality_with_periods(
-        municipality_code, year, num_periods, chunk_size, reference_date
-    )
-    return aggregate_municipality_from_pixel_chunks(
+    """Predict one municipality-year (wrapper around batched inference)."""
+    if args is None:
+        if run_config is None:
+            raise ValueError(
+                "predict_municipality_with_periods needs args or run_config"
+            )
+        args = inference_args_from_run_config(run_config)
+    if year is None:
+        if getattr(dataset, "use_multi_year", False):
+            raise ValueError("year required for multi-year dataset")
+        year = dataset.municipality_years[str(municipality_code)]
+    results = predict_municipalities_with_periods(
         model,
-        chunks,
+        [(str(municipality_code), int(year))],
+        dataset,
+        num_periods,
+        chunk_size,
         device,
-        aggregation=aggregation_for_target_column(dataset.target_column),
+        reference_date,
+        args,
     )
+    return results.get((str(municipality_code), int(year)))
+
+
+def batched_predict_with_periods(
+    model,
+    municipality_list,
+    dataset,
+    num_periods,
+    chunk_size,
+    device,
+    reference_date,
+    args,
+    *,
+    batch_size: int = 10,
+    single_season: bool = False,
+    target_year: int | None = None,
+    desc: str | None = None,
+    aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
+) -> tuple[dict, list]:
+    """Predict incomplete-series yields in municipality batches (training pipeline)."""
+    from itertools import islice
+
+    if batch_size < 1:
+        batch_size = 1
+
+    predictions: dict = {}
+    failed_entries: list = []
+    iterator = iter(municipality_list)
+    total = len(municipality_list)
+    progress = tqdm(total=total, desc=desc, leave=False) if desc else None
+
+    try:
+        while True:
+            batch = list(islice(iterator, batch_size))
+            if not batch:
+                break
+
+            if single_season:
+                if target_year is None:
+                    raise ValueError("target_year required for single_season batching")
+                entries = [(str(m), int(target_year)) for m in batch]
+                result_keys = list(batch)
+            else:
+                entries = [(str(m), int(y)) for m, y in batch]
+                result_keys = list(batch)
+
+            batch_results = predict_municipalities_with_periods(
+                model,
+                entries,
+                dataset,
+                num_periods,
+                chunk_size,
+                device,
+                reference_date,
+                args,
+                aggregation=aggregation,
+                head_output=head_output,
+                target_mean=target_mean,
+                target_std=target_std,
+            )
+            for entry, result_key in zip(entries, result_keys):
+                if entry in batch_results:
+                    predictions[result_key] = batch_results[entry]
+                else:
+                    failed_entries.append(result_key)
+
+            if progress is not None:
+                progress.update(len(batch))
+    finally:
+        if progress is not None:
+            progress.close()
+
+    return predictions, failed_entries
+
+
+def batched_predict_all_periods(
+    model,
+    municipality_list,
+    dataset,
+    period_list,
+    chunk_size,
+    device,
+    reference_date,
+    args,
+    *,
+    batch_size: int = 10,
+    single_season: bool = False,
+    target_year: int | None = None,
+    desc: str | None = None,
+    aggregation: str | None = None,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
+) -> tuple[dict[int, dict], dict[int, list]]:
+    """Predict every incomplete-series k in one pass per municipality batch."""
+    from itertools import islice
+
+    if batch_size < 1:
+        batch_size = 1
+    periods = sorted({int(k) for k in period_list if int(k) >= 1})
+    predictions_by_k: dict[int, dict] = {k: {} for k in periods}
+    failed_by_k: dict[int, list] = {k: [] for k in periods}
+    iterator = iter(municipality_list)
+    total = len(municipality_list)
+    progress = tqdm(total=total, desc=desc, leave=False) if desc else None
+
+    try:
+        while True:
+            batch = list(islice(iterator, batch_size))
+            if not batch:
+                break
+
+            if single_season:
+                if target_year is None:
+                    raise ValueError("target_year required for single_season batching")
+                entries = [(str(m), int(target_year)) for m in batch]
+                result_keys = list(batch)
+            else:
+                entries = [(str(m), int(y)) for m, y in batch]
+                result_keys = list(batch)
+
+            batch_results = predict_municipalities_all_periods(
+                model,
+                entries,
+                dataset,
+                periods,
+                chunk_size,
+                device,
+                reference_date,
+                args,
+                aggregation=aggregation,
+                head_output=head_output,
+                target_mean=target_mean,
+                target_std=target_std,
+            )
+            for k in periods:
+                k_results = batch_results.get(k, {})
+                for entry, result_key in zip(entries, result_keys):
+                    if entry in k_results:
+                        predictions_by_k[k][result_key] = k_results[entry]
+                    else:
+                        failed_by_k[k].append(result_key)
+
+            if progress is not None:
+                progress.update(len(batch))
+    finally:
+        if progress is not None:
+            progress.close()
+
+    return predictions_by_k, failed_by_k
 
 
 def main():
@@ -199,10 +494,12 @@ def main():
     # Create model
     print("Creating model...")
     device = torch.device(args.device)
+    model_kw = resolve_model_kwargs(run_config, checkpoint)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
+        **model_kw,
     ).to(device)
 
     # Load model weights
@@ -215,18 +512,27 @@ def main():
     target, target_column, aggregation, target_unit = resolve_inference_target(
         run_config, checkpoint
     )
+    head_output = resolve_head_output(checkpoint, run_config)
+    target_mean = checkpoint.get("target_mean")
+    target_std = checkpoint.get("target_std")
     print(
         f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
     )
     print(
         f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
     )
+    print(f"Head output: {head_output}")
 
     if not args.yield_csv.exists():
         raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
 
     print(f"Loading yield CSV from {args.yield_csv}...")
     yield_df = pd.read_csv(args.yield_csv)
+    yield_df = filter_yield_pandas_by_coverage(
+        yield_df,
+        min_ratio=args.min_coverage_ratio,
+        max_ratio=args.max_coverage_ratio,
+    )
 
     muni_code_col = "municipality_code"
     yield_col = target_column
@@ -267,9 +573,12 @@ def main():
         seed=args.seed,
         feature_layout=normalize_feature_layout(args.feature_layout),
         target_column=target_column,
+        min_coverage_ratio=args.min_coverage_ratio,
+        max_coverage_ratio=args.max_coverage_ratio,
     )
 
     single_season = getattr(dataset, "is_single_season", False) and year_col is not None
+    target_year: int | None = None
     if single_season:
         # One folder = one safra. Target = yield of second year (e.g. 2022-2023 → 2023).
         folder_name = args.datapath.name
@@ -305,80 +614,54 @@ def main():
         print("⚠️  Warning: No municipalities found!")
         return
 
-    # Test with different numbers of time periods
+    # One pass over municipalities for every k=1..6 (shared mmap + DOY sort).
     num_periods_list = [1, 2, 3, 4, 5, 6]
     all_results = []
+    inference_args = inference_args_from_run_config(run_config)
+    inference_batch_size = inference_batch_size_from_run_config(run_config)
+
+    print(f"\n{'='*60}")
+    print(f"Evaluating incomplete series k={num_periods_list} (single pass)")
+    print(f"{'='*60}")
+
+    predictions_by_k, failed_by_k = batched_predict_all_periods(
+        model,
+        municipality_list,
+        dataset,
+        num_periods_list,
+        args.chunk_size,
+        device,
+        reference_date=args.reference_date,
+        args=inference_args,
+        batch_size=inference_batch_size,
+        single_season=single_season,
+        target_year=target_year,
+        desc="Predicting (k=1..6)",
+        aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
+    )
+
+    yield_lookup = muni_to_yield_single if single_season else muni_to_yield
 
     for num_periods in num_periods_list:
         print(f"\n{'='*60}")
-        print(f"Evaluating with {num_periods} time periods")
+        print(f"Results for {num_periods} time periods")
         print(f"{'='*60}")
 
-        predictions = {}
-        failed_entries = []
+        predictions = predictions_by_k.get(num_periods, {})
+        failed_entries = failed_by_k.get(num_periods, [])
 
-        if single_season:
-            for municipality_code in tqdm(
-                municipality_list, desc=f"Predicting ({num_periods} periods)"
-            ):
-                prediction = predict_municipality_with_periods(
-                    model,
-                    municipality_code,
-                    None,
-                    dataset,
-                    num_periods,
-                    args.chunk_size,
-                    device,
-                    reference_date=args.reference_date,
-                )
-                if prediction is not None:
-                    predictions[municipality_code] = prediction
-                else:
-                    failed_entries.append(municipality_code)
-        else:
-            for entry in tqdm(
-                municipality_list, desc=f"Predicting ({num_periods} periods)"
-            ):
-                if year_col is not None:
-                    municipality_code, year = entry
-                else:
-                    municipality_code = entry
-                    year = None
-                prediction = predict_municipality_with_periods(
-                    model,
-                    municipality_code,
-                    year,
-                    dataset,
-                    num_periods,
-                    args.chunk_size,
-                    device,
-                    reference_date=args.reference_date,
-                )
-                if prediction is not None:
-                    predictions[entry] = prediction
-                else:
-                    failed_entries.append(entry)
-
-        # Compute metrics
         y_pred = []
         y_true = []
-        valid_entries = []
-        yield_lookup = muni_to_yield_single if single_season else muni_to_yield
-
         for entry in municipality_list:
             if entry in predictions and entry in yield_lookup:
-                pred = predictions[entry]
-                true_val = yield_lookup[entry]
-
-                # Convert to numeric types
-                pred = pd.to_numeric(pred, errors="coerce")
-                true_val = pd.to_numeric(true_val, errors="coerce")
-
-                # Filter out NaN/inf
+                pred = pd.to_numeric(predictions[entry], errors="coerce")
+                true_val = pd.to_numeric(yield_lookup[entry], errors="coerce")
                 if np.isfinite(pred) and np.isfinite(true_val):
                     y_pred.append(pred)
                     y_true.append(true_val)
-                    valid_entries.append(entry)
 
         if len(y_pred) > 0:
             y_pred = np.array(y_pred)
@@ -386,16 +669,13 @@ def main():
 
             metrics = regression_metrics(y_pred, y_true, target_column=target_column)
 
-            print(
-                f"\nResults for {num_periods} time periods ({len(y_pred)} municipalities):"
-            )
+            print(f"  Municipalities: {len(y_pred)}")
             print(f"  RMSE: {metrics['rmse']:.2f} tons")
             print(f"  MAE:  {metrics['mae']:.2f} tons")
             print(f"  R²:   {metrics['r2']:.4f}")
             if not np.isnan(metrics["mape"]):
                 print(f"  MAPE: {metrics['mape']:.2f}%")
 
-            # Store results
             all_results.append(
                 {
                     "num_periods": num_periods,

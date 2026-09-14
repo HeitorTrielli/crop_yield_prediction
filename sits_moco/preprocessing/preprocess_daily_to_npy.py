@@ -3,8 +3,9 @@
 Preprocess daily municipal TIFFs (from clip_tiffs_to_shapefiles) to .npy.
 
 Reads TIFFs under {input_dir}/{year_range}/{municipal_code}/, stacks to
-[num_pixels, num_days, 11] (10 bands + DOY), or [N, T, 13] with --xavier-pr-nc
-(two Xavier rain channels; see data_download/xavier_rain_for_daily_npy.py).
+[num_pixels, num_days, 11] (10 bands + DOY), [N, T, 13] with --xavier-pr-nc
+(two rain channels), or [N, T, 17] when ETo/Rs/Tmax/Tmin NetCDFs are also set
+(see data_download/xavier_climate_for_daily_npy.py).
 """
 
 from __future__ import annotations
@@ -12,9 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import tempfile
 import time
-import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
@@ -122,6 +121,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Xavier NetCDF (e.g. xavier_pr.nc). When set, appends 2 rain channels per timestep.",
     )
+    p.add_argument(
+        "--xavier-eto-nc",
+        type=Path,
+        default=None,
+        help="Optional Xavier ETo NetCDF. With Rs/Tmax/Tmin, appends 4 climate channels (requires --xavier-pr-nc).",
+    )
+    p.add_argument(
+        "--xavier-rs-nc",
+        type=Path,
+        default=None,
+        help="Optional Xavier Rs (solar radiation) NetCDF.",
+    )
+    p.add_argument(
+        "--xavier-tmax-nc",
+        type=Path,
+        default=None,
+        help="Optional Xavier Tmax NetCDF.",
+    )
+    p.add_argument(
+        "--xavier-tmin-nc",
+        type=Path,
+        default=None,
+        help="Optional Xavier Tmin NetCDF.",
+    )
     return p.parse_args()
 
 
@@ -190,8 +213,9 @@ def process_municipality(
     output_dir: Path,
     season_start: date,
     xavier_pr_work: Path | None = None,
+    xavier_climate_work: dict[str, Path] | None = None,
 ) -> int:
-    """Load daily TIFFs for one municipality, build [num_pixels, num_days, 11|13], save .npy. Returns pixel count."""
+    """Load daily TIFFs for one municipality, build [num_pixels, num_days, 11|13|17], save .npy. Returns pixel count."""
     if not tiff_paths:
         return 0
 
@@ -251,7 +275,11 @@ def process_municipality(
     # Fill remaining NaN with NO_DATA_VALUE for storage
     stack = np.where(np.isnan(stack), NO_DATA_VALUE, stack)
 
-    n_extra = 2 if xavier_pr_work is not None else 0
+    n_extra = 0
+    if xavier_pr_work is not None:
+        n_extra += 2
+    if xavier_climate_work is not None:
+        n_extra += 4
     n_out_ch = 11 + n_extra
 
     # Append DOY: [num_pixels, num_days, 11..]
@@ -260,13 +288,14 @@ def process_municipality(
     out[:, :, :nbands] = stack
     out[:, :, 10] = doy_broadcast
 
+    rows = (idx_final // width).astype(np.int64)
+    cols = (idx_final % width).astype(np.int64)
+
     if xavier_pr_work is not None:
         from data_download.xavier_rain_for_daily_npy import (
             compute_rain_block_for_municipality,
         )
 
-        rows = (idx_final // width).astype(np.int64)
-        cols = (idx_final % width).astype(np.int64)
         rain = compute_rain_block_for_municipality(
             xavier_pr_work,
             year_range,
@@ -278,6 +307,23 @@ def process_municipality(
         )
         rain = np.where(np.isfinite(rain), rain, NO_DATA_VALUE)
         out[:, :, 11:13] = rain
+
+    if xavier_climate_work is not None:
+        from data_download.xavier_climate_for_daily_npy import (
+            compute_climate_block_for_municipality,
+        )
+
+        climate = compute_climate_block_for_municipality(
+            xavier_climate_work,
+            year_range,
+            rows,
+            cols,
+            ref_transform,
+            ref_crs,
+            list(dates),
+        )
+        climate = np.where(np.isfinite(climate), climate, NO_DATA_VALUE)
+        out[:, :, 13:17] = climate
 
     out_dir = output_dir / year_range / code
     out_path = out_dir / f"{code}.npy"
@@ -292,9 +338,15 @@ def _process_municipality_worker(
     output_dir: Path,
     season_start: date,
     xavier_pr_work: str | None,
+    xavier_climate_work: dict[str, str] | None,
 ) -> tuple[str, int, str | None]:
     try:
         xp = Path(xavier_pr_work) if xavier_pr_work else None
+        climate = (
+            {k: Path(v) for k, v in xavier_climate_work.items()}
+            if xavier_climate_work
+            else None
+        )
         n = process_municipality(
             code,
             tiff_paths,
@@ -302,10 +354,19 @@ def _process_municipality_worker(
             output_dir,
             season_start,
             xavier_pr_work=xp,
+            xavier_climate_work=climate,
         )
         return (code, n, None)
     except Exception as e:
         return (code, 0, str(e))
+
+
+def _prepare_xavier_work_copy(src: Path | None, prefix: str) -> Path | None:
+    if src is None:
+        return None
+    from data_download.xavier_climate_for_daily_npy import copy_nc_to_temp
+
+    return copy_nc_to_temp(Path(src), prefix=prefix)
 
 
 def main() -> None:
@@ -353,45 +414,66 @@ def main() -> None:
             f"Skipped {n_skipped} municipalities (missing dir or no TIFFs): {skipped_no_dir + skipped_no_tiffs}"
         )
     workers = max(1, int(args.workers))
-    xavier_arg = args.xavier_pr_nc
-    if xavier_arg is not None and not Path(xavier_arg).is_file():
-        raise SystemExit(f"--xavier-pr-nc not a file: {xavier_arg}")
-    xavier_str = str(Path(xavier_arg).resolve()) if xavier_arg is not None else None
-    xavier_work_path: Path | None = None
-    if xavier_str:
-        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
-        src = Path(xavier_arg).expanduser().resolve()
-        if not src.is_file():
-            raise SystemExit(f"--xavier-pr-nc not a file: {src}")
-        try:
-            blob = src.read_bytes()
-        except OSError as e:
-            raise SystemExit(f"Could not read --xavier-pr-nc ({src}): {e}") from e
-        tmp = tempfile.NamedTemporaryFile(
-            prefix=f"xavier_pr_{uuid.uuid4().hex}_",
-            suffix=".nc",
-            delete=False,
-        )
-        try:
-            tmp.write(blob)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        finally:
-            tmp.close()
-        xavier_work_path = Path(tmp.name)
 
-    print(
-        f"Processing {len(muni_to_paths)} municipalities, year-range {year_range}, "
-        f"season_start={season_start} (DOY 1), workers={workers}"
-        + (f", xavier_pr_nc={xavier_str}" if xavier_str else "")
-        + (f", xavier_work_copy={xavier_work_path}" if xavier_work_path else "")
-    )
-    total_pixels = 0
-    failed: list[tuple[str, str]] = []
-    items = sorted(muni_to_paths.items(), key=lambda x: x[0])
-    xavier_work_str = os.fspath(xavier_work_path) if xavier_work_path else None
+    climate_srcs = {
+        "ETo": args.xavier_eto_nc,
+        "Rs": args.xavier_rs_nc,
+        "Tmax": args.xavier_tmax_nc,
+        "Tmin": args.xavier_tmin_nc,
+    }
+    climate_any = any(v is not None for v in climate_srcs.values())
+    climate_all = all(v is not None for v in climate_srcs.values())
+    if climate_any and not climate_all:
+        missing = [k for k, v in climate_srcs.items() if v is None]
+        raise SystemExit(
+            "Xavier climate channels require all of --xavier-eto-nc, --xavier-rs-nc, "
+            f"--xavier-tmax-nc, --xavier-tmin-nc (missing: {missing})"
+        )
+    if climate_all and args.xavier_pr_nc is None:
+        raise SystemExit(
+            "Xavier climate channels (ETo/Rs/Tmax/Tmin) require --xavier-pr-nc "
+            "so rain stays in channels 11:13 and climate in 13:17."
+        )
+
+    for label, path in [("pr", args.xavier_pr_nc), *climate_srcs.items()]:
+        if path is not None and not Path(path).is_file():
+            raise SystemExit(f"Xavier NetCDF not a file ({label}): {path}")
+
+    xavier_work_path: Path | None = None
+    climate_work: dict[str, Path] | None = None
+    temp_paths: list[Path] = []
 
     try:
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+        if args.xavier_pr_nc is not None:
+            xavier_work_path = _prepare_xavier_work_copy(args.xavier_pr_nc, "xavier_pr")
+            if xavier_work_path is not None:
+                temp_paths.append(xavier_work_path)
+        if climate_all:
+            climate_work = {}
+            for key, src in climate_srcs.items():
+                wp = _prepare_xavier_work_copy(src, f"xavier_{key.lower()}")
+                assert wp is not None
+                climate_work[key] = wp
+                temp_paths.append(wp)
+
+        xavier_str = (
+            str(Path(args.xavier_pr_nc).resolve()) if args.xavier_pr_nc else None
+        )
+        print(
+            f"Processing {len(muni_to_paths)} municipalities, year-range {year_range}, "
+            f"season_start={season_start} (DOY 1), workers={workers}"
+            + (f", xavier_pr_nc={xavier_str}" if xavier_str else "")
+            + (f", xavier_climate={list(climate_srcs)}" if climate_all else "")
+        )
+        total_pixels = 0
+        failed: list[tuple[str, str]] = []
+        items = sorted(muni_to_paths.items(), key=lambda x: x[0])
+        xavier_work_str = os.fspath(xavier_work_path) if xavier_work_path else None
+        climate_work_str = (
+            {k: os.fspath(v) for k, v in climate_work.items()} if climate_work else None
+        )
+
         if workers <= 1:
             for code, paths in tqdm(items, desc="Municipalities", unit="muni"):
                 try:
@@ -402,6 +484,7 @@ def main() -> None:
                         out_base,
                         season_start,
                         xavier_pr_work=xavier_work_path,
+                        xavier_climate_work=climate_work,
                     )
                     total_pixels += n
                 except Exception as e:
@@ -418,6 +501,7 @@ def main() -> None:
                         out_base,
                         season_start,
                         xavier_work_str,
+                        climate_work_str,
                     ): code
                     for code, paths in items
                 }
@@ -441,9 +525,9 @@ def main() -> None:
                 f"Failed {len(failed)} municipality/municipalities (re-run after fixing disk/OneDrive): {[c for c, _ in failed]}"
             )
     finally:
-        if xavier_work_path is not None:
+        for p in temp_paths:
             try:
-                xavier_work_path.unlink(missing_ok=True)
+                Path(p).unlink(missing_ok=True)
             except OSError:
                 pass
 

@@ -9,6 +9,7 @@ Layout::
         figures/
             intramunicipal_heatmap/   pixel-level yield / NDVI heatmaps
             municipal_heatmaps/       state/municipality choropleth maps
+            productivity_scatter/     predicted vs IBGE productivity scatter plots
 
 Legacy runs (before feature-layout subfolders) may still live at::
 
@@ -20,17 +21,105 @@ Legacy runs (before feature-layout subfolders) may still live at::
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import os
+import subprocess
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from datasets.feature_layout import normalize_feature_layout
+from env_config import resolve_datapath
 
 TRAINING_SUBDIR = "training"
 FIGURES_SUBDIR = "figures"
 PREDICTIONS_SUBDIR = "predictions"
 INTRAMUNICIPAL_HEATMAP_SUBDIR = "intramunicipal_heatmap"
 MUNICIPAL_HEATMAPS_SUBDIR = "municipal_heatmaps"
+PRODUCTIVITY_SCATTER_SUBDIR = "productivity_scatter"
 _RUN_SUBDIRS = frozenset({TRAINING_SUBDIR, FIGURES_SUBDIR, PREDICTIONS_SUBDIR})
+
+
+def _to_windows_path_str(path: Path) -> str | None:
+    """Map a WSL ``/mnt/<drive>/...`` path to ``D:\\...``, else None."""
+    resolved = path if path.is_absolute() else path.resolve()
+    parts = resolved.parts
+    # Path.parts on POSIX: ('/', 'mnt', 'c', 'Users', ...)
+    if len(parts) >= 3 and parts[0] == "/" and parts[1] == "mnt" and len(parts[2]) == 1:
+        drive = parts[2].upper()
+        tail = "\\".join(parts[3:])
+        return f"{drive}:\\{tail}" if tail else f"{drive}:\\"
+    return None
+
+
+def ensure_dir(path: Path | str, *, quiet: bool = False) -> Path:
+    """
+    mkdir -p with a WSL /mnt/c workaround for DrvFS ghost paths.
+
+    On Windows mounts, ``stat`` can return ENOENT while ``mkdir`` returns EEXIST
+    (common after deleting a folder from Windows while WSL still had it open).
+    Fall back to ``cmd.exe /c mkdir`` when that happens.
+    """
+    path = Path(path)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except FileExistsError:
+        if path.is_dir():
+            return path
+
+    if path.exists() and not path.is_dir():
+        raise FileExistsError(
+            f"{path} exists and is not a directory; remove it and retry"
+        )
+
+    win_path = _to_windows_path_str(path.resolve())
+    cmd = Path("/mnt/c/Windows/System32/cmd.exe")
+    if win_path and cmd.is_file():
+        if not quiet:
+            print(f"WSL mkdir quirk for {path}; creating via Windows cmd.exe")
+        proc = subprocess.run(
+            [str(cmd), "/c", "mkdir", win_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if path.is_dir():
+            return path
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise FileExistsError(
+            f"Could not create {path} (WSL FileExistsError ghost). "
+            f"cmd.exe mkdir exit={proc.returncode}: {detail}"
+        )
+
+    raise FileExistsError(
+        f"Could not create {path}: path missing to stat but mkdir reports EEXIST. "
+        "On WSL /mnt/c try: cmd.exe /c mkdir <windows-path>"
+    )
+
+
+def normalize_user_path(path: Path | str) -> Path:
+    """
+    Normalize a user-supplied path for the current OS.
+
+    On WSL/Linux:
+    - convert Windows absolute paths (``C:\\...`` or ``C:/...``) to ``/mnt/<drive>/...``
+    - convert relative Windows-style paths (``results\\foo\\bar.pth``) to POSIX separators
+    so the same CLI path works when pasted from Windows.
+    """
+    raw = str(path)
+    if os.name == "nt":
+        return Path(path)
+
+    # Absolute Windows path: C:\... or C:/...
+    if len(raw) >= 2 and raw[1] == ":" and (len(raw) == 2 or raw[2] in "\\/"):
+        wp = PureWindowsPath(raw)
+        drive = (wp.drive or "").rstrip(":").lower()
+        return Path("/mnt") / drive / Path(*wp.parts[1:])
+
+    # Relative Windows-style path with backslashes (not a valid POSIX separator).
+    if "\\" in raw and not raw.startswith("/"):
+        return Path(raw.replace("\\", "/"))
+
+    return Path(path)
 
 
 def experiment_dir(logdir: Path | str, experiment_name: str) -> Path:
@@ -50,7 +139,7 @@ def run_dir_for_experiment(
 
 def run_dir_from_path(path: Path | str) -> Path:
     """Resolve the layout root from a checkpoint path or any file inside a run."""
-    p = Path(path).resolve()
+    p = normalize_user_path(path).resolve()
     if p.is_file():
         p = p.parent
     elif p.suffix == ".pth":
@@ -74,7 +163,7 @@ def training_dir(run_dir: Path | str, *, create: bool = False) -> Path:
     run_dir = Path(run_dir)
     td = run_dir / TRAINING_SUBDIR
     if create:
-        td.mkdir(parents=True, exist_ok=True)
+        ensure_dir(td, quiet=True)
     return td
 
 
@@ -82,7 +171,7 @@ def figures_dir(run_dir: Path | str, *, create: bool = False) -> Path:
     run_dir = Path(run_dir)
     fd = run_dir / FIGURES_SUBDIR
     if create:
-        fd.mkdir(parents=True, exist_ok=True)
+        ensure_dir(fd, quiet=True)
     return fd
 
 
@@ -90,7 +179,7 @@ def intramunicipal_heatmap_dir(run_dir: Path | str, *, create: bool = False) -> 
     run_dir = Path(run_dir)
     d = run_dir / FIGURES_SUBDIR / INTRAMUNICIPAL_HEATMAP_SUBDIR
     if create:
-        d.mkdir(parents=True, exist_ok=True)
+        ensure_dir(d, quiet=True)
     return d
 
 
@@ -98,7 +187,15 @@ def municipal_heatmaps_dir(run_dir: Path | str, *, create: bool = False) -> Path
     run_dir = Path(run_dir)
     d = run_dir / FIGURES_SUBDIR / MUNICIPAL_HEATMAPS_SUBDIR
     if create:
-        d.mkdir(parents=True, exist_ok=True)
+        ensure_dir(d, quiet=True)
+    return d
+
+
+def productivity_scatter_dir(run_dir: Path | str, *, create: bool = False) -> Path:
+    run_dir = Path(run_dir)
+    d = run_dir / FIGURES_SUBDIR / PRODUCTIVITY_SCATTER_SUBDIR
+    if create:
+        ensure_dir(d, quiet=True)
     return d
 
 
@@ -106,14 +203,14 @@ def predictions_dir(run_dir: Path | str, *, create: bool = False) -> Path:
     run_dir = Path(run_dir)
     pd = run_dir / PREDICTIONS_SUBDIR
     if create:
-        pd.mkdir(parents=True, exist_ok=True)
+        ensure_dir(pd, quiet=True)
     return pd
 
 
 def ensure_run_layout(run_dir: Path | str) -> tuple[Path, Path, Path]:
     """Create training/, figures/, and predictions/ under the run root."""
     run_dir = Path(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(run_dir, quiet=True)
     return (
         training_dir(run_dir, create=True),
         figures_dir(run_dir, create=True),
@@ -129,7 +226,7 @@ def model_best_in_run(run_dir: Path | str) -> Path:
 
 def resolve_checkpoint_path(path: Path | str) -> Path:
     """Resolve model_best.pth from a .pth file or a run directory."""
-    p = Path(path)
+    p = normalize_user_path(path)
     if p.is_file():
         return p.resolve()
 
@@ -142,7 +239,7 @@ def resolve_checkpoint_path(path: Path | str) -> Path:
             return candidate.resolve()
 
     raise FileNotFoundError(
-        f"Checkpoint not found at {path!r}. "
+        f"Checkpoint not found at {p!r} (from {path!r}). "
         f"Pass a .pth file or a run directory with training/model_best.pth."
     )
 
@@ -246,6 +343,9 @@ def apply_run_config_to_args(
             continue
         val = _config_value(cli, computed, cli_key, computed_key)
         if val is None:
+            if arg_name == "datapath":
+                setattr(args, arg_name, resolve_datapath())
+                continue
             raise ValueError(
                 f"Missing {arg_name!r} in {config_path} and not passed on the command line."
             )

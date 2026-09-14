@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from tuning.config import BOOL_PARAMS, coerce_param_types
 
-from run_paths import run_dir_for_experiment
+from run_paths import ensure_dir, run_dir_for_experiment
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TARGET_PREFIX = {
     "productivity": "Productivity",
+    "productivity_dev": "ProductivityDev",
     "total_adj": "TotalAdj",
     "total": "Total",
 }
@@ -37,6 +39,16 @@ def predict_run_name(params: dict) -> str:
         parts.append(str(suffix))
     return "_".join(parts)
 
+# Tuner-only keys: never forwarded to the training script argparse.
+TUNER_ONLY_KEYS = frozenset(
+    {
+        "year_loo_folds",
+        "skip",
+        "skip_reason",
+        "suffix_prefix",
+    }
+)
+
 # CLI flags that differ from snake_case param names.
 FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "learning_rate": ("-lr", "--learning-rate"),
@@ -45,26 +57,61 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "workers": ("-j", "--workers"),
     "epochs": ("-e", "--epochs"),
     "logdir": ("-l", "--logdir"),
+    "run_dir": ("--run-dir",),
     "suffix": ("-s", "--suffix"),
     "target": ("--target",),
+    "head_output": ("--head-output",),
     "harvest_years": ("--harvest-years",),
+    "holdout_year": ("--holdout-year",),
     "feature_layout": ("--feature-layout",),
+    "extra_scaler": ("--extra-scaler",),
+    "refit_extra_scaler": ("--refit-extra-scaler",),
     "weight_decay": ("--weight-decay",),
     "sample_ratio": ("--sample-ratio",),
     "warmup_epochs": ("--warmup-epochs",),
     "early_stop_patience": ("--early-stop-patience",),
+    "checkpoint_every": ("--checkpoint-every",),
     "model_d_model": ("--model-d-model",),
     "model_n_head": ("--model-n-head",),
     "model_n_layers": ("--model-n-layers",),
     "model_d_inner": ("--model-d-inner",),
     "model_dropout": ("--model-dropout",),
+    "temporal_pooling": ("--temporal-pooling",),
+    "attn_pool_queries": ("--attn-pool-queries",),
+    "soil_fusion": ("--soil-fusion",),
+    "aux_loss": ("--aux-loss",),
+    "aux_loss_weight": ("--aux-loss-weight",),
+    "aux_min_std": ("--aux-min-std",),
     "pretrained": ("--pretrained",),
     "datapath": ("--datapath",),
     "yield_csv": ("--yield-csv",),
+    "exclude_muni_years": ("--exclude-muni-years",),
     "seed": ("--seed",),
+    "min_coverage_ratio": ("--min-coverage-ratio",),
+    "max_coverage_ratio": ("--max-coverage-ratio",),
+    "train_mid_yield_keep_fraction": ("--train-mid-yield-keep-fraction",),
+    "train_mid_yield_lo": ("--train-mid-yield-lo",),
+    "train_mid_yield_hi": ("--train-mid-yield-hi",),
+    "train_mid_yield_bin_width": ("--train-mid-yield-bin-width",),
+    "min_images": ("--min-images",),
+    "min_months": ("--min-months",),
     "schedule": ("--schedule",),
     "pixel_chunk_size": ("--pixel-chunk-size",),
     "prefetch_chunks": ("--prefetch-chunks",),
+    "chunks_per_grad": ("--chunks-per-grad",),
+    "auto_chunks_per_grad_min": ("--auto-chunks-per-grad-min",),
+    "auto_pixel_chunk_size_min": ("--auto-pixel-chunk-size-min",),
+    "auto_pixel_chunk_size_step": ("--auto-pixel-chunk-size-step",),
+    "auto_chunks_per_grad_vram_frac": ("--auto-chunks-per-grad-vram-frac",),
+    "auto_chunks_per_grad_vram_target_frac": (
+        "--auto-chunks-per-grad-vram-target-frac",
+    ),
+    "auto_chunks_per_grad_narrow_threshold": (
+        "--auto-chunks-per-grad-narrow-threshold",
+    ),
+    "auto_chunks_per_grad_refine_radius": (
+        "--auto-chunks-per-grad-refine-radius",
+    ),
 }
 
 
@@ -110,7 +157,9 @@ def build_training_argv(
     # Required ordering: --target and --harvest-years first (argparse friendly).
     priority = ("target", "harvest_years")
     ordered_keys = [k for k in priority if k in params]
-    ordered_keys += sorted(k for k in params if k not in priority)
+    ordered_keys += sorted(
+        k for k in params if k not in priority and k not in TUNER_ONLY_KEYS
+    )
 
     for key in ordered_keys:
         argv.extend(_param_to_flags(key, params[key]))
@@ -119,11 +168,28 @@ def build_training_argv(
 
 def predict_run_dir(params: dict, *, logdir: str | Path = "./results") -> Path:
     """Predict results folder for a trial from its merged params."""
+    explicit = params.get("run_dir")
+    if explicit:
+        return Path(explicit)
     return run_dir_for_experiment(
         logdir,
         predict_run_name(params),
         params.get("feature_layout", "spectral"),
     )
+
+
+def apply_resume_params(
+    params: dict,
+    resume_checkpoint: Path | str,
+) -> dict:
+    """Return a copy of trial params configured to continue an interrupted run."""
+    out = dict(params)
+    out["pretrained"] = str(Path(resume_checkpoint).resolve())
+    out["overwrite_run"] = False
+    # Never re-fit the shared input scaler on resume; the interrupted run already
+    # had a fitted scaler (or will load the study cache).
+    out["refit_extra_scaler"] = False
+    return out
 
 
 def run_trial_subprocess(
@@ -133,6 +199,7 @@ def run_trial_subprocess(
     repo_root: Path | None = None,
     dry_run: bool = False,
     capture_log: Path | None = None,
+    append_log: bool = False,
 ) -> dict[str, Any]:
     """
     Run one training trial. Returns outcome dict (includes subprocess returncode).
@@ -156,8 +223,14 @@ def run_trial_subprocess(
 
     stdout_path = capture_log
     if stdout_path is not None:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stdout_path, "w", encoding="utf-8") as log_f:
+        ensure_dir(stdout_path.parent, quiet=True)
+        log_mode = "a" if append_log and stdout_path.is_file() else "w"
+        with open(stdout_path, log_mode, encoding="utf-8") as log_f:
+            if log_mode == "a":
+                log_f.write(
+                    f"\n\n=== resumed {datetime.now(timezone.utc).isoformat()} ===\n\n"
+                )
+                log_f.flush()
             proc = subprocess.run(
                 argv,
                 cwd=str(repo_root),

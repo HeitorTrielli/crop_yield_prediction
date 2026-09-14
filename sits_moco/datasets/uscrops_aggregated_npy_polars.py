@@ -8,7 +8,10 @@ Training code loads pixels in chunks on-demand.
 
 from collections import OrderedDict, defaultdict
 from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
+import math
+import random
 from typing import Iterable, Optional
 
 import numpy as np
@@ -18,6 +21,7 @@ from torch.utils.data import Dataset
 
 from .feature_layout import (
     feature_layout_choices,
+    feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
     resolve_feature_layout,
 )
@@ -25,7 +29,6 @@ from .pixel_transform import (
     DOY_CHANNEL,
     NUM_SPECTRAL_CHANNELS,
     PixelTransform,
-    scale_xavier_rain_channels,
 )
 
 
@@ -40,11 +43,497 @@ def _doy_to_season_month(doy, reference_date):
     return season_cal_months.index(cal) + 1
 
 
+@lru_cache(maxsize=8)
+def _season_month_lut(reference_date: date, max_doy: int = 400) -> np.ndarray:
+    """Lookup table: DOY index → season month (0 = outside 6-month window, else 1..6)."""
+    lut = np.zeros(max_doy + 1, dtype=np.int8)
+    for d in range(1, max_doy + 1):
+        lut[d] = _doy_to_season_month(d, reference_date)
+    return lut
+
+
+def _season_months_from_doys(doys: np.ndarray, reference_date: date) -> np.ndarray:
+    """Vectorized season-month mapping for any-shaped DOY array."""
+    lut = _season_month_lut(reference_date)
+    doy_i = np.asarray(doys, dtype=np.int64)
+    doy_i = np.clip(doy_i, 0, lut.shape[0] - 1)
+    return lut[doy_i]
+
+
+# Missing markers stored by preprocess_daily_to_npy.
+NO_DATA_VALUE = -9999
+# Daily .npy DOY is season-relative with day 1 = Oct 1 (see season_start_from_year_range).
+DEFAULT_SEASON_REFERENCE_DATE = date(2000, 10, 1)
+
+
+def pixel_temporal_keep_mask(
+    data: np.ndarray,
+    *,
+    min_images: int = 0,
+    min_months: int = 0,
+    reference_date: Optional[date] = None,
+) -> np.ndarray:
+    """
+    Keep pixels with enough valid daily images and distinct season months.
+
+    A day counts as an image if any spectral band (0..9) is finite and not 0/-9999.
+    Months are season months 1..6 derived from the DOY channel (index 10).
+    """
+    if data.ndim != 3 or data.shape[0] == 0:
+        return np.zeros(data.shape[0] if data.ndim >= 1 else 0, dtype=bool)
+
+    min_images = max(0, int(min_images))
+    min_months = max(0, int(min_months))
+    if min_images <= 0 and min_months <= 0:
+        return np.ones(data.shape[0], dtype=bool)
+
+    spec = data[:, :, :NUM_SPECTRAL_CHANNELS]
+    day_valid = np.any(
+        (spec != NO_DATA_VALUE) & (spec != 0) & np.isfinite(spec),
+        axis=2,
+    )
+    n_images = day_valid.sum(axis=1)
+    keep = n_images >= min_images if min_images > 0 else np.ones(
+        data.shape[0], dtype=bool
+    )
+
+    if min_months > 0:
+        ref = reference_date or DEFAULT_SEASON_REFERENCE_DATE
+        season_m = _season_months_from_doys(data[:, :, DOY_CHANNEL], ref)
+        masked_months = np.where(day_valid, season_m, 0)
+        n_months = np.zeros(data.shape[0], dtype=np.int32)
+        for month in range(1, 7):
+            n_months += np.any(masked_months == month, axis=1)
+        keep &= n_months >= min_months
+
+    return keep
+
+
+# Default: no coverage filter (use all municipality–year rows).
+# Optional suggested band for S2 footprint vs IBGE planted area:
+#   --min-coverage-ratio 0.8 --max-coverage-ratio 1.2
+DEFAULT_MIN_COVERAGE_RATIO = None
+DEFAULT_MAX_COVERAGE_RATIO = None
+SUGGESTED_MIN_COVERAGE_RATIO = 0.8
+SUGGESTED_MAX_COVERAGE_RATIO = 1.2
+COVERAGE_RATIO_COL = "coverage_ratio"
+PRODUCTIVITY_DEV_SOURCE_COL = "yield_t_ha"
+PRODUCTIVITY_DEV_COL = "yield_t_ha_dev"
+YEAR_LOO_HOLDOUT_SPLIT = "holdout"
+
+
+def apply_year_loo_split(yield_df: pl.DataFrame, holdout_year: int) -> pl.DataFrame:
+    """
+    Ignore the CSV split column: train = every year except ``holdout_year``;
+    valid and test both use that year (leave-one-year-out).
+    """
+    if "year" not in yield_df.columns:
+        raise ValueError(
+            "Year leave-one-out requires a 'year' column in the yield CSV"
+        )
+    hy = int(holdout_year)
+    years = sorted(
+        {
+            int(y)
+            for y in yield_df["year"].drop_nulls().to_list()
+            if y is not None
+        }
+    )
+    if hy not in years:
+        raise ValueError(
+            f"--holdout-year {hy} is not in the yield CSV years {years}"
+        )
+    n_hold = len(yield_df.filter(pl.col("year") == hy))
+    n_train = len(yield_df.filter(pl.col("year") != hy))
+    if n_hold == 0:
+        raise ValueError(f"--holdout-year {hy}: no rows in the yield CSV")
+    if n_train == 0:
+        raise ValueError(
+            f"--holdout-year {hy}: no remaining years for training"
+        )
+    print(
+        f"  Year LOO: holdout={hy} → valid=test (n={n_hold}); "
+        f"train=other years (n={n_train})"
+    )
+    return yield_df.with_columns(
+        pl.when(pl.col("year") == hy)
+        .then(pl.lit(YEAR_LOO_HOLDOUT_SPLIT))
+        .otherwise(pl.lit("train"))
+        .alias("split")
+    )
+
+
+def parse_exclude_muni_years(spec: str | None) -> list[tuple[str, int]]:
+    """Parse ``CODE:YEAR,CODE:YEAR`` pairs (IBGE code, harvest year)."""
+    if spec is None:
+        return []
+    text = str(spec).strip()
+    if not text:
+        return []
+    pairs: list[tuple[str, int]] = []
+    for part in text.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"exclude-muni-years item {item!r} must be CODE:YEAR "
+                "(e.g. 4112009:2020)"
+            )
+        code, year_s = item.rsplit(":", 1)
+        code = str(code).strip()
+        if not code:
+            raise ValueError(f"exclude-muni-years item {item!r} has an empty code")
+        pairs.append((code, int(year_s.strip())))
+    return pairs
+
+
+def apply_exclude_muni_years(
+    yield_df: pl.DataFrame,
+    spec: str | None,
+    *,
+    municipality_code_col: str = "municipality_code",
+) -> pl.DataFrame:
+    """Drop specific municipality–harvest-year rows from the yield table."""
+    pairs = parse_exclude_muni_years(spec)
+    if not pairs:
+        return yield_df
+    if municipality_code_col not in yield_df.columns or "year" not in yield_df.columns:
+        raise ValueError(
+            "exclude-muni-years requires municipality_code and year columns"
+        )
+    codes = pl.col(municipality_code_col).cast(pl.Utf8)
+    hit = pl.lit(False)
+    for code, year in pairs:
+        hit = hit | ((codes == code) & (pl.col("year") == int(year)))
+    before = len(yield_df)
+    out = yield_df.filter(~hit)
+    dropped = before - len(out)
+    pretty = ", ".join(f"{c}:{y}" for c, y in pairs)
+    print(f"  Excluded {dropped} municipality–year(s) ({pretty})")
+    return out
+
+
+def ensure_productivity_dev_column(
+    yield_df: pl.DataFrame,
+    *,
+    harvest_years: Iterable[int] | None = None,
+    source_column: str = PRODUCTIVITY_DEV_SOURCE_COL,
+    out_column: str = PRODUCTIVITY_DEV_COL,
+) -> tuple[pl.DataFrame, dict]:
+    """
+    Add ``out_column`` = ``source_column`` − per-year train mean.
+
+    Baselines use ``split == train`` only (after any coverage filter already
+    applied by the caller). Valid/test rows reuse those year means so there is
+    no leakage from held-out labels. Years with no train rows fall back to the
+    global train mean.
+
+    If ``out_column`` already exists, returns the frame unchanged.
+    """
+    if out_column in yield_df.columns:
+        return yield_df, {"already_present": True, "out_column": out_column}
+
+    if source_column not in yield_df.columns:
+        raise ValueError(
+            f"Cannot derive {out_column!r}: missing source column {source_column!r}. "
+            f"Available: {list(yield_df.columns)}"
+        )
+    if "split" not in yield_df.columns:
+        raise ValueError(
+            f"Cannot derive {out_column!r}: yield CSV has no 'split' column. "
+            "Run add_train_valid_test_split.py first."
+        )
+    if "year" not in yield_df.columns:
+        raise ValueError(
+            f"Cannot derive {out_column!r}: yield CSV has no 'year' column."
+        )
+
+    train_df = yield_df.filter(pl.col("split") == "train")
+    if harvest_years is not None:
+        hset = {int(y) for y in harvest_years}
+        train_df = train_df.filter(pl.col("year").is_in(sorted(hset)))
+
+    train_vals = (
+        train_df.select(source_column).drop_nulls()[source_column].to_list()
+    )
+    train_vals = [float(v) for v in train_vals if v is not None and v != ""]
+    if not train_vals:
+        raise ValueError(
+            f"Cannot derive {out_column!r}: no valid train values in {source_column!r}"
+        )
+    global_train_mean = float(np.mean(train_vals))
+
+    year_means: dict[int, float] = {}
+    # Prefer group_by (Polars >=0.19); fall back for older installs.
+    _groupby = getattr(train_df, "group_by", None) or getattr(train_df, "groupby")
+    year_stats = _groupby("year").agg(
+        pl.col(source_column).drop_nulls().mean().alias("year_baseline")
+    )
+    for row in year_stats.iter_rows(named=True):
+        year_val = row["year"]
+        mean_y = row["year_baseline"]
+        if year_val is None or mean_y is None:
+            continue
+        try:
+            year_means[int(year_val)] = float(mean_y)
+        except (TypeError, ValueError):
+            continue
+
+    baseline_df = pl.DataFrame(
+        {
+            "year": list(year_means.keys()),
+            "_year_baseline": list(year_means.values()),
+        }
+    )
+    if len(baseline_df) == 0:
+        out_df = yield_df.with_columns(
+            (pl.col(source_column).cast(pl.Float64) - global_train_mean).alias(
+                out_column
+            )
+        )
+    else:
+        out_df = (
+            yield_df.join(baseline_df, on="year", how="left")
+            .with_columns(
+                pl.col("_year_baseline").fill_null(global_train_mean).alias(
+                    "_year_baseline"
+                )
+            )
+            .with_columns(
+                (
+                    pl.col(source_column).cast(pl.Float64) - pl.col("_year_baseline")
+                ).alias(out_column)
+            )
+            .drop("_year_baseline")
+        )
+
+    meta = {
+        "already_present": False,
+        "out_column": out_column,
+        "source_column": source_column,
+        "baseline": "year_train_mean",
+        "global_train_mean": global_train_mean,
+        "year_train_means": {str(k): v for k, v in sorted(year_means.items())},
+        "n_train_for_baseline": len(train_vals),
+    }
+    print(
+        f"  Derived {out_column} = {source_column} - year_train_mean "
+        f"(global_train_mean={global_train_mean:.4f}, years={sorted(year_means)})"
+    )
+    return out_df, meta
+
+
+def filter_yield_df_by_coverage(
+    yield_df: pl.DataFrame,
+    *,
+    min_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+    column: str = COVERAGE_RATIO_COL,
+) -> pl.DataFrame:
+    """
+    Keep rows whose ``coverage_ratio`` is inside ``[min_ratio, max_ratio]``.
+
+    If ``min_ratio`` and ``max_ratio`` are both None, returns ``yield_df`` unchanged.
+    If the column is missing while a filter is requested, raises ``ValueError``.
+    """
+    if min_ratio is None and max_ratio is None:
+        return yield_df
+    if column not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {column!r} required for coverage filtering. "
+            "Run scripts/compute_imagery_area_coverage.py to add it, "
+            "or pass --no-coverage-filter."
+        )
+
+    before = len(yield_df)
+    expr = pl.col(column).is_not_null()
+    if min_ratio is not None:
+        expr = expr & (pl.col(column) >= float(min_ratio))
+    if max_ratio is not None:
+        expr = expr & (pl.col(column) <= float(max_ratio))
+    filtered = yield_df.filter(expr)
+    after = len(filtered)
+    lo = "-inf" if min_ratio is None else f"{min_ratio:g}"
+    hi = "+inf" if max_ratio is None else f"{max_ratio:g}"
+    print(
+        f"  Coverage filter {column} in [{lo}, {hi}]: "
+        f"kept {after}/{before} rows (dropped {before - after})"
+    )
+    return filtered
+
+
+def filter_yield_pandas_by_coverage(
+    yield_df,
+    *,
+    min_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+    max_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+    column: str = COVERAGE_RATIO_COL,
+):
+    """Pandas equivalent of :func:`filter_yield_df_by_coverage`."""
+    if min_ratio is None and max_ratio is None:
+        return yield_df
+    if column not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {column!r} required for coverage filtering. "
+            "Run scripts/compute_imagery_area_coverage.py to add it, "
+            "or pass --no-coverage-filter."
+        )
+    before = len(yield_df)
+    mask = yield_df[column].notna()
+    if min_ratio is not None:
+        mask &= yield_df[column] >= float(min_ratio)
+    if max_ratio is not None:
+        mask &= yield_df[column] <= float(max_ratio)
+    filtered = yield_df.loc[mask].copy()
+    after = len(filtered)
+    lo = "-inf" if min_ratio is None else f"{min_ratio:g}"
+    hi = "+inf" if max_ratio is None else f"{max_ratio:g}"
+    print(
+        f"  Coverage filter {column} in [{lo}, {hi}]: "
+        f"kept {after}/{before} rows (dropped {before - after})"
+    )
+    return filtered
+
+
+# Mid-band train undersample defaults (disabled unless keep_fraction is set).
+# Suggested: keep ~0.52 of yield ∈ [3.0, 4.25) so mid bins average ~70 rows
+# while preserving relative shape (see entering-productivity-density canvas).
+DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION = None
+DEFAULT_TRAIN_MID_YIELD_LO = 3.0
+DEFAULT_TRAIN_MID_YIELD_HI = 4.25
+DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH = 0.25
+PRODUCTIVITY_YIELD_COL = "yield_t_ha"
+
+
+def undersample_train_mid_yield_band(
+    yield_df: pl.DataFrame,
+    *,
+    keep_fraction: float | None = DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+    yield_lo: float = DEFAULT_TRAIN_MID_YIELD_LO,
+    yield_hi: float = DEFAULT_TRAIN_MID_YIELD_HI,
+    bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+    yield_column: str = PRODUCTIVITY_YIELD_COL,
+    seed: int = 101010,
+    split_column: str = "split",
+    train_value: str = "train",
+) -> pl.DataFrame:
+    """
+    Randomly downscale **train** rows whose yield is in ``[yield_lo, yield_hi)``.
+
+    Uses a uniform keep fraction within each ``bin_width`` slice so the mid-band
+    histogram shape is preserved (not a hard per-bin cap). Valid/test rows and
+    train rows outside the band are never dropped.
+
+    If ``keep_fraction`` is None or >= 1, returns ``yield_df`` unchanged.
+    """
+    if keep_fraction is None:
+        return yield_df
+    keep_fraction = float(keep_fraction)
+    if keep_fraction >= 1.0:
+        return yield_df
+    if keep_fraction < 0.0:
+        raise ValueError(
+            f"train mid-yield keep_fraction must be in [0, 1], got {keep_fraction}"
+        )
+    if yield_column not in yield_df.columns:
+        raise ValueError(
+            f"Yield CSV missing {yield_column!r} required for mid-band undersampling. "
+            f"Available: {list(yield_df.columns)}"
+        )
+    if bin_width <= 0:
+        raise ValueError(f"bin_width must be > 0, got {bin_width}")
+
+    n = len(yield_df)
+    if n == 0:
+        return yield_df
+
+    yields = yield_df[yield_column].to_list()
+    if split_column in yield_df.columns:
+        splits = yield_df[split_column].to_list()
+    else:
+        splits = [train_value] * n
+
+    bins: dict[float, list[int]] = defaultdict(list)
+    keep_mask = [True] * n
+    for i in range(n):
+        if splits[i] != train_value:
+            continue
+        y_raw = yields[i]
+        if y_raw is None or y_raw == "" or y_raw == "-":
+            continue
+        try:
+            yf = float(y_raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(yf):
+            continue
+        if yield_lo <= yf < yield_hi:
+            bin_key = math.floor(yf / float(bin_width)) * float(bin_width)
+            bins[bin_key].append(i)
+            keep_mask[i] = False
+
+    rng = random.Random(int(seed))
+    kept_mid = 0
+    dropped_mid = 0
+    for _bin_key, indices in sorted(bins.items()):
+        rng.shuffle(indices)
+        k = int(round(len(indices) * keep_fraction))
+        k = max(0, min(len(indices), k))
+        for idx in indices[:k]:
+            keep_mask[idx] = True
+        kept_mid += k
+        dropped_mid += len(indices) - k
+
+    before = n
+    filtered = (
+        yield_df.with_columns(pl.Series("_mid_yield_keep", keep_mask))
+        .filter(pl.col("_mid_yield_keep"))
+        .drop("_mid_yield_keep")
+    )
+    after = len(filtered)
+    print(
+        f"  Train mid-yield undersample {yield_column} in [{yield_lo:g}, {yield_hi:g}) "
+        f"keep_fraction={keep_fraction:g} bin_width={bin_width:g} seed={seed}: "
+        f"mid kept {kept_mid}/{kept_mid + dropped_mid} "
+        f"(dropped {dropped_mid}); rows {after}/{before}"
+    )
+    return filtered
+
+
+def filter_yield_pandas_by_mid_yield_undersample(
+    yield_df,
+    *,
+    keep_fraction: float | None = DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+    yield_lo: float = DEFAULT_TRAIN_MID_YIELD_LO,
+    yield_hi: float = DEFAULT_TRAIN_MID_YIELD_HI,
+    bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+    yield_column: str = PRODUCTIVITY_YIELD_COL,
+    seed: int = 101010,
+    split_column: str = "split",
+    train_value: str = "train",
+):
+    """Pandas wrapper around :func:`undersample_train_mid_yield_band`."""
+    if keep_fraction is None or float(keep_fraction) >= 1.0:
+        return yield_df
+    out = undersample_train_mid_yield_band(
+        pl.from_pandas(yield_df),
+        keep_fraction=keep_fraction,
+        yield_lo=yield_lo,
+        yield_hi=yield_hi,
+        bin_width=bin_width,
+        yield_column=yield_column,
+        seed=seed,
+        split_column=split_column,
+        train_value=train_value,
+    )
+    return out.to_pandas()
+
+
 def _indices_first_n_months(row, num_periods, reference_date):
     """Return indices of rows in (T, C) where season month is in 1..num_periods (DOY at channel 10)."""
-    doys = row[:, DOY_CHANNEL].astype(np.float64)
-    months = np.array([_doy_to_season_month(d, reference_date) for d in doys])
-    valid = (months >= 1) & (months <= num_periods)
+    season_m = _season_months_from_doys(row[:, DOY_CHANNEL], reference_date)
+    valid = (season_m >= 1) & (season_m <= num_periods)
     return np.nonzero(valid)[0]
 
 
@@ -75,21 +564,43 @@ class USCropsAggregatedNPY(Dataset):
         target_std=None,
         harvest_years: Optional[Iterable[int]] = None,
         feature_layout: str = "spectral",
-        target_column: str = "production_t",
+        target_column: str | list[str] | tuple[str, ...] = "production_t",
+        npy_cache_size: int = 20,
+        npy_defer_copy: bool = True,  # ignored; always deferred (kept for API compat)
+        min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
+        max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
+        min_images: int = 0,
+        min_months: int = 0,
+        season_reference_date: Optional[date] = None,
+        train_mid_yield_keep_fraction: float | None = DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
+        train_mid_yield_lo: float = DEFAULT_TRAIN_MID_YIELD_LO,
+        train_mid_yield_hi: float = DEFAULT_TRAIN_MID_YIELD_HI,
+        train_mid_yield_bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
+        holdout_year: Optional[int] = None,
+        exclude_muni_years: str | None = None,
+        normalize_targets: bool | None = None,
+        legacy_input_scaling: bool = False,
     ):
         super(USCropsAggregatedNPY, self).__init__()
 
         mode = mode.lower()
         assert mode in ["train", "valid", "eval", "test", "all"]
 
+        self.legacy_input_scaling = bool(legacy_input_scaling)
         self.feature_layout = normalize_feature_layout(feature_layout)
         _lay = resolve_feature_layout(self.feature_layout)
         self.input_feature_dim = int(_lay["input_dim"])
         self._extra_channels_slice: tuple[int, int] | None = _lay[
             "extra_channels_slice"
         ]
-        # Backward-compatible flag for logging / meta
-        self.use_xavier = self._extra_channels_slice == (11, 13)
+        self._soil_sidecar = bool(_lay.get("soil_sidecar")) or feature_layout_needs_soil_sidecar(
+            self.feature_layout
+        )
+        # Backward-compatible flag for logging / meta (any Xavier extras starting at ch 11)
+        self.use_xavier = (
+            self._extra_channels_slice is not None
+            and int(self._extra_channels_slice[0]) == 11
+        )
 
         self.root = Path(root)
         self.year = year
@@ -97,11 +608,41 @@ class USCropsAggregatedNPY(Dataset):
         self.sequencelength = sequencelength
         self.rc = randomchoice
         self.interp = interp
+        self.min_coverage_ratio = min_coverage_ratio
+        self.max_coverage_ratio = max_coverage_ratio
+        self.train_mid_yield_keep_fraction = train_mid_yield_keep_fraction
+        self.train_mid_yield_lo = float(train_mid_yield_lo)
+        self.train_mid_yield_hi = float(train_mid_yield_hi)
+        self.train_mid_yield_bin_width = float(train_mid_yield_bin_width)
+        self.min_images = max(0, int(min_images))
+        self.min_months = max(0, int(min_months))
+        self.season_reference_date = (
+            season_reference_date or DEFAULT_SEASON_REFERENCE_DATE
+        )
+        self._temporal_filter_enabled = self.min_images > 0 or self.min_months > 0
 
-        # Store normalization parameters
+        # Labels are z-scored here when normalize_targets is True (default if
+        # train μ/σ are provided). --head-output raw keeps yield_t_ha as-is.
         self.target_mean = target_mean if target_mean is not None else 0.0
         self.target_std = target_std if target_std is not None else 1.0
-        self.normalize_targets = target_mean is not None and target_std is not None
+        if normalize_targets is None:
+            self.normalize_targets = target_mean is not None and target_std is not None
+        else:
+            self.normalize_targets = bool(normalize_targets) and (
+                target_mean is not None and target_std is not None
+            )
+
+        if isinstance(target_column, (list, tuple)):
+            self.target_columns = list(target_column)
+        else:
+            self.target_columns = [target_column]
+        self.num_outputs = len(self.target_columns)
+        # Backward-compatible single-column attribute
+        self.target_column = (
+            self.target_columns[0]
+            if self.num_outputs == 1
+            else list(self.target_columns)
+        )
 
         # Load yield targets with Polars
         print(f"Loading yield targets from {yield_csv}...")
@@ -113,21 +654,66 @@ class USCropsAggregatedNPY(Dataset):
         )
 
         municipality_code_col = "municipality_code"
-        yield_col = target_column
         cols = list(yield_df.columns)
         if municipality_code_col not in cols:
             raise ValueError(
                 f"Yield CSV missing {municipality_code_col!r}. Available: {cols}"
             )
-        if yield_col not in cols:
-            raise ValueError(f"Yield CSV missing {yield_col!r}. Available: {cols}")
-        self.municipality_code_column = municipality_code_col
-        self.target_column = yield_col
 
         # Convert municipality_code to string and filter by split
         yield_df = yield_df.with_columns(
             pl.col(municipality_code_col).cast(pl.Utf8).alias(municipality_code_col)
         )
+
+        yield_df = filter_yield_df_by_coverage(
+            yield_df,
+            min_ratio=min_coverage_ratio,
+            max_ratio=max_coverage_ratio,
+        )
+
+        # Restrict years before mid-band undersample so keep/drop matches the
+        # municipality–years that actually enter training.
+        if harvest_years is not None and "year" in yield_df.columns:
+            hset = sorted({int(y) for y in harvest_years})
+            before_y = len(yield_df)
+            yield_df = yield_df.filter(pl.col("year").is_in(hset))
+            print(
+                f"  Restricted yield CSV to harvest years {hset}: "
+                f"{len(yield_df)}/{before_y} rows"
+            )
+
+        yield_df = apply_exclude_muni_years(
+            yield_df,
+            exclude_muni_years,
+            municipality_code_col=municipality_code_col,
+        )
+
+        self.holdout_year = int(holdout_year) if holdout_year is not None else None
+        if self.holdout_year is not None:
+            yield_df = apply_year_loo_split(yield_df, self.holdout_year)
+
+        # Train-only mid-band undersample (before productivity_dev baselines / split filter).
+        yield_df = undersample_train_mid_yield_band(
+            yield_df,
+            keep_fraction=train_mid_yield_keep_fraction,
+            yield_lo=self.train_mid_yield_lo,
+            yield_hi=self.train_mid_yield_hi,
+            bin_width=self.train_mid_yield_bin_width,
+            seed=int(seed),
+        )
+
+        self.productivity_dev_meta = None
+        if PRODUCTIVITY_DEV_COL in self.target_columns:
+            yield_df, self.productivity_dev_meta = ensure_productivity_dev_column(
+                yield_df,
+                harvest_years=harvest_years,
+            )
+
+        cols = list(yield_df.columns)
+        for yield_col in self.target_columns:
+            if yield_col not in cols:
+                raise ValueError(f"Yield CSV missing {yield_col!r}. Available: {cols}")
+        self.municipality_code_column = municipality_code_col
 
         # Filter by split (skip filter when mode is "all" to use train/valid/test entries)
         if "split" in yield_df.columns and mode != "all":
@@ -138,6 +724,8 @@ class USCropsAggregatedNPY(Dataset):
                 "test": "test",
             }
             target_split = split_mapping.get(mode, mode)
+            if self.holdout_year is not None and mode in ("valid", "eval", "test"):
+                target_split = YEAR_LOO_HOLDOUT_SPLIT
             yield_df = yield_df.filter(pl.col("split") == target_split)
             print(f"Filtered to {target_split} split: {len(yield_df)} rows")
         elif mode == "all" and "split" in yield_df.columns:
@@ -154,21 +742,33 @@ class USCropsAggregatedNPY(Dataset):
 
         self.split_pairs = set()
         if "year" in yield_df.columns and self.year is None:
-            trip = yield_df.select([municipality_code_col, "year", yield_col]).to_dict()
+            select_cols = [municipality_code_col, "year", *self.target_columns]
+            trip = yield_df.select(select_cols).to_dict()
             self.yield_map = {}
-            for muni_code, year_val, yld in zip(
-                trip[municipality_code_col],
-                trip["year"],
-                trip[yield_col],
-            ):
+            n_rows = len(trip[municipality_code_col])
+            for i in range(n_rows):
+                muni_code = trip[municipality_code_col][i]
+                year_val = trip["year"][i]
                 if year_val is None:
                     continue
                 try:
                     yi = int(year_val)
-                    self.split_pairs.add((str(muni_code), yi))
-                    self.yield_map[(str(muni_code), yi)] = yld
                 except (ValueError, TypeError):
                     continue
+                vals = []
+                for col in self.target_columns:
+                    yld = trip[col][i]
+                    if yld is None or yld == "-" or yld == "":
+                        vals.append(0.0)
+                    else:
+                        try:
+                            vals.append(float(yld))
+                        except (ValueError, TypeError):
+                            vals.append(0.0)
+                self.split_pairs.add((str(muni_code), yi))
+                self.yield_map[(str(muni_code), yi)] = (
+                    vals[0] if self.num_outputs == 1 else vals
+                )
             if harvest_years_set is not None:
                 self.split_pairs = {
                     (m, y) for m, y in self.split_pairs if y in harvest_years_set
@@ -182,18 +782,33 @@ class USCropsAggregatedNPY(Dataset):
                 )
             print(
                 f"Loaded yield targets for {len(self.yield_map)} (municipality, year) entries"
+                f" ({self.num_outputs} head(s): {self.target_columns})"
             )
         else:
-            yield_dict = yield_df.select([municipality_code_col, yield_col]).to_dict()
-            self.yield_map = dict(
-                zip(yield_dict[municipality_code_col], yield_dict[yield_col])
-            )
+            select_cols = [municipality_code_col, *self.target_columns]
+            yield_dict = yield_df.select(select_cols).to_dict()
+            self.yield_map = {}
+            for i, muni_code in enumerate(yield_dict[municipality_code_col]):
+                vals = []
+                for col in self.target_columns:
+                    yld = yield_dict[col][i]
+                    if yld is None or yld == "-" or yld == "":
+                        vals.append(0.0)
+                    else:
+                        try:
+                            vals.append(float(yld))
+                        except (ValueError, TypeError):
+                            vals.append(0.0)
+                self.yield_map[str(muni_code)] = (
+                    vals[0] if self.num_outputs == 1 else vals
+                )
             if harvest_years_set is not None:
                 raise ValueError(
                     "harvest_years filter requires year=None and a 'year' column in the yield CSV"
                 )
             print(
                 f"Loaded yield targets for {len(self.yield_map)} municipality entries"
+                f" ({self.num_outputs} head(s): {self.target_columns})"
             )
 
         # Build cached mapping: year -> list of year-dir Paths, or detect "flat" structure
@@ -371,11 +986,14 @@ class USCropsAggregatedNPY(Dataset):
         )
         total_pixels = sum(self.municipality_pixel_counts.values())
         print(f"Total pixels: {total_pixels:,}")
+        n_layouts = len(feature_layout_choices())
         print(
             f"Feature layout: {self.feature_layout!r} → STNet input_dim={self.input_feature_dim} "
-            f"(choices: {', '.join(feature_layout_choices())})"
+            f"({n_layouts} registered layouts)"
         )
         self._validate_npy_channel_requirement()
+        if self._soil_sidecar:
+            self._validate_soil_sidecar_requirement()
 
         self.pixel_transform = PixelTransform(
             sequencelength,
@@ -383,11 +1001,70 @@ class USCropsAggregatedNPY(Dataset):
             randomchoice=randomchoice,
             interp=interp,
             seed=seed,
+            legacy_input_scaling=self.legacy_input_scaling,
         )
+        if self.legacy_input_scaling:
+            print(
+                "Input scaling: legacy hardcoded SPECTRAL_MEAN/STD + Xavier divisors "
+                "(no train_input_scaler.json)"
+            )
+        if self._soil_sidecar:
+            print(
+                "  Soil sidecars: enabled "
+                f"(layout {self.feature_layout!r} → +4 channels from {{code}}_soil.npy)"
+            )
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
         self.npy_cache = OrderedDict()
-        self.npy_cache_max_size = 20
+        self.npy_cache_max_size = int(npy_cache_size)
+        self.soil_cache = OrderedDict()
+        self._temporal_keep_cache: OrderedDict = OrderedDict()
+        self._temporal_keep_cache_max = 64
+
+        if self._temporal_filter_enabled:
+            print(
+                f"  Temporal pixel filter: min_images>={self.min_images}, "
+                f"min_months>={self.min_months} "
+                f"(season_reference={self.season_reference_date.isoformat()})"
+            )
+            raw_total = sum(municipality_pixel_counts.values())
+            filtered_counts = {}
+            dropped_keys = []
+            for key, _raw_n in municipality_pixel_counts.items():
+                if isinstance(key, tuple):
+                    code, year_key = key
+                else:
+                    code, year_key = key, municipality_years.get(key)
+                data = self.mmap_municipality(code, year=year_key)
+                if data is None:
+                    dropped_keys.append(key)
+                    continue
+                kept = int(self._temporal_keep_mask(data).sum())
+                if kept <= 0:
+                    dropped_keys.append(key)
+                    continue
+                filtered_counts[key] = kept
+            for key in dropped_keys:
+                municipality_pixel_counts.pop(key, None)
+                municipality_years.pop(key, None)
+            municipality_pixel_counts.update(filtered_counts)
+            self.municipality_list = sorted(municipality_pixel_counts.keys())
+            self.municipality_pixel_counts = municipality_pixel_counts
+            self.municipality_years = municipality_years
+            self.use_multi_year = bool(self.municipality_list) and isinstance(
+                self.municipality_list[0], tuple
+            )
+            kept_total = sum(municipality_pixel_counts.values())
+            print(
+                f"  Temporal filter kept {kept_total:,}/{raw_total:,} pixels "
+                f"across {len(self.municipality_list)} municipality–years "
+                f"(dropped {len(dropped_keys)} empty after filter)"
+            )
+            print(
+                f"Found {len(self.municipality_list)} municipalities with pixels and yield data"
+            )
+            total_pixels = sum(self.municipality_pixel_counts.values())
+            print(f"Total pixels: {total_pixels:,}")
 
     @property
     def is_single_season(self):
@@ -412,16 +1089,64 @@ class USCropsAggregatedNPY(Dataset):
                 return candidate
         return None
 
+    def _resolve_soil_path(self, municipality_code, year):
+        """Return Path to {code}_soil.npy sidecar beside the time-series .npy."""
+        npy_path = self._resolve_npy_path(municipality_code, year)
+        if npy_path is None:
+            return None
+        soil = npy_path.with_name(f"{npy_path.stem}_soil.npy")
+        return soil if soil.is_file() else None
+
+    def _validate_soil_sidecar_requirement(self) -> None:
+        """Drop municipality–years missing {code}_soil.npy when layout needs soil."""
+        dropped: list[tuple[object, str]] = []
+        keep: list = []
+        for key in self.municipality_list:
+            if isinstance(key, tuple):
+                code, year = key
+            else:
+                code = key
+                year = self.municipality_years.get(code, self.year)
+            npy = self._resolve_npy_path(code, year)
+            soil = self._resolve_soil_path(code, year)
+            if npy is not None and soil is None:
+                dropped.append((key, str(npy.with_name(f"{npy.stem}_soil.npy"))))
+                continue
+            keep.append(key)
+
+        if dropped:
+            for key, _path in dropped:
+                self.municipality_pixel_counts.pop(key, None)
+                self.municipality_years.pop(key, None)
+            self.municipality_list = sorted(keep)
+            examples = "; ".join(path for _, path in dropped[:3])
+            print(
+                f"  Dropped {len(dropped)} municipality–year(s) missing soil sidecar "
+                f"(layout {self.feature_layout!r}), e.g. {examples}"
+            )
+
+        if not self.municipality_list:
+            examples = "; ".join(path for _, path in dropped[:5])
+            raise ValueError(
+                f"Feature layout {self.feature_layout!r} requires {{code}}_soil.npy "
+                f"sidecars next to each .npy. Build them with "
+                f"data_download/build_mapbiomas_solo_sidecars.py. Missing e.g.: {examples}"
+            )
+
     def _validate_npy_channel_requirement(self) -> None:
-        """Ensure on-disk .npy files have enough channels for the chosen layout."""
+        """Drop municipality–years whose .npy is too narrow for the layout.
+
+        2019-2020 mega-pixel files are often rain-only (C=13). Layouts that
+        need climate extras (C=17) skip those files instead of aborting a
+        mixed-year loader. An empty split after filtering is an error.
+        """
         if self._extra_channels_slice is None:
             return
         _, hi = self._extra_channels_slice
-        bad: list[tuple[str, int]] = []
+        dropped: list[tuple[object, str, int]] = []
         checked = 0
+        keep: list = []
         for key in self.municipality_list:
-            if checked >= 120:
-                break
             if isinstance(key, tuple):
                 code, year = key
             else:
@@ -429,33 +1154,188 @@ class USCropsAggregatedNPY(Dataset):
                 year = self.municipality_years.get(code, self.year)
             p = self._resolve_npy_path(code, year)
             if p is None or not p.is_file():
+                keep.append(key)
                 continue
-            checked += 1
             try:
                 data = np.load(p, mmap_mode="r")
                 if data.ndim < 3:
+                    keep.append(key)
                     continue
                 c = int(data.shape[2])
+                checked += 1
                 if c < hi:
-                    bad.append((str(p), c))
+                    dropped.append((key, str(p), c))
+                    continue
             except OSError:
+                keep.append(key)
                 continue
-        if bad:
-            examples = "; ".join(f"{path} (C={c})" for path, c in bad[:5])
+            keep.append(key)
+
+        if dropped:
+            for key, _path, _c in dropped:
+                self.municipality_pixel_counts.pop(key, None)
+                self.municipality_years.pop(key, None)
+            self.municipality_list = sorted(keep)
+            examples = "; ".join(f"{path} (C={c})" for _, path, c in dropped[:3])
+            print(
+                f"  Dropped {len(dropped)} municipality–year(s) with C<{hi} "
+                f"(layout {self.feature_layout!r} needs extras at "
+                f"{self._extra_channels_slice}), e.g. {examples}"
+            )
+
+        if not self.municipality_list:
+            examples = "; ".join(f"{path} (C={c})" for _, path, c in dropped[:5])
             raise ValueError(
-                f"Feature layout {self.feature_layout!r} requires each .npy to have at least {hi} channels "
-                f"(extra fields at indices {self._extra_channels_slice}). "
-                f"Found files with fewer channels, e.g.: {examples}. "
-                f"Use --feature-layout spectral or rebuild .npy with the extra channels."
+                f"Feature layout {self.feature_layout!r} needs at least {hi} "
+                f"channels per .npy (extras at {self._extra_channels_slice}), "
+                f"but every file in this split is narrower. "
+                f"Rebuild that season with climate extras "
+                f"(data_download/append_xavier_climate_to_npy.py), e.g.: {examples}"
             )
         if checked == 0 and len(self.municipality_list) > 0:
             print(
                 f"  ⚠️  Could not read any .npy to verify channel count for layout {self.feature_layout!r}."
             )
 
-    def _transform_chunk(self, chunk_arr):
+    def _transform_chunk(self, chunk_arr, soil=None):
         """Vectorized transform (delegates to PixelTransform — same as training)."""
-        return self.pixel_transform.transform_chunk(chunk_arr)
+        return self.pixel_transform.transform_chunk(chunk_arr, soil=soil)
+
+    def _temporal_keep_mask(self, municipality_data) -> np.ndarray:
+        """Boolean keep-mask for temporal image/month thresholds."""
+        if not self._temporal_filter_enabled:
+            return np.ones(len(municipality_data), dtype=bool)
+        # Compute in chunks so large mmap files do not fully materialize at once.
+        n = len(municipality_data)
+        keep = np.zeros(n, dtype=bool)
+        step = 8192
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            chunk = np.asarray(municipality_data[start:end], dtype=np.float32)
+            keep[start:end] = pixel_temporal_keep_mask(
+                chunk,
+                min_images=self.min_images,
+                min_months=self.min_months,
+                reference_date=self.season_reference_date,
+            )
+        return keep
+
+    def filter_municipality_data(self, municipality_data, *, cache_key=None, soil=None):
+        """
+        Return municipality pixels after optional min_images / min_months filter.
+
+        When ``soil`` is passed, returns ``(data, soil)`` with the same keep-index.
+        Otherwise returns data only.
+        """
+        data_out, soil_out = self.filter_municipality_pair(
+            municipality_data, soil, cache_key=cache_key
+        )
+        if soil is not None:
+            return data_out, soil_out
+        return data_out
+
+    def filter_municipality_pair(
+        self, municipality_data, soil=None, *, cache_key=None
+    ):
+        """Filter time-series rows and aligned soil rows with the same keep-index."""
+        if municipality_data is None or len(municipality_data) == 0:
+            empty_soil = None if soil is None else soil[:0]
+            return municipality_data, empty_soil
+        if soil is not None and len(soil) != len(municipality_data):
+            raise ValueError(
+                f"soil N={len(soil)} != municipality_data N={len(municipality_data)}"
+            )
+        if not self._temporal_filter_enabled:
+            return municipality_data, soil
+
+        idx = None
+        if cache_key is not None:
+            cached = self._temporal_keep_cache.get(cache_key)
+            if cached is not None:
+                self._temporal_keep_cache.move_to_end(cache_key)
+                idx = cached
+        if idx is None:
+            keep = self._temporal_keep_mask(municipality_data)
+            idx = np.flatnonzero(keep)
+            if cache_key is not None:
+                if len(self._temporal_keep_cache) >= self._temporal_keep_cache_max:
+                    self._temporal_keep_cache.popitem(last=False)
+                self._temporal_keep_cache[cache_key] = idx
+
+        if idx.size == 0:
+            empty_data = municipality_data[:0]
+            empty_soil = None if soil is None else soil[:0]
+            return empty_data, empty_soil
+        if idx.size == len(municipality_data):
+            return municipality_data, soil
+        data_out = np.ascontiguousarray(municipality_data[idx])
+        soil_out = None if soil is None else np.ascontiguousarray(soil[idx])
+        return data_out, soil_out
+
+    def _resolve_load_year(self, municipality_code, year=None):
+        """Return the harvest year used to locate a municipality .npy file."""
+        if year is None and self._flat_season:
+            return self.year if self.year is not None else 2023
+        if year is None:
+            if self.year is not None:
+                return self.year
+            if self.use_multi_year:
+                for y, _ in self._year_dir_tuples:
+                    if self._resolve_npy_path(municipality_code, y) is not None:
+                        return y
+                return None
+            if municipality_code in self.municipality_years:
+                return self.municipality_years[municipality_code]
+            for y, _ in self._year_dir_tuples:
+                if self._resolve_npy_path(municipality_code, y) is not None:
+                    return y
+            return None
+        return year
+
+    def mmap_municipality(self, municipality_code, year=None):
+        """Memory-map a municipality .npy array (LRU-cached). Returns None if missing."""
+        year = self._resolve_load_year(municipality_code, year)
+        if year is None:
+            return None
+        muni_npy_file = self._resolve_npy_path(municipality_code, year)
+        if muni_npy_file is None:
+            return None
+
+        if self.npy_cache_max_size <= 0:
+            municipality_data = np.load(muni_npy_file, mmap_mode="r")
+        else:
+            if muni_npy_file not in self.npy_cache:
+                if len(self.npy_cache) >= self.npy_cache_max_size:
+                    self.npy_cache.popitem(last=False)
+                self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
+            self.npy_cache.move_to_end(muni_npy_file)
+            municipality_data = self.npy_cache[muni_npy_file]
+        if len(municipality_data) == 0:
+            return None
+        return municipality_data
+
+    def mmap_soil(self, municipality_code, year=None):
+        """Memory-map {code}_soil.npy [N,4] (LRU-cached). None if missing / unused."""
+        if not self._soil_sidecar:
+            return None
+        year = self._resolve_load_year(municipality_code, year)
+        if year is None:
+            return None
+        soil_path = self._resolve_soil_path(municipality_code, year)
+        if soil_path is None:
+            return None
+        if self.npy_cache_max_size <= 0:
+            soil = np.load(soil_path, mmap_mode="r")
+        else:
+            if soil_path not in self.soil_cache:
+                if len(self.soil_cache) >= self.npy_cache_max_size:
+                    self.soil_cache.popitem(last=False)
+                self.soil_cache[soil_path] = np.load(soil_path, mmap_mode="r")
+            self.soil_cache.move_to_end(soil_path)
+            soil = self.soil_cache[soil_path]
+        if soil.ndim != 2 or soil.shape[0] == 0:
+            return None
+        return soil
 
     def load_pixels_from_municipality(
         self, municipality_code, year=None, chunk_size=10000
@@ -467,56 +1347,181 @@ class USCropsAggregatedNPY(Dataset):
             year: Year to load (required if use_multi_year=True, optional otherwise)
             chunk_size: Number of pixels per chunk
         """
-        # Determine which year to use
-        if year is None and self._flat_season:
-            # One season folder (e.g. 2020-2021/4100103/4100103.npy); year is only for yield lookup
-            year = self.year if self.year is not None else 2023
-        elif year is None:
-            if self.year is not None:
-                year = self.year
-            elif self.use_multi_year:
-                # Fallback: try each year (cached) until we find a file
-                for y, _ in self._year_dir_tuples:
-                    if self._resolve_npy_path(municipality_code, y) is not None:
-                        year = y
-                        break
-                if year is None:
-                    return  # No file found
-            else:
-                # Single-year mode: use stored year
-                if municipality_code in self.municipality_years:
-                    year = self.municipality_years[municipality_code]
-                else:
-                    for y, _ in self._year_dir_tuples:
-                        if self._resolve_npy_path(municipality_code, y) is not None:
-                            year = y
-                            break
-                    if year is None:
-                        return  # No file found
-
-        muni_npy_file = self._resolve_npy_path(municipality_code, year)
-        if muni_npy_file is None:
-            return  # No .npy found for this (municipality, year)
-
-        if self.npy_cache_max_size <= 0:
-            municipality_data = np.load(muni_npy_file, mmap_mode="r")
+        municipality_data = self.mmap_municipality(municipality_code, year=year)
+        if municipality_data is None:
+            return
+        year_resolved = self._resolve_load_year(municipality_code, year)
+        cache_key = self._resolve_npy_path(municipality_code, year_resolved)
+        soil = self.mmap_soil(municipality_code, year=year_resolved)
+        if self._soil_sidecar:
+            if soil is None:
+                return
+            if len(soil) != len(municipality_data):
+                raise ValueError(
+                    f"Soil sidecar N={len(soil)} != npy N={len(municipality_data)} "
+                    f"for {municipality_code} year={year_resolved}"
+                )
+            municipality_data, soil = self.filter_municipality_pair(
+                municipality_data, soil, cache_key=cache_key
+            )
         else:
-            if muni_npy_file not in self.npy_cache:
-                if len(self.npy_cache) >= self.npy_cache_max_size:
-                    self.npy_cache.popitem(last=False)
-                self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
-
-            # LRU: move to end so this file is evicted last
-            self.npy_cache.move_to_end(muni_npy_file)
-            municipality_data = self.npy_cache[muni_npy_file]
-        if len(municipality_data) == 0:
+            municipality_data = self.filter_municipality_data(
+                municipality_data, cache_key=cache_key
+            )
+        if municipality_data is None or len(municipality_data) == 0:
             return
 
         num_pixels = len(municipality_data)
         for start in range(0, num_pixels, chunk_size):
             end = min(start + chunk_size, num_pixels)
-            chunk_arr = np.asarray(municipality_data[start:end], dtype=np.float32)
-            yield self._transform_chunk(chunk_arr)
+            soil_chunk = None if soil is None else soil[start:end]
+            yield self._transform_chunk(
+                municipality_data[start:end], soil=soil_chunk
+            )
+
+    def _pack_sorted_in_season_chunk(
+        self,
+        chunk_arr: np.ndarray,
+        reference_date: date,
+        *,
+        max_periods: int = 6,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        Sort in-season days by DOY (vectorized).
+
+        Season months are non-decreasing in DOY (Oct=1 … Mar=6), so the
+        incomplete-series cut for month ``k`` is a prefix of this packing.
+        Returns ``(gathered [N,T,C], season_sorted [N,T])`` or None if empty.
+        """
+        if chunk_arr.size == 0:
+            return None
+        if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
+            chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
+        season_lut = _season_month_lut(reference_date)
+        doy_i = np.clip(
+            chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
+            0,
+            season_lut.shape[0] - 1,
+        )
+        season_m = season_lut[doy_i]
+        in_season = (season_m >= 1) & (season_m <= int(max_periods))
+        if not np.any(in_season):
+            return None
+        # Push out-of-season timesteps to the end so a prefix is the filtered series.
+        sort_key = np.where(in_season, doy_i, np.iinfo(np.int64).max)
+        order = np.argsort(sort_key, axis=1, kind="stable")
+        gathered = np.take_along_axis(chunk_arr, order[:, :, None], axis=1)
+        season_sorted = np.take_along_axis(season_m, order, axis=1)
+        return gathered, season_sorted
+
+    def _yield_period_transforms_from_packed(
+        self,
+        gathered: np.ndarray,
+        season_sorted: np.ndarray,
+        num_periods: int,
+        soil: np.ndarray | None = None,
+    ):
+        """Yield STNet batches for one k from a DOY-sorted in-season packing."""
+        k = int(num_periods)
+        counts = ((season_sorted >= 1) & (season_sorted <= k)).sum(axis=1)
+        # Keep earliest sequencelength days (matches incomplete-series docstring).
+        counts_eff = np.minimum(counts, int(self.sequencelength))
+        for length in np.unique(counts_eff):
+            length = int(length)
+            if length <= 0:
+                continue
+            idx = np.flatnonzero(counts_eff == length)
+            if idx.size == 0:
+                continue
+            stacked = np.ascontiguousarray(gathered[idx, :length])
+            soil_chunk = None if soil is None else np.ascontiguousarray(soil[idx])
+            yield self._transform_chunk(stacked, soil=soil_chunk)
+
+    def iter_period_pixel_chunks_from_data(
+        self,
+        municipality_data,
+        *,
+        num_periods: int,
+        chunk_size: int,
+        reference_date: date,
+        cache_key=None,
+        soil=None,
+    ):
+        """Yield batched STNet inputs after incomplete-series month filtering."""
+        if self._soil_sidecar and soil is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires soil sidecar rows "
+                "aligned with municipality_data"
+            )
+        municipality_data, soil = self.filter_municipality_pair(
+            municipality_data, soil, cache_key=cache_key
+        )
+        if municipality_data is None or len(municipality_data) == 0:
+            return
+
+        num_pixels = len(municipality_data)
+        for start in range(0, num_pixels, chunk_size):
+            end = min(start + chunk_size, num_pixels)
+            chunk_view = municipality_data[start:end]
+            soil_view = None if soil is None else soil[start:end]
+            packed = self._pack_sorted_in_season_chunk(
+                chunk_view, reference_date, max_periods=int(num_periods)
+            )
+            if packed is None:
+                continue
+            gathered, season_sorted = packed
+            yield from self._yield_period_transforms_from_packed(
+                gathered, season_sorted, num_periods, soil=soil_view
+            )
+
+    def iter_multiperiod_pixel_chunks_from_data(
+        self,
+        municipality_data,
+        *,
+        period_list: list[int] | tuple[int, ...],
+        chunk_size: int,
+        reference_date: date,
+        cache_key=None,
+        soil=None,
+    ):
+        """
+        Yield ``(num_periods, STNet_chunk)`` for every k in ``period_list``.
+
+        Reads / sorts each pixel block once (full 6-month window), then takes
+        DOY-sorted prefixes for each k. Avoids the old 6× remmap + per-pixel loop.
+        """
+        periods = sorted({int(k) for k in period_list if int(k) >= 1})
+        if not periods:
+            return
+        if self._soil_sidecar and soil is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires soil sidecar rows "
+                "aligned with municipality_data"
+            )
+        municipality_data, soil = self.filter_municipality_pair(
+            municipality_data, soil, cache_key=cache_key
+        )
+        if municipality_data is None or len(municipality_data) == 0:
+            return
+
+        max_periods = max(periods)
+        num_pixels = len(municipality_data)
+        for start in range(0, num_pixels, chunk_size):
+            end = min(start + chunk_size, num_pixels)
+            soil_view = None if soil is None else soil[start:end]
+            packed = self._pack_sorted_in_season_chunk(
+                municipality_data[start:end],
+                reference_date,
+                max_periods=max_periods,
+            )
+            if packed is None:
+                continue
+            gathered, season_sorted = packed
+            for num_periods in periods:
+                for pixel_chunk in self._yield_period_transforms_from_packed(
+                    gathered, season_sorted, num_periods, soil=soil_view
+                ):
+                    yield int(num_periods), pixel_chunk
 
     def load_pixels_from_municipality_with_periods(
         self, municipality_code, year, num_periods, chunk_size=400, reference_date=None
@@ -526,80 +1531,24 @@ class USCropsAggregatedNPY(Dataset):
         sorted by DOY. If more than `sequencelength` days remain, the first `sequencelength` (earliest
         in season) are kept. Otherwise the sequence is padded to `sequencelength`.
         reference_date: date where DOY 1 falls (e.g. date(2022, 10, 1)). No random subsampling.
-        Yields lists of 4-tuples (x_pad, mask, doy_pad, weight_pad) like load_pixels_from_municipality.
+        Yields batched 4-tuples (x, mask, doy, weight) like load_pixels_from_municipality.
         """
         if reference_date is None:
             reference_date = date(2022, 10, 1)
-        if year is None and not self._flat_season:
-            if self.year is not None:
-                year = self.year
-            elif self.use_multi_year:
-                for y, _ in self._year_dir_tuples:
-                    if self._resolve_npy_path(municipality_code, y) is not None:
-                        year = y
-                        break
-                if year is None:
-                    return
-            else:
-                if municipality_code in self.municipality_years:
-                    year = self.municipality_years[municipality_code]
-                else:
-                    for y, _ in self._year_dir_tuples:
-                        if self._resolve_npy_path(municipality_code, y) is not None:
-                            year = y
-                            break
-                    if year is None:
-                        return
-        if year is None and self._flat_season:
-            year = 2023  # dummy; path resolution ignores it in flat mode
-
-        muni_npy_file = self._resolve_npy_path(municipality_code, year)
-        if muni_npy_file is None:
+        municipality_data = self.mmap_municipality(municipality_code, year=year)
+        if municipality_data is None:
             return
-
-        if muni_npy_file not in self.npy_cache:
-            if len(self.npy_cache) >= self.npy_cache_max_size:
-                self.npy_cache.popitem(last=False)
-            self.npy_cache[muni_npy_file] = np.load(muni_npy_file, mmap_mode="r")
-        self.npy_cache.move_to_end(muni_npy_file)
-        municipality_data = self.npy_cache[muni_npy_file]
-        if len(municipality_data) == 0:
-            return
-
-        num_pixels = len(municipality_data)
-        for start in range(0, num_pixels, chunk_size):
-            end = min(start + chunk_size, num_pixels)
-            chunk_arr = np.asarray(municipality_data[start:end], dtype=np.float32)
-            N = chunk_arr.shape[0]
-            # All images in first num_periods months (1, 1–2, 1–3, …) per pixel
-            filtered = []
-            for i in range(N):
-                idx = _indices_first_n_months(chunk_arr[i], num_periods, reference_date)
-                if len(idx) == 0:
-                    filtered.append(None)
-                    continue
-                sub = chunk_arr[i, idx, :]
-                doys = sub[:, DOY_CHANNEL].astype(np.float64)
-                sub = sub[np.argsort(doys, kind="stable"), :]
-                filtered.append(sub)
-            by_len = defaultdict(list)
-            for i in range(N):
-                if filtered[i] is not None:
-                    by_len[filtered[i].shape[0]].append(i)
-            result = [None] * N
-            for k, indices in by_len.items():
-                stacked = np.asarray([filtered[i] for i in indices], dtype=np.float32)
-                batch_x, batch_mask, batch_doy, batch_weight = self._transform_chunk(
-                    stacked
-                )
-                for j, i in enumerate(indices):
-                    result[i] = (
-                        batch_x[j],
-                        batch_mask[j],
-                        batch_doy[j],
-                        batch_weight[j],
-                    )
-            yield [r for r in result if r is not None]
+        year_resolved = self._resolve_load_year(municipality_code, year)
+        cache_key = self._resolve_npy_path(municipality_code, year_resolved)
+        soil = self.mmap_soil(municipality_code, year=year_resolved)
+        yield from self.iter_period_pixel_chunks_from_data(
+            municipality_data,
+            num_periods=num_periods,
+            chunk_size=chunk_size,
+            reference_date=reference_date,
+            cache_key=cache_key,
+            soil=soil,
+        )
 
     def __len__(self):
         return len(self.municipality_list)
@@ -621,21 +1570,39 @@ class USCropsAggregatedNPY(Dataset):
             target = self.yield_map[(municipality_code, year)]
         else:
             target = self.yield_map[municipality_code]
-        # Handle null/NaN values (Polars uses None for null)
-        if target is None or target == "-" or target == "":
-            target = 0.0
-        else:
-            try:
-                target = float(target)
-            except (ValueError, TypeError):
-                target = 0.0
 
+        if self.num_outputs == 1:
+            if target is None or target == "-" or target == "":
+                target_vec = [0.0]
+            else:
+                try:
+                    target_vec = [float(target)]
+                except (ValueError, TypeError):
+                    target_vec = [0.0]
+        else:
+            target_vec = []
+            raw = target if isinstance(target, (list, tuple)) else [target]
+            for v in raw:
+                if v is None or v == "-" or v == "":
+                    target_vec.append(0.0)
+                else:
+                    try:
+                        target_vec.append(float(v))
+                    except (ValueError, TypeError):
+                        target_vec.append(0.0)
+
+        target_t = torch.tensor(target_vec, dtype=torch.float32)
         if self.normalize_targets:
-            target = (target - self.target_mean) / self.target_std
+            mean = torch.as_tensor(self.target_mean, dtype=torch.float32)
+            std = torch.as_tensor(self.target_std, dtype=torch.float32)
+            target_t = (target_t - mean) / std
+
+        if self.num_outputs == 1:
+            target_t = target_t.squeeze(0)
 
         return (
             municipality_code,
-            torch.tensor(target, dtype=torch.float32),
+            target_t,
             num_pixels,
             year,
         )

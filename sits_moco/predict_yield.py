@@ -11,7 +11,12 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from datasets import USCropsAggregatedNPY
+from datasets import (
+    DEFAULT_MAX_COVERAGE_RATIO,
+    DEFAULT_MIN_COVERAGE_RATIO,
+    USCropsAggregatedNPY,
+    filter_yield_pandas_by_coverage,
+)
 from datasets.feature_layout import (
     feature_layout_choices,
     feature_layout_input_dim,
@@ -28,7 +33,9 @@ from run_paths import (
 from utils_aggregated import (
     aggregate_municipality_from_pixel_chunks,
     regression_metrics,
+    resolve_head_output,
     resolve_inference_target,
+    resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -148,6 +155,26 @@ def parse_args():
             + ", ".join(feature_layout_choices())
         ),
     )
+    parser.add_argument(
+        "--min-coverage-ratio",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE_RATIO,
+        help=(
+            "Keep rows with coverage_ratio >= this (default: no filter). "
+            "Example: --min-coverage-ratio 0.8 --max-coverage-ratio 1.2"
+        ),
+    )
+    parser.add_argument(
+        "--max-coverage-ratio",
+        type=float,
+        default=DEFAULT_MAX_COVERAGE_RATIO,
+        help="Keep rows with coverage_ratio <= this (default: no filter)",
+    )
+    parser.add_argument(
+        "--no-coverage-filter",
+        action="store_true",
+        help="Do not filter yield CSV rows by coverage_ratio (default behavior)",
+    )
     args = parser.parse_args()
 
     args.checkpoint = resolve_checkpoint_path(args.checkpoint)
@@ -163,6 +190,9 @@ def parse_args():
     args.yield_csv = Path(args.yield_csv).expanduser()
     if args.feature_layout is not None:
         normalize_feature_layout(args.feature_layout)
+    if args.no_coverage_filter:
+        args.min_coverage_ratio = None
+        args.max_coverage_ratio = None
 
     return args, run_config
 
@@ -175,13 +205,23 @@ def predict_municipality(
     device,
     year=None,
     aggregation: str = "sum",
+    *,
+    head_output: str = "raw",
+    target_mean=None,
+    target_std=None,
 ):
     """Predict yield via USCropsAggregatedNPY (same transform as training)."""
     chunks = dataset.load_pixels_from_municipality(
         municipality_code, year=year, chunk_size=chunk_size
     )
     return aggregate_municipality_from_pixel_chunks(
-        model, chunks, device, aggregation=aggregation
+        model,
+        chunks,
+        device,
+        aggregation=aggregation,
+        head_output=head_output,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
 
@@ -224,6 +264,7 @@ def main():
     )
     target_mean = checkpoint.get("target_mean", 0.0)
     target_std = checkpoint.get("target_std", 1.0)
+    head_output = resolve_head_output(checkpoint, run_config)
     print(
         f"Run config: {run_config['config_path']} (session {run_config['session_index']})"
     )
@@ -231,16 +272,18 @@ def main():
         f"Target: {target} ({target_column}, {aggregation} over pixels, {target_unit})"
     )
     print(
-        f"Training normalization stats (for reference): mean={target_mean:.2f}, std={target_std:.2f}"
+        f"Head output: {head_output} (denorm with mean={target_mean:.2f}, std={target_std:.2f})"
     )
 
     # Create model
     print("Creating model...")
     device = torch.device(args.device)
+    model_kw = resolve_model_kwargs(run_config, checkpoint)
     model = STNetRegression(
         input_dim=input_dim,
         num_outputs=1,
         max_seq_len=args.sequencelength,
+        **model_kw,
     ).to(device)
 
     # Load model weights
@@ -269,6 +312,8 @@ def main():
         seed=args.seed,
         feature_layout=feature_layout,
         target_column=target_column,
+        min_coverage_ratio=args.min_coverage_ratio,
+        max_coverage_ratio=args.max_coverage_ratio,
     )
 
     # Get list of municipalities to predict
@@ -297,6 +342,11 @@ def main():
             f"(from {args.yield_csv.name}) ∩ .npy under {args.datapath}"
         )
         ydf = pd.read_csv(args.yield_csv)
+        ydf = filter_yield_pandas_by_coverage(
+            ydf,
+            min_ratio=args.min_coverage_ratio,
+            max_ratio=args.max_coverage_ratio,
+        )
         muni_code_col = "municipality_code"
         year_col = "year"
         if muni_code_col not in ydf.columns:
@@ -330,6 +380,11 @@ def main():
             raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
         print(f"Loading yield CSV from {args.yield_csv}...")
         yield_df = pd.read_csv(args.yield_csv)
+        yield_df = filter_yield_pandas_by_coverage(
+            yield_df,
+            min_ratio=args.min_coverage_ratio,
+            max_ratio=args.max_coverage_ratio,
+        )
         muni_code_col = "municipality_code"
         if muni_code_col not in yield_df.columns:
             raise ValueError(
@@ -400,12 +455,12 @@ def main():
             args.chunk_size,
             device,
             aggregation=aggregation,
+            head_output=head_output,
+            target_mean=target_mean,
+            target_std=target_std,
         )
 
         if prediction is not None:
-            # Model outputs are already in original scale (tons)
-            # The normalization (target_mean, target_std) was only used during training
-            # to normalize targets for loss computation, but model outputs raw values
             results.append(
                 {
                     "municipality_code": municipality_code,
@@ -432,6 +487,11 @@ def main():
                 raise FileNotFoundError(f"Yield CSV not found: {args.yield_csv}")
             print(f"\nComputing metrics using ground truth from {args.yield_csv}...")
             yield_df = pd.read_csv(args.yield_csv)
+            yield_df = filter_yield_pandas_by_coverage(
+                yield_df,
+                min_ratio=args.min_coverage_ratio,
+                max_ratio=args.max_coverage_ratio,
+            )
             muni_code_col = "municipality_code"
             yield_col = target_column
             year_col = "year"

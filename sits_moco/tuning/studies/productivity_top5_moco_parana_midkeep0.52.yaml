@@ -1,0 +1,114 @@
+# Same as productivity_top5_moco_parana (MoCo encoder init matched per trial),
+# plus train-only mid-band yield undersampling:
+#   keep ~52% of train rows with yield_t_ha ∈ [3.0, 4.25), uniform per 0.25 t/ha bin
+#   (preserves histogram shape; tails and valid/test unchanged).
+#
+# MoCo checkpoints are reused when the trunk fingerprint already exists
+# (same 4 pretrains as productivity_top5_moco_parana).
+#
+# Source ranking (val_r2 from productivity_architecture_xavier):
+#   trial_034  0.236   128/4/128 drop=0.4
+#   trial_024  0.202    64/16/128 drop=0.4
+#   trial_031  0.133   128/4/128 drop=0.3
+#   trial_004  0.128    64/4/64  drop=0.4
+#   trial_008  0.121    96/8/64  drop=0.3
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_top5_moco_parana_midkeep0.52.yaml --list-trials
+#
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana_midkeep0.52.yaml --skip-completed
+
+name: productivity_top5_moco_parana_midkeep0.52
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+# Paraná MoCo recipe (same scale as P_MoCoV2TransformerModel_RC_2020-2024_doy).
+# Arch + feature_layout come from each yield trial.
+moco:
+  model: transformer
+  rc: true
+  use_doy: true
+  useall: true
+  mlp: true
+  max_samples: 500000
+  epochs: 100
+  batchsize: 512
+  workers: 8
+  sequencelength: 70
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  seed: 111
+  model_dropout: 0.2
+  harvest_years: "2020,2021,2022,2023,2024"
+  logdir: ./results
+
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral_xavier
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  # Train-only: scale down mid productivity band (~52% keep, shape preserved).
+  train_mid_yield_keep_fraction: 0.52
+  train_mid_yield_lo: 3.0
+  train_mid_yield_hi: 4.25
+  train_mid_yield_bin_width: 0.25
+  logdir: ./results
+  seed: 101010
+  epochs: 100
+  workers: 20
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 5.0e-4
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [12, 75]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 50
+  prefetch_chunks: 30
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
+  quiet_training: true
+  model_n_layers: 1
+
+search:
+  strategy: list
+
+  # Same order as first_real_tuning val_r2 ranking (best → 5th).
+  trials:
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+
+    - model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 64
+      model_dropout: 0.3

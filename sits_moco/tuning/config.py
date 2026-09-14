@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from env_config import resolve_datapath
+
 OBJECTIVES = {
     "val_loss": {"mode": "min", "column": "valloss"},
     "val_r2": {"mode": "max", "column": "r2"},
@@ -16,10 +18,27 @@ OBJECTIVES = {
     "test_loss": {"mode": "min", "column": "testloss", "log": "testlog"},
 }
 
-SEARCH_STRATEGIES = ("grid", "random")
+SEARCH_STRATEGIES = ("grid", "random", "list", "feature_sweep")
 
 BOOL_PARAMS = frozenset(
-    {"rc", "interp", "no_compile", "overwrite_run", "quiet_training", "disable_pipeline_h2d"}
+    {
+        "rc",
+        "interp",
+        "no_compile",
+        "overwrite_run",
+        "quiet_training",
+        "disable_pipeline_h2d",
+        "zero_grad_set_to_none",
+        "skip_batch_empty_cache",
+        "batch_empty_cache",
+        "legacy_zero_grad",
+        "dataloader_persistent_workers",
+        "h2d_pin_host",
+        "no_dataloader_pin_memory",
+        "auto_chunks_per_grad",
+        "no_coverage_filter",
+        "refit_extra_scaler",
+    }
 )
 
 INT_PARAMS = frozenset(
@@ -31,12 +50,25 @@ INT_PARAMS = frozenset(
         "warmup_epochs",
         "seed",
         "early_stop_patience",
+        "checkpoint_every",
         "model_d_model",
         "model_n_head",
         "model_n_layers",
         "model_d_inner",
         "pixel_chunk_size",
         "prefetch_chunks",
+        "dataloader_prefetch_factor",
+        "npy_cache_size",
+        "chunks_per_grad",
+        "auto_chunks_per_grad_min",
+        "auto_pixel_chunk_size_min",
+        "auto_pixel_chunk_size_step",
+        "auto_chunks_per_grad_narrow_threshold",
+        "auto_chunks_per_grad_refine_radius",
+        "min_images",
+        "min_months",
+        "holdout_year",
+        "attn_pool_queries",
     }
 )
 
@@ -46,6 +78,16 @@ FLOAT_PARAMS = frozenset(
         "weight_decay",
         "sample_ratio",
         "model_dropout",
+        "aux_loss_weight",
+        "aux_min_std",
+        "auto_chunks_per_grad_vram_frac",
+        "auto_chunks_per_grad_vram_target_frac",
+        "min_coverage_ratio",
+        "max_coverage_ratio",
+        "train_mid_yield_keep_fraction",
+        "train_mid_yield_lo",
+        "train_mid_yield_hi",
+        "train_mid_yield_bin_width",
     }
 )
 
@@ -54,6 +96,12 @@ def _require_mapping(obj: Any, name: str) -> dict:
     if not isinstance(obj, dict):
         raise ValueError(f"{name} must be a mapping, got {type(obj).__name__}")
     return obj
+
+
+def _apply_env_datapath(base: dict) -> None:
+    """Set base['datapath'] from .env when omitted in study YAML."""
+    override = base.get("datapath")
+    base["datapath"] = str(resolve_datapath(override))
 
 
 def load_study_config(path: Path | str) -> dict:
@@ -75,6 +123,7 @@ def load_study_config(path: Path | str) -> dict:
         raise ValueError(f"Unknown objective {objective!r}; expected one of: {choices}")
 
     base = _require_mapping(cfg.get("base"), "base")
+    _apply_env_datapath(base)
     search = _require_mapping(cfg.get("search", {}), "search")
     strategy = search.get("strategy", "grid")
     if strategy not in SEARCH_STRATEGIES:
@@ -85,9 +134,48 @@ def load_study_config(path: Path | str) -> dict:
         raise ValueError("search.parameters must be a mapping")
 
     n_trials = search.get("n_trials")
+    explicit_trials = search.get("trials")
+    extra_trials = search.get("extra_trials")
+    year_loo = search.get("year_loo")
+    skip_holdout_years_missing_climate = search.get(
+        "skip_holdout_years_missing_climate"
+    )
+    extra_scaler_template = search.get("extra_scaler_template")
+    if year_loo is not None:
+        if strategy != "feature_sweep":
+            raise ValueError("search.year_loo is only valid with strategy: feature_sweep")
+        if isinstance(year_loo, (int, str)):
+            year_loo = [int(year_loo)]
+        elif not isinstance(year_loo, list) or not year_loo:
+            raise ValueError("search.year_loo must be a non-empty list of years")
+        else:
+            year_loo = [int(y) for y in year_loo]
+    if skip_holdout_years_missing_climate is not None:
+        if isinstance(skip_holdout_years_missing_climate, (int, str)):
+            skip_holdout_years_missing_climate = [
+                int(skip_holdout_years_missing_climate)
+            ]
+        else:
+            skip_holdout_years_missing_climate = [
+                int(y) for y in skip_holdout_years_missing_climate
+            ]
+    if extra_scaler_template is not None:
+        extra_scaler_template = str(extra_scaler_template)
+    if extra_trials is not None:
+        if not isinstance(extra_trials, list):
+            raise ValueError("search.extra_trials must be a list")
+        for i, trial in enumerate(extra_trials):
+            if not isinstance(trial, dict):
+                raise ValueError(f"search.extra_trials[{i}] must be a mapping")
     if strategy == "random":
         if n_trials is None or int(n_trials) < 1:
             raise ValueError("random search requires search.n_trials >= 1")
+    elif strategy == "list":
+        if not isinstance(explicit_trials, list) or not explicit_trials:
+            raise ValueError("list search requires a non-empty search.trials list")
+        for i, trial in enumerate(explicit_trials):
+            if not isinstance(trial, dict):
+                raise ValueError(f"search.trials[{i}] must be a mapping")
     elif parameters:
         for pname, spec in parameters.items():
             if not isinstance(spec, dict):
@@ -100,6 +188,11 @@ def load_study_config(path: Path | str) -> dict:
     training_script = cfg.get("training_script", "main_yield_regression_polars.py")
     seed_offset = int(cfg.get("seed_offset", 0))
 
+    moco_raw = cfg.get("moco")
+    moco_cfg = None
+    if moco_raw is not None:
+        moco_cfg = deepcopy(_require_mapping(moco_raw, "moco"))
+
     return {
         "name": name,
         "objective": objective,
@@ -109,12 +202,22 @@ def load_study_config(path: Path | str) -> dict:
             "strategy": strategy,
             "n_trials": int(n_trials) if n_trials is not None else None,
             "parameters": deepcopy(parameters or {}),
+            "trials": deepcopy(explicit_trials) if explicit_trials is not None else None,
+            "extra_trials": deepcopy(extra_trials) if extra_trials is not None else None,
             "seed": int(search.get("seed", 42)),
+            "year_loo": deepcopy(year_loo) if year_loo is not None else None,
+            "skip_holdout_years_missing_climate": deepcopy(
+                skip_holdout_years_missing_climate
+            )
+            if skip_holdout_years_missing_climate is not None
+            else None,
+            "extra_scaler_template": extra_scaler_template,
         },
         "output_dir": str(output_dir),
         "training_script": str(training_script),
         "seed_offset": seed_offset,
         "config_path": str(path.resolve()),
+        "moco": moco_cfg,
     }
 
 

@@ -6,6 +6,18 @@ set -euo pipefail
 SRC="${1:-/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/files/npy}"
 DST="${2:-$HOME/sits_moco_data/npy}"
 echo "Syncing $SRC -> $DST"
+
+# A symlink into /mnt/c makes rsync a no-op (src == dest). Replace with a real dir.
+if [[ -L "$DST" ]]; then
+  echo "Removing symlink $DST -> $(readlink "$DST")"
+  rm -f "$DST"
+fi
 mkdir -p "$DST"
+if [[ "$(readlink -f "$SRC")" == "$(readlink -f "$DST")" ]]; then
+  echo "ERROR: SRC and DST resolve to the same path. Aborting." >&2
+  exit 1
+fi
+
 rsync -a --info=progress2 "$SRC/" "$DST/"
 echo "Done. Train with: --datapath $DST"
+df -Th "$DST"

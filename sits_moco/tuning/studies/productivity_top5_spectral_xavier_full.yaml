@@ -1,0 +1,87 @@
+# From-scratch pixel baseline with full Xavier inputs (rain + cum ETo/Rs/Tmax/Tmin).
+# Same five arches and training recipe as rain-from-scratch
+# (productivity_architecture_xavier / first_real_tuning). No MoCo.
+#
+# Requires 17-channel pixel .npy under SITS_MOCO_DATAPATH (~/sits_moco_data/npy).
+#
+# Source ranking on rain-only (val_r2):
+#   trial_034  0.236   128/4/128 drop=0.4
+#   trial_024  0.202    64/16/128 drop=0.4
+#   trial_031  0.133   128/4/128 drop=0.3
+#   trial_004  0.128    64/4/64  drop=0.4
+#   trial_008  0.121    96/8/64  drop=0.3
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_top5_spectral_xavier_full.yaml --list-trials
+#
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_top5_spectral_xavier_full.yaml --skip-completed
+
+name: productivity_top5_spectral_xavier_full
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral_xavier_full
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 100
+  workers: 20
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 1.0e-4
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [15, 75]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 50
+  prefetch_chunks: 30
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
+  quiet_training: true
+  model_n_layers: 1
+
+search:
+  strategy: list
+
+  # Same order as first_real_tuning val_r2 ranking (best → 5th).
+  trials:
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+
+    - model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 64
+      model_dropout: 0.3

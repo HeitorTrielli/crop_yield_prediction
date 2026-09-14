@@ -87,8 +87,13 @@ class RandomTempRemoval:
     def __call__(self, sample):
         x = sample['x']
         doy = sample['doy']
+        if x.shape[0] == 0:
+            return {'x': x, 'doy': doy}
         mask = [1 if random.random() < 0.15 else 0 for _ in range(x.shape[0])]
         mask = np.array(mask) == 0
+        # Keep at least one timestep (short Paraná series can otherwise become empty)
+        if not np.any(mask):
+            mask[random.randrange(len(mask))] = True
 
         return {'x': x[mask], 'doy': doy[mask]}
 
@@ -101,6 +106,19 @@ class RandomSampleTimeSteps:
     def __call__(self, sample):
         x = sample['x']
         doy = sample['doy']
+
+        if x.shape[0] == 0:
+            # Degenerate series: emit zero-filled padded tensors
+            c_length = x.shape[1] if x.ndim == 2 and x.shape[1] else 10
+            x_pad = np.zeros((self.sequencelength, c_length), dtype=np.float32)
+            mask = np.ones((self.sequencelength,), dtype=int)
+            doy_pad = np.zeros((self.sequencelength,), dtype=int)
+            return (
+                torch.from_numpy(x_pad).type(torch.FloatTensor),
+                torch.from_numpy(mask == 0),
+                torch.from_numpy(doy_pad).type(torch.LongTensor),
+                torch.tensor([]),
+            )
 
         if self.rc:
             # choose with replacement if sequencelength smaller als choose_t

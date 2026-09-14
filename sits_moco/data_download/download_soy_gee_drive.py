@@ -40,7 +40,15 @@ from drive_api import (
     get_folder_id_by_name,
     list_files_in_folder,
 )
-from gee_export import build_daily_image, get_dates_with_s2_scenes, start_export_task
+from gee_export import (
+    DEFAULT_GEE_ACCOUNT,
+    DEFAULT_GEE_PROJECT,
+    build_daily_image,
+    get_aligned_crs_transform,
+    get_dates_with_s2_scenes,
+    initialize_gee,
+    start_export_task,
+)
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -114,8 +122,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gee-project",
         type=str,
-        default="soybean-yield-prediction",
-        help="GEE project ID (default: from ee.Initialize or default project)",
+        default=DEFAULT_GEE_PROJECT,
+        help=f"GEE project ID (default: {DEFAULT_GEE_PROJECT})",
+    )
+    parser.add_argument(
+        "--gee-account",
+        type=str,
+        default=DEFAULT_GEE_ACCOUNT,
+        help=f"Google account for Earth Engine auth (default: {DEFAULT_GEE_ACCOUNT})",
     )
     parser.add_argument(
         "--cloud-pct",
@@ -146,6 +160,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Seconds between GEE task polls (default: 30)",
+    )
+    parser.add_argument(
+        "--no-align-grid",
+        action="store_true",
+        help=(
+            "Disable fixed crsTransform. Default is a global EPSG:4326 grid at "
+            "--resolution (Projection.atScale) so S2 aligns with S1/Landsat exports."
+        ),
     )
     args = parser.parse_args()
 
@@ -300,6 +322,7 @@ def run_one_municipality(
     run_start_time: float,
     total_municipalities: int,
     municipality_index: int,
+    export_crs_transform: Optional[list[float]] = None,
 ) -> tuple[list[str], list[dict]]:
     """Run export+download for one municipality. Returns (downloaded_dates, failed_entries)."""
     municipality_code = shapefile.stem
@@ -534,6 +557,7 @@ def run_one_municipality(
                 folder_name=args.drive_folder,
                 region=ee_geometry,
                 scale=args.resolution,
+                crs_transform=export_crs_transform,
             )
         except Exception as e:
             log(f"Export start failed for {date_str}: {e}")
@@ -619,19 +643,16 @@ def main() -> None:
     total_files_before = 0
     total_files_after = 0
 
-    try:
-        if args.gee_project:
-            ee.Initialize(project=args.gee_project)
-        else:
-            ee.Initialize()
-    except ee.EEException as e:
-        if "Please authenticate" in str(e) or "credentials" in str(e).lower():
-            sys.exit(
-                'GEE not authenticated. Run in a terminal: python -c "import ee; ee.Authenticate()"'
-            )
-        raise
+    initialize_gee(args.gee_project, args.gee_account)
 
     drive_service = build_drive_service(args.credentials_dir)
+
+    export_crs_transform = None
+    if not getattr(args, "no_align_grid", False):
+        export_crs_transform = get_aligned_crs_transform(args.resolution)
+        log(
+            f"Using aligned export grid at {args.resolution}m: transform={export_crs_transform}"
+        )
 
     log(
         f"Batch: {len(shapefiles)} municipality(ies), date range {date_list[0]}–{date_list[-1]} ({year_start}-{year_end}), {len(date_list)} days"
@@ -657,6 +678,7 @@ def main() -> None:
             run_start_time,
             len(shapefiles),
             i,
+            export_crs_transform=export_crs_transform,
         )
         if raw_dir.exists():
             total_files_after += len(list(raw_dir.iterdir()))

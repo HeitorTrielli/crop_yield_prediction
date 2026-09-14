@@ -26,6 +26,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import multiprocessing as mp
+
+_MP_CTX = mp.get_context("spawn")
 
 
 def _log(msg: str) -> None:
@@ -99,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         metavar="YYYY-YYYY",
         help="Output subfolder name (e.g. 2022-2023). If not set, inferred from TIFF filenames.",
     )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip municipality/day outputs that already exist and are non-empty",
+    )
     return p.parse_args()
 
 
@@ -155,7 +163,12 @@ def collect_municipalities(
         result = []
         for subdir in sorted(d.iterdir()):
             if subdir.is_dir():
-                shps = list(subdir.glob("*.shp"))
+                # Prefer iterdir: Path.glob("*.shp") can miss files on some WSL↔NTFS mounts.
+                shps = [
+                    f
+                    for f in subdir.iterdir()
+                    if f.is_file() and f.suffix.lower() == ".shp"
+                ]
                 if shps:
                     path = shps[0]
                     code = (
@@ -170,40 +183,72 @@ def collect_municipalities(
     raise ValueError("Provide either shapefile_dir or shapefiles")
 
 
+def _prepare_muni_geoms_in_crs(
+    municipalities: list[tuple[Path, str, Any]],
+    src_crs: Any,
+) -> list[tuple[str, Any]]:
+    """Reproject all municipality polygons to src_crs once (avoids ~400× GeoDataFrame work)."""
+    prepared: list[tuple[str, Any]] = []
+    for _path, code, geom in municipalities:
+        if geom is None:
+            continue
+        gdf_one = gpd.GeoDataFrame([{"g": geom}], geometry="g", crs="EPSG:4326")
+        gdf_one = gdf_one.to_crs(src_crs)
+        geom_clip = gdf_one.geometry.iloc[0]
+        geojson_geom = (
+            geom_clip.__geo_interface__
+            if hasattr(geom_clip, "__geo_interface__")
+            else geom_clip
+        )
+        prepared.append((code, geojson_geom))
+    return prepared
+
+
 def _process_one_tiff(
     tiff_path: Path,
     municipalities: list[tuple[Path, str, Any]],
     output_dir: Path,
     year_range: str,
     all_touched: bool,
+    skip_existing: bool = False,
+    heartbeat_every: int = 0,
 ) -> tuple[str, int]:
     """
     Process a single day TIFF: clip to all municipalities and write outputs.
     Returns (tiff_basename, number_of_files_written). Used by parallel workers.
     """
+    import os
+    import time
+
+    # Keep each clip worker light — 20 workers × default GDAL cache OOMs a 62GB WSL VM.
+    os.environ.setdefault("GDAL_CACHEMAX", "256")
+
     date_str = parse_date_from_tiff_path(tiff_path)
     if not date_str:
         return (tiff_path.name, 0)
     y, m, d = date_str.split("-")
     written = 0
+    skipped_existing = 0
+    t0 = time.perf_counter()
     with rasterio.open(tiff_path) as src:
-        src_crs = src.crs
-        for _path, code, geom in municipalities:
-            out_subdir = output_dir / year_range / code
+        prepared = _prepare_muni_geoms_in_crs(municipalities, src.crs)
+        n_muni = len(prepared)
+        season_root = output_dir / year_range
+        for i, (code, geojson_geom) in enumerate(prepared, start=1):
+            if heartbeat_every > 0 and (i == 1 or i % heartbeat_every == 0 or i == n_muni):
+                print(
+                    f"  [{datetime.now().strftime('%H:%M:%S')}] clip {tiff_path.name} "
+                    f"muni {i}/{n_muni} wrote={written} skip_exist={skipped_existing} "
+                    f"(+{time.perf_counter() - t0:.0f}s)",
+                    flush=True,
+                )
+            out_subdir = season_root / code
             out_subdir.mkdir(parents=True, exist_ok=True)
             out_file = out_subdir / f"{code}_{y}_{m}_{d}.tiff"
+            if skip_existing and out_file.is_file() and out_file.stat().st_size > 0:
+                skipped_existing += 1
+                continue
 
-            if geom is not None:
-                gdf_one = gpd.GeoDataFrame([{"g": geom}], geometry="g", crs="EPSG:4326")
-                gdf_one = gdf_one.to_crs(src_crs)
-                geom_clip = gdf_one.geometry.iloc[0]
-            else:
-                geom_clip = geom
-            geojson_geom = (
-                geom_clip.__geo_interface__
-                if hasattr(geom_clip, "__geo_interface__")
-                else geom_clip
-            )
             try:
                 out_image, out_transform = rio_mask(
                     src, [geojson_geom], crop=True, all_touched=all_touched
@@ -243,11 +288,17 @@ def _process_one_tiff(
                     "width": out_image.shape[2],
                     "transform": out_transform,
                     "nodata": NO_DATA_VALUE,
+                    "tiled": True,
+                    "blockxsize": 256,
+                    "blockysize": 256,
+                    "BIGTIFF": "IF_SAFER",
                 }
             )
             # Use source compression if present, else LZW so nodata regions don't bloat the file
             if out_meta.get("compress") is None:
                 out_meta["compress"] = "lzw"
+            # Multi-threaded DEFLATE/ZSTD/LZW encode when GDAL supports NUM_THREADS
+            out_meta["NUM_THREADS"] = "ALL_CPUS"
 
             data = (
                 out_image.filled(NO_DATA_VALUE)
@@ -279,6 +330,7 @@ def clip_state_tiffs_to_municipalities(
     all_touched: bool = True,
     verbose: bool = True,
     workers: int = 1,
+    skip_existing: bool = False,
 ) -> None:
     """
     Clip state-level daily TIFFs to municipal boundaries and save one TIFF per municipality per day.
@@ -310,6 +362,8 @@ def clip_state_tiffs_to_municipalities(
         If True, print progress (default: True).
     workers : int
         Number of parallel workers (default: 1). Use e.g. 20 to process 20 days at a time.
+    skip_existing : bool
+        If True, do not rewrite non-empty municipal day outputs.
     """
     tiff_dir = Path(tiff_dir).resolve()
     if not tiff_dir.is_dir():
@@ -356,11 +410,12 @@ def clip_state_tiffs_to_municipalities(
                 output_dir,
                 year_range,
                 all_touched,
+                skip_existing,
             )
             if verbose:
                 _log(f"Clipped {name} -> {written} municipality files")
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=_MP_CTX) as executor:
             futures = {
                 executor.submit(
                     _process_one_tiff,
@@ -369,6 +424,7 @@ def clip_state_tiffs_to_municipalities(
                     output_dir,
                     year_range,
                     all_touched,
+                    skip_existing,
                 ): tiff_path
                 for tiff_path in tiffs
             }
@@ -399,6 +455,7 @@ def main() -> None:
             all_touched=args.all_touched,
             verbose=True,
             workers=getattr(args, "workers", 1),
+            skip_existing=bool(getattr(args, "skip_existing", False)),
         )
     except ValueError as e:
         raise SystemExit(str(e)) from e

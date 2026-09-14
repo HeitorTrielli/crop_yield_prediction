@@ -1,0 +1,78 @@
+# Leave-one-year-out CV of mega-pixel mean trial_111
+# (productivity_muni_mean_feature_sweep: feature_layout mp_tri__thermo,
+#  val R² ≈ 0.224 on the CSV split).
+#
+# Five folds, harvest years 2020–2024. Fold Y trains on the other four years;
+# valid and test are the full left-out year (CSV split column is ignored).
+# Target mean/std and the input scaler are fit on that fold's train years.
+#
+# Drop two 2019-2020 files that never got climate extras (4112009, 4113734).
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_muni_mean_tri_thermo_year_loo.yaml --list-trials
+#
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_muni_mean_tri_thermo_year_loo.yaml --skip-completed
+#
+# Summarize (per-year test R²):
+#   python run_tuning_study.py summarize tuning/studies/productivity_muni_mean_tri_thermo_year_loo.yaml
+
+name: productivity_muni_mean_tri_thermo_year_loo
+
+objective: test_r2
+
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: mp_tri__thermo
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  exclude_muni_years: "4112009:2020,4113734:2020"
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 1.0e-5
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [150, 750]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  model_n_layers: 1
+  model_d_model: 64
+  model_n_head: 4
+  model_d_inner: 64
+  model_dropout: 0.4
+  refit_extra_scaler: true
+
+search:
+  strategy: list
+  trials:
+    - holdout_year: 2020
+      extra_scaler: files/train_input_scaler_loo2020.json
+      suffix: loo2020
+    - holdout_year: 2021
+      extra_scaler: files/train_input_scaler_loo2021.json
+      suffix: loo2021
+    - holdout_year: 2022
+      extra_scaler: files/train_input_scaler_loo2022.json
+      suffix: loo2022
+    - holdout_year: 2023
+      extra_scaler: files/train_input_scaler_loo2023.json
+      suffix: loo2023
+    - holdout_year: 2024
+      extra_scaler: files/train_input_scaler_loo2024.json
+      suffix: loo2024

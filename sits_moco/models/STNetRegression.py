@@ -13,14 +13,66 @@ import torch.nn.functional as F
 from .STNet import PositionalEncoding, linlayer
 
 
+class AttentionPooling(nn.Module):
+    """Learned multi-query attention pooling over the temporal axis.
+
+    Replaces the fixed exp(NDVI)-weighted mean. Each of the ``num_queries``
+    learnable queries attends over the transformer outputs and pools its own
+    summary (e.g. green-up vs peak vs senescence windows); the concatenated
+    summaries feed the decoder. The exp(NDVI) weight enters as a per-query
+    log-prior with learnable gate (init 1.0 = trust it like the old pooling;
+    the model can learn to ignore it).
+    """
+
+    def __init__(self, d_model: int, num_queries: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.num_queries = int(num_queries)
+        self.queries = nn.Parameter(
+            torch.randn(self.num_queries, d_model) * d_model**-0.5
+        )
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.scale = d_model**-0.5
+        # per-query strength of the exp(NDVI) cloud/quality prior
+        self.weight_gate = nn.Parameter(torch.ones(self.num_queries))
+        self.dropout = nn.Dropout(dropout)
+        self.out_dim = self.num_queries * d_model
+
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        # x: (B, T, D); mask: (B, T) True = padding; weight: (B, T) sums to 1
+        k = self.key(x)
+        v = self.value(x)
+        logits = torch.einsum("qd,btd->bqt", self.queries.to(k.dtype), k) * self.scale
+        prior = torch.log(weight.clamp_min(1e-6)).unsqueeze(1)  # (B, 1, T)
+        logits = logits + self.weight_gate.view(1, -1, 1).to(logits.dtype) * prior
+        logits = logits.masked_fill(mask.unsqueeze(1), float("-inf"))
+        attn = torch.softmax(logits, dim=-1)
+        attn = torch.nan_to_num(attn)  # all-masked rows -> zeros, not NaN
+        attn = self.dropout(attn)
+        pooled = torch.einsum("bqt,btd->bqd", attn, v)
+        return pooled.flatten(1)  # (B, Q*D)
+
+
 class STNetRegression(nn.Module):
     """
     STNet model adapted for regression tasks.
 
+    The decoder emits **z-scores** of the municipal training target by default
+    (``(y − μ) / σ``). ``--head-output raw`` instead predicts original units
+    (t/ha). Convert z-scores with ``z * σ + μ`` (see ``denormalize_head_output``).
+
     Changes from classification version:
     - Output layer outputs num_outputs (default 1) instead of num_classes
     - No softmax activation
-    - Returns continuous values instead of class logits
+    - Returns continuous z-scores instead of class logits
+
+    Soil fusion (``soil_fusion``), when the last ``soil_dim`` input channels are
+    MapBiomas Solo sidecars:
+    - ``early``: all channels through the MLP + transformer (default).
+    - ``late``: spectral/climate through the transformer; soil concatenated
+      after temporal pooling into the decoder.
     """
 
     def __init__(
@@ -37,12 +89,38 @@ class STNetRegression(nn.Module):
         max_seq_len=70,
         T=1000,
         max_temporal_shift=30,
+        temporal_pooling="ndvi",
+        attn_pool_queries=4,
+        soil_fusion="early",
+        soil_dim=4,
     ):
         super(STNetRegression, self).__init__()
         self.modelname = "STNetRegression"
         self.max_seq_len = max_seq_len
+        if temporal_pooling not in ("ndvi", "attention"):
+            raise ValueError(
+                f"temporal_pooling must be 'ndvi' or 'attention', got {temporal_pooling!r}"
+            )
+        if soil_fusion not in ("early", "late"):
+            raise ValueError(
+                f"soil_fusion must be 'early' or 'late', got {soil_fusion!r}"
+            )
+        self.temporal_pooling = temporal_pooling
+        self.soil_fusion = soil_fusion
+        self.soil_dim = int(soil_dim)
+        self.input_dim = int(input_dim)
 
-        self.mlp_dim = [input_dim, 32, 64, d_model]
+        if self.soil_fusion == "late":
+            if self.input_dim <= self.soil_dim:
+                raise ValueError(
+                    f"late soil_fusion needs input_dim > soil_dim "
+                    f"({self.input_dim} <= {self.soil_dim})"
+                )
+            seq_dim = self.input_dim - self.soil_dim
+        else:
+            seq_dim = self.input_dim
+
+        self.mlp_dim = [seq_dim, 32, 64, d_model]
         layers = []
         for i in range(len(self.mlp_dim) - 1):
             layers.append(linlayer(self.mlp_dim[i], self.mlp_dim[i + 1]))
@@ -63,15 +141,28 @@ class STNetRegression(nn.Module):
             encoder_layer, n_layers, encoder_norm
         )
 
-        # Regression decoder: outputs num_outputs continuous values
+        if self.temporal_pooling == "attention":
+            self.attn_pool = AttentionPooling(
+                d_model, num_queries=attn_pool_queries, dropout=dropout
+            )
+            decoder_in = self.attn_pool.out_dim
+        else:
+            self.attn_pool = None
+            decoder_in = d_model
+
+        if self.soil_fusion == "late":
+            decoder_in = decoder_in + self.soil_dim
+
+        # Regression decoder: LayerNorm (not BatchNorm) so train/eval use the
+        # same normalization under pixel-chunked, variable-size batches.
         layers = []
-        decoder = [d_model, 64, 32, num_outputs]
+        decoder = [decoder_in, 64, 32, num_outputs]
         for i in range(len(decoder) - 1):
             layers.append(nn.Linear(decoder[i], decoder[i + 1]))
             if i < (len(decoder) - 2):
                 layers.extend(
                     [
-                        nn.BatchNorm1d(decoder[i + 1]),
+                        nn.LayerNorm(decoder[i + 1]),
                         nn.ReLU(),
                         nn.Dropout(dropout),
                     ]
@@ -80,6 +171,12 @@ class STNetRegression(nn.Module):
 
     def forward(self, x, is_bert=False):
         x, mask, doy, weight = x
+
+        soil = None
+        if self.soil_fusion == "late":
+            # Soil is static across T; last soil_dim channels of the cube.
+            soil = x[:, 0, -self.soil_dim :]
+            x = x[:, :, : -self.soil_dim]
 
         x = x.permute((0, 2, 1))
         x = self.mlp1(x)
@@ -90,13 +187,19 @@ class STNetRegression(nn.Module):
 
         x = self.transformerencoder(x, src_key_padding_mask=mask)
 
-        # weight
+        # temporal pooling
         if not is_bert:
-            weight = self.dropout(weight)
-            weight_sum = weight.sum(1).unsqueeze(1)
-            weight_sum = torch.clamp(weight_sum, min=1e-8)  # Prevent division by zero
-            weight /= weight_sum
-            x = torch.bmm(weight.unsqueeze(1), x).squeeze(1)
+            if self.temporal_pooling == "attention":
+                x = self.attn_pool(x, mask, weight)
+            else:
+                weight = self.dropout(weight)
+                weight_sum = weight.sum(1).unsqueeze(1)
+                weight_sum = torch.clamp(weight_sum, min=1e-8)  # Prevent division by zero
+                weight /= weight_sum
+                x = torch.bmm(weight.unsqueeze(1), x).squeeze(1)
+
+        if soil is not None:
+            x = torch.cat([x, soil], dim=-1)
 
         output = self.decoder(x)
 

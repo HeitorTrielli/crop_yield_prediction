@@ -1,0 +1,97 @@
+# Top-5 yield architectures with full Xavier inputs (rain + ETo/Rs/Tmax/Tmin).
+# Requires 17-channel pixel .npy under SITS_MOCO_DATAPATH (~/sits_moco_data/npy).
+#
+# Trains a matching MoCo trunk per trial (feature_layout spectral_xavier_full → 16 inputs).
+# Run after refreshing pixel .npy with climate channels.
+#
+# Preview:
+#   python run_tuning_study.py show tuning/studies/productivity_top5_moco_parana_spectral_xavier_full.yaml --list-trials
+#
+# Run:
+#   python run_tuning_study.py run tuning/studies/productivity_top5_moco_parana_spectral_xavier_full.yaml --skip-completed
+
+name: productivity_top5_moco_parana_spectral_xavier_full
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+moco:
+  model: transformer
+  rc: true
+  use_doy: true
+  useall: true
+  mlp: true
+  max_samples: 500000
+  epochs: 100
+  batchsize: 512
+  workers: 8
+  sequencelength: 70
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  seed: 111
+  model_dropout: 0.2
+  harvest_years: "2020,2021,2022,2023,2024"
+  logdir: ./results
+
+base:
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: spectral_xavier_full
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 100
+  workers: 20
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 5.0e-5
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [10, 75]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 10
+  pixel_chunk_size: 8000
+  chunks_per_grad: 50
+  prefetch_chunks: 40
+  auto_chunks_per_grad: true
+  auto_chunks_per_grad_min: 1
+  auto_chunks_per_grad_vram_frac: 0.95
+  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_pixel_chunk_size_min: 3500
+  auto_pixel_chunk_size_step: 100
+  quiet_training: true
+  model_n_layers: 1
+
+search:
+  strategy: list
+
+  trials:
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+
+    - model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+
+    - model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 64
+      model_dropout: 0.3

@@ -54,8 +54,10 @@ def weight_init(m):
 
 def weight_init_regression(m):
     """
-    Initializes a regression model's parameters with smaller output layer weights.
-    This helps prevent initial predictions from being too large.
+    Initializes a regression model's parameters with a near-zero last layer.
+    Bias 0 is climatology when the head emits z-scores of the municipal target.
+    For ``--head-output raw``, call ``set_regression_output_bias`` afterward
+    so the last-layer bias is the training mean in original units.
 
     Usage:
         model = RegressionModel()
@@ -96,6 +98,7 @@ def weight_init_regression(m):
         init.constant_(m.bias.data, 0)
     elif isinstance(m, nn.Linear):
         if m.out_features == 1:
+            # Head emits z-scores: N(0, 0.01) weights + bias 0 → climatology.
             init.normal_(m.weight.data, mean=0.0, std=0.01)
             if m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
@@ -127,3 +130,20 @@ def weight_init_regression(m):
                 init.orthogonal_(param.data)
             else:
                 init.normal_(param.data)
+
+
+def set_regression_output_bias(model: nn.Module, value) -> None:
+    """Set the last Linear bias to ``value`` (climatology in raw target units)."""
+    last = None
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            last = module
+    if last is None or last.bias is None:
+        return
+    if isinstance(value, (list, tuple)):
+        if len(value) == int(last.bias.numel()):
+            for i, item in enumerate(value):
+                last.bias.data[i] = float(item)
+            return
+        value = value[0]
+    last.bias.data.fill_(float(value))
