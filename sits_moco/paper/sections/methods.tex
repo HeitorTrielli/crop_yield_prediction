@@ -1,0 +1,32 @@
+\section{Methods}
+\label{sec:methods}
+
+\subsection{Downscaling formulation}
+Let a municipality $m$ in harvest year $y$ contain $N_m$ valid soybean pixels with time series $\mathbf{x}_p$.
+A shared model $f_\theta$ maps each pixel to a scalar productivity contribution $\hat{y}_p = f_\theta(\mathbf{x}_p)$.
+These pixel scores are the downscaled product of interest: after training they form intramunicipal productivity maps.
+Municipal productivity, which is the only quantity for which labels exist, is recovered by mean aggregation,
+\begin{equation}
+  \hat{y}_{m,y} = \frac{1}{N_m}\sum_{p=1}^{N_m} \hat{y}_p ,
+  \label{eq:mean-agg}
+\end{equation}
+and is supervised against the official PAM label $y_{m,y}$.
+Thus learning proceeds from coarse labels to fine predictions: gradients update $f_\theta$ through the municipal mean, while inference retains the full pixel field $\{\hat{y}_p\}$.
+
+\subsection{Architecture}
+We use a regression adaptation of STNet~\citep{xu2024sitsmoco} as the pixel encoder.
+Given pixel sequences with sixteen channels (ten spectral bands and six Xavier climate covariates), padding masks, and day-of-year indices, the network projects each timestep with a shared multilayer perceptron from 16 inputs through widths $32 \rightarrow 64 \rightarrow d_{\mathrm{model}}$, adds sinusoidal positional encodings indexed by day of year, applies a Transformer encoder with padding masks to model temporal dependencies, collapses the sequence to a single vector per pixel by temporal pooling, and maps the pooled embedding to a continuous scalar with a multilayer-perceptron head.
+Temporal pooling uses NDVI-weighted averaging: temporal weights derived from NDVI are normalized and used as a soft collapse over time.
+An alternative that averages only over valid (unmasked) timesteps, without NDVI weights, is evaluated as an ablation.
+The spectral-only ablation uses the same architecture with ten-band inputs.
+
+The proposed model uses one Transformer layer, $d_{\mathrm{model}}=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=128$, and dropout $0.3$.
+
+\subsection{Loss and optimization}
+Training minimizes mean squared error between aggregated municipal predictions and PAM targets after standardization by the training-set mean and standard deviation.
+Reported metrics (RMSE, MAE, $R^2$, MAPE) are computed in original \si{t/ha} units on the municipal aggregates, which are the evaluable layer of the downscaling pipeline.
+
+Optimization uses AdamW with learning rate $1\times10^{-4}$, weight decay $5\times10^{-4}$, and batches of 40 municipalities.
+The learning rate is reduced at epochs 15 and 75; training stops early after ten epochs without improvement in validation $R^2$.
+Because municipalities can contain many pixels, gradients within each municipal batch are accumulated over subsets of pixels.
+No self-supervised pretraining is used: the network is trained from scratch under municipal supervision.

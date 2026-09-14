@@ -1,0 +1,29 @@
+\section{Discussion}
+\label{sec:discussion}
+
+The central claim of this work is that municipal PAM labels are enough to train a pixel-level productivity model whose intramunicipal maps are the intended product, while municipal means of those maps remain evaluable against official statistics.
+On the 2021 validation and test splits, those aggregates attain roughly $0.35$--$0.36$\,\si{t/ha} RMSE and about $8\%$--$9\%$ MAPE, with closely matched $R^2$ near $0.23$.
+MAPE suggests that relative municipal errors are often practically small, whereas $R^2$ indicates that only a modest fraction of cross-municipality variance is explained on this single holdout year.
+Pixel maps (e.g., Figure~\ref{fig:guara}) cannot be scored directly without field labels; their credibility rests on consistency of the municipal mean and on qualitative spatial structure.
+
+Adding Xavier climate covariates improves both validation and test $R^2$ relative to the spectral-only ablation (validation $R^2$ $0.227$ vs.\ $0.165$; test $R^2$ $0.228$ vs.\ $0.117$).
+Climate inputs are therefore useful for the municipal selection criterion and for spatial generalization within the holdout year under the protocol used here.
+
+Architecture search on spectral inputs favored a compact Transformer ($d_{\mathrm{model}}=96$, modest feed-forward width, moderate dropout) for the spectral-only ablation, whereas the proposed model uses a wider configuration ($d_{\mathrm{model}}=128$, $d_{\mathrm{inner}}=128$, dropout $0.3$).
+Combined with validation degradation after the learning-rate schedule step, this points to a regime where capacity, covariates, and optimization noise jointly affect year-holdout generalization of the downscaled aggregates.
+
+Per-year diagnostics highlight 2022 as a severe failure mode: RMSE and MAPE rise sharply even though $R^2$ is near zero.
+Interpreting $R^2$ alone can therefore be misleading under drought-driven level shifts; RMSE and MAPE remain essential, and models selected on a single holdout year may not transfer to extreme seasons---including the intramunicipal maps derived from the same checkpoint.
+
+NDVI-weighted temporal pooling improved validation $R^2$ relative to mean pooling over valid timesteps on the spectral-only architecture, but test $R^2$ was essentially unchanged.
+The ablation supports NDVI weighting as a useful inductive bias for model selection, while cautioning against overinterpreting a single holdout-year test difference.
+
+Early-season results show progressive information gain as the season unfolds.
+Pooled across years, municipal $R^2$ turns positive by month 3 and peaks near month 5 ($0.429$) before a slight decline at month 6.
+On 2021 alone, truncated evaluations remain weak until the full six-month window recovers the holdout $R^2$.
+Operational early warning with downscaled maps would therefore need models trained explicitly for truncated inputs, multi-year aggregation of forecasts, or stronger season-aware regularization.
+
+A structural limitation is the mean-aggregation assumption: municipal productivity is treated as the average of pixel contributions, which ignores possible unequal area weighting, management heterogeneity, and label noise in PAM.
+Without pixel-level references, we cannot quantify intramunicipal calibration error, only municipal consistency.
+Further limitations include a single holdout year, the absence of external algorithmic baselines, and sensitivity to extreme seasons such as 2022.
+Self-supervised pretraining was not evaluated here and remains future work.

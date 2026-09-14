@@ -1,0 +1,58 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{siunitx}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=blue!50!black,
+  urlcolor=blue!50!black
+}
+
+\graphicspath{{figures/}}
+
+\title{Downscaling Municipal Soybean Productivity Labels to Pixel Predictions with a Spectral--Temporal Transformer}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Official soybean productivity statistics in Brazil are reported at the municipality level, whereas Sentinel-2 observations resolve crop condition within municipalities.
+We formulate this scale mismatch as a downscaling task: a spectral--temporal Transformer assigns a productivity contribution to each soybean pixel and is trained so that the municipal mean of those contributions matches IBGE PAM labels.
+Using Sentinel-2 time series for Paran\'{a} (harvest years 2020--2024), augmented with gridded climate covariates, the trained pixel outputs provide intramunicipal productivity maps without field-level supervision.
+On a 2021 spatial holdout, the climate-augmented model attains validation and test $R^2$ of $0.227$ and $0.228$.
+Pooled early-season skill improves with additional months of imagery, peaking at $R^2=0.429$ after five season months, while the 2022 drought year remains difficult.
+The results suggest that municipal labels can supervise spatially resolved productivity estimates, subject to remaining limits under extreme seasons and truncated inputs.
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/data}
+\input{sections/methods}
+\input{sections/experiments}
+\input{sections/results}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+\section*{Data availability}
+Municipal productivity labels are from IBGE PAM and provide the only supervised signal.
+Sentinel-2 time series and Xavier climate covariates were processed to per-pixel sequences within municipalities, with coverage filtering as described in Section~\ref{sec:data}, enabling intramunicipal prediction maps after municipal training.
+Further details are available from the authors upon reasonable request.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

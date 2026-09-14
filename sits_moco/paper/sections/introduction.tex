@@ -1,0 +1,12 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Soybean productivity maps at fine spatial resolution would support planning, insurance, and risk assessment, but field-level yield labels are rarely available at scale in Brazil.
+What is available instead are official municipal statistics from the Brazilian Institute of Geography and Statistics (IBGE) Municipal Agricultural Production survey (PAM), together with dense Sentinel-2 time series that resolve spectral variation \emph{within} municipalities.
+This paper treats that gap as a \emph{downscaling} task: learn pixel-level productivity contributions from municipal labels alone, then read out both municipal aggregates and intramunicipal maps.
+
+Deep Transformers have been shown to extract informative representations from Sentinel-2 time series for crop mapping~\citep{xu2024sitsmoco}.
+We adapt the Spectral--Temporal Network (STNet) from that line of research to continuous productivity regression (tonnes per hectare).
+Each soybean pixel is scored by the network; municipal predictions are the mean of pixel scores and are supervised by PAM labels, using Sentinel-2 reflectance and Xavier climate covariates over Paran\'{a} for harvest years 2020--2024.
+
+Our contributions are a municipal-to-pixel downscaling scheme that trains per-pixel productivity predictors under mean aggregation to IBGE PAM labels; a spectral--temporal Transformer for Paran\'{a} soybean that combines reflectance with Xavier climate covariates, with ablations that remove climate inputs or change temporal pooling; and a held-out evaluation on the 2021 growing season, including early-season truncations and qualitative intramunicipal maps.

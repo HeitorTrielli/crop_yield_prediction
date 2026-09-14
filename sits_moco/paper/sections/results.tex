@@ -1,0 +1,148 @@
+\section{Results}
+\label{sec:results}
+
+\subsection{Municipal aggregates of downscaled predictions}
+Because pixel-level yield labels are unavailable, quantitative skill is assessed on municipal aggregates of the pixel predictions (Eq.~\ref{eq:mean-agg}).
+Table~\ref{tab:main-metrics} summarizes validation and test metrics for the proposed spectral--climate downscaling model.
+Validation $R^2$ peaks at epoch 12 ($0.227$), with RMSE $0.362$\,\si{t/ha} and MAPE $8.82\%$.
+The corresponding test metrics are $R^2=0.228$, RMSE $0.351$\,\si{t/ha}, and MAPE $8.42\%$.
+Absolute and relative municipal errors are therefore on the order of a few tenths of a tonne per hectare and about $8\%$--$9\%$ MAPE, with closely matched validation and test $R^2$ on the 2021 spatial holdout.
+
+\begin{table}[t]
+\centering
+\caption{Validation and test metrics for municipal aggregates of the proposed downscaling model (best validation epoch 12). Units for RMSE/MAE are \si{t/ha}; MAPE is in percent.}
+\label{tab:main-metrics}
+\begin{tabular}{lcccc}
+\toprule
+Split & RMSE & MAE & $R^2$ & MAPE (\%) \\
+\midrule
+Validation (2021) & 0.362 & 0.287 & 0.227 & 8.82 \\
+Test (2021)       & 0.351 & 0.271 & 0.228 & 8.42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:learning} shows learning dynamics.
+Validation RMSE and $R^2$ improve through about epoch 12; after the scheduled learning-rate reduction near epoch 15, validation performance becomes unstable and eventually degrades, consistent with early stopping at epoch 22.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{learning_curves.pdf}
+\caption{Training dynamics for the proposed spectral--climate downscaling model. The dashed line marks the best validation epoch (12).}
+\label{fig:learning}
+\end{figure}
+
+\subsection{Architecture search without climate}
+Table~\ref{tab:arch-top} lists the five best spectral-only configurations by validation $R^2$.
+The top configuration is clearly ahead of the next-best models and is used as the spectral-only ablation below.
+Wider spectral configurations often underperform, suggesting that capacity control and dropout matter for this dataset size and holdout design.
+
+\begin{table}[t]
+\centering
+\caption{Top five spectral-only configurations by validation $R^2$ (24 completed runs). The proposed model instead uses the full Xavier climate layout with $d_{\mathrm{model}}=128$, four heads, $d_{\mathrm{inner}}=128$, and dropout $0.3$.}
+\label{tab:arch-top}
+\begin{tabular}{lcccccc}
+\toprule
+Rank & $d_{\mathrm{model}}$ & Heads & $d_{\mathrm{inner}}$ & Dropout & Val $R^2$ & Test $R^2$ \\
+\midrule
+1 & 96 & 8 & 64 & 0.3 & 0.165 & 0.117 \\
+2 & 96 & 4 & 128 & 0.4 & 0.084 & 0.134 \\
+3 & 64 & 4 & 64 & 0.4 & 0.076 & --- \\
+4 & 64 & 4 & 128 & 0.3 & 0.071 & 0.119 \\
+5 & 64 & 4 & 128 & 0.4 & 0.046 & 0.106 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablations}
+\label{sec:ablations}
+
+\paragraph{Spectral only.}
+Training with spectral bands alone yields validation $R^2=0.165$ (RMSE $0.376$\,\si{t/ha}, MAPE $9.05\%$) and test $R^2=0.117$ (RMSE $0.375$\,\si{t/ha}, MAPE $9.09\%$).
+Relative to the proposed spectral--climate model, removing climate covariates lowers both validation $R^2$ ($0.227\rightarrow 0.165$) and test $R^2$ ($0.228\rightarrow 0.117$), while MAPE remains near $9\%$.
+Climate inputs therefore improve the municipal aggregates used for model selection and holdout evaluation under the 2021 spatial split.
+
+\paragraph{Temporal pooling.}
+With the best spectral-only architecture fixed, replacing NDVI-weighted temporal pooling by mean pooling over valid timesteps reduces validation $R^2$ from $0.165$ to $0.049$ (best epoch 12), while test $R^2$ remains nearly unchanged ($0.117$).
+NDVI-weighted pooling therefore improves validation fit under the selection criterion used here, but does not translate into a clear test gain on this single holdout year.
+
+\subsection{Per-year municipal diagnostics}
+Figure~\ref{fig:scatter} shows predicted versus actual \emph{municipal} productivity for each harvest year under the proposed model.
+Years 2020 and 2021 lie nearest the identity line (MAPE $8.1\%$--$8.6\%$), with 2021 $R^2=0.229$ consistent with the holdout evaluation.
+Year 2022 remains difficult: RMSE rises to $1.14$\,\si{t/ha} and MAPE to $88.6\%$ despite near-zero $R^2$, reflecting a drought year with strong productivity collapse.
+Years 2023--2024 are intermediate (Table~\ref{tab:per-year}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{scatter_panel.pdf}
+\caption{Predicted versus actual municipal soybean productivity (\si{t/ha}) by harvest year for the proposed downscaling model.
+Points are colored by split (train / validation / test). The dashed line is identity.}
+\label{fig:scatter}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Per-year municipal metrics for aggregates of the proposed model (municipalities with coverage-filtered forecasts in each year).}
+\label{tab:per-year}
+\begin{tabular}{lccccc}
+\toprule
+Year & $n$ & RMSE & MAE & $R^2$ & MAPE (\%) \\
+\midrule
+2020 & 247 & 0.370 & 0.296 & 0.167 & 8.1 \\
+2021 & 255 & 0.356 & 0.279 & 0.229 & 8.6 \\
+2022 & 240 & 1.140 & 0.928 & $-0.001$ & 88.6 \\
+2023 & 248 & 0.464 & 0.371 & 0.087 & 10.7 \\
+2024 & 260 & 0.651 & 0.525 & 0.059 & 20.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:map2021} maps municipal aggregate errors in the 2021 holdout year.
+Figure~\ref{fig:guara} shows the corresponding intramunicipal product: pixel-level productivity contributions within Guarapuava, Paran\'{a}, obtained without field-level labels.
+Spatial structure in such maps is the operational output of downscaling; municipal metrics only certify that the pixel field is consistent with PAM when averaged.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\textwidth]{map_error_2021.png}
+\caption{Municipal aggregate prediction error map for harvest year 2021 (holdout).}
+\label{fig:map2021}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\textwidth]{guarapuava_heatmap.png}
+\caption{Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a}.}
+\label{fig:guara}
+\end{figure}
+
+\subsection{Early-season skill}
+Table~\ref{tab:incomplete} and Figure~\ref{fig:incomplete} summarize early-season evaluation of municipal aggregates pooled over years.
+With one or two season months, $R^2$ is negative and MAPE exceeds $34\%$.
+Skill becomes clearly positive by month 3 ($R^2=0.266$) and peaks at month 5 ($R^2=0.429$, RMSE $0.648$\,\si{t/ha}, MAPE $26.2\%$), with a slight decline at month 6 ($R^2=0.411$).
+Restricting the same protocol to 2021 alone, $R^2$ remains negative until month 6, where it reaches $0.229$ with RMSE $0.356$\,\si{t/ha}---matching the full-season holdout aggregate.
+Early downscaled forecasts therefore improve as more of the season is observed when pooled across years, but the spatial holdout year requires nearly the full season window under this checkpoint.
+
+\begin{table}[t]
+\centering
+\caption{Early-season evaluation of municipal aggregates (pooled years) as a function of season months $k$ retained from 1~October.}
+\label{tab:incomplete}
+\begin{tabular}{ccccc}
+\toprule
+$k$ & RMSE & MAE & $R^2$ & MAPE (\%) \\
+\midrule
+1 & 0.958 & 0.800 & $-0.247$ & 36.9 \\
+2 & 0.907 & 0.793 & $-0.116$ & 34.6 \\
+3 & 0.735 & 0.587 & 0.266 & 29.2 \\
+4 & 0.680 & 0.523 & 0.373 & 27.3 \\
+5 & 0.648 & 0.483 & 0.429 & 26.2 \\
+6 & 0.658 & 0.477 & 0.411 & 26.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{incomplete_series.pdf}
+\caption{Early-season municipal metrics versus number of available season months $k$ (pooled years).}
+\label{fig:incomplete}
+\end{figure}

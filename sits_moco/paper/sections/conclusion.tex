@@ -1,0 +1,7 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We framed soybean productivity mapping in Paran\'{a} as downscaling: a spectral--temporal Transformer predicts productivity at every Sentinel-2 soybean pixel and is trained so that municipal means match IBGE PAM labels, yielding intramunicipal maps without field-level supervision.
+On a 2021 spatial holdout, municipal aggregates of the climate-augmented model achieve approximately $8\%$--$9\%$ MAPE and $0.35$--$0.36$\,\si{t/ha} RMSE, with validation and test $R^2$ near $0.23$, and outperform a spectral-only ablation.
+Early-season truncations improve pooled skill through about five season months (peak $R^2=0.429$), while the 2021 holdout needs nearly the full season window, and drought year 2022 remains challenging.
+Future work includes multi-year holdouts, stronger baselines under identical splits, self-supervised pretraining, and pathways to validate intramunicipal structure when limited field references become available.

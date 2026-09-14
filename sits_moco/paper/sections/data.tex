@@ -1,0 +1,125 @@
+\section{Data}
+\label{sec:data}
+
+Downscaling requires fine-resolution predictors and coarse labels.
+Features are drawn from several sources (Table~\ref{tab:data-sources}): Sentinel-2 reflectance, Xavier climate covariates, and MapBiomas Solo soil properties at each soybean pixel, a MapBiomas soybean mask, and IBGE PAM productivity labels at the municipality level.
+
+\begin{table}[t]
+\centering
+\caption{Summary of data sources used in the experiments.}
+\label{tab:data-sources}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llp{2.35cm}ccp{2.35cm}@{}}
+\toprule
+Category & Variables & Unit & Related properties & Spatial res. & Source \\
+\midrule
+Satellite imagery
+  & \makecell[l]{B2, B3, B4, B5, B6,\\B7, B8, B8A, B11, B12}
+  & ---
+  & Vegetation reflectance
+  & 30\,m
+  & Sentinel-2 L2A \\
+\midrule
+\multirow{6}{*}{Climate}
+  & Cumulative precipitation
+  & mm
+  & Water availability
+  & \multirow{6}{*}{$0.1^\circ$}
+  & \multirow{6}{*}{\makecell[c]{Xavier\\(BR-DWGD)}} \\
+\cmidrule(lr){2-4}
+  & Max.\ dry-day streak
+  & days
+  & Drought stress
+  &
+  & \\
+\cmidrule(lr){2-4}
+  & Cumulative ETo
+  & mm
+  & Atmospheric demand
+  &
+  & \\
+\cmidrule(lr){2-4}
+  & Cumulative Rs
+  & MJ\,m$^{-2}$
+  & Solar radiation
+  &
+  & \\
+\cmidrule(lr){2-4}
+  & Cumulative Tmax
+  & $^\circ$C$\cdot$day
+  & Heat accumulation
+  &
+  & \\
+\cmidrule(lr){2-4}
+  & Cumulative Tmin
+  & $^\circ$C$\cdot$day
+  & Cold accumulation
+  &
+  & \\
+\midrule
+\multirow{4}{*}{Soil}
+  & Clay (0--30\,cm)
+  & \%
+  & Texture
+  & \multirow{4}{*}{30\,m}
+  & \multirow{4}{*}{\makecell[c]{MapBiomas Solo\\Col.\ 3}} \\
+\cmidrule(lr){2-4}
+  & Silt (0--30\,cm)
+  & \%
+  & Texture
+  &
+  & \\
+\cmidrule(lr){2-4}
+  & Sand (0--30\,cm)
+  & \%
+  & Texture
+  &
+  & \\
+\cmidrule(lr){2-4}
+  & SOC stock (0--30\,cm)
+  & \si{t/ha}
+  & Organic carbon
+  &
+  & \\
+\midrule
+Land cover
+  & Soybean mask (class 39)
+  & ---
+  & Crop mask
+  & 30\,m
+  & MapBiomas Col.\ 10 \\
+\midrule
+Labels
+  & Soybean productivity
+  & \si{t/ha}
+  & Municipal supervision
+  & Municipality
+  & IBGE PAM \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Study area and labels}
+The study covers soybean-producing municipalities in the state of Paran\'{a}, Brazil.
+Supervision uses municipal soybean productivity in tonnes per hectare (\si{t/ha}) from IBGE PAM, with municipality codes, harvest year, and a predefined validation and test partition within the holdout year.
+No field- or pixel-level yield labels are used.
+We retain municipality--year pairs whose Sentinel-2 coverage ratio relative to the reported planted area lies in $[0.8, 1.2]$, so that satellite coverage is roughly consistent with official area statistics.
+
+\subsection{Imagery and climate covariates}
+Predictors are per-pixel Sentinel-2 spectral time series, organized by municipality and growing season.
+Each pixel sequence comprises ten spectral bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12) and a day-of-year index used for positional encoding.
+Climate covariates come from the Xavier daily weather grid~\citep{xavier2022} and are temporally aligned to each Sentinel-2 observation date: cumulative precipitation from 1~October through the observation date; the maximum consecutive dry-day streak between successive Sentinel-2 dates (dry day: precipitation $<1$\,mm); and season-to-date cumulative reference evapotranspiration (ETo), solar radiation (Rs), maximum temperature (Tmax), and minimum temperature (Tmin).
+All climate channels are sampled at the Xavier cell containing each pixel centroid and scaled before concatenation with normalized reflectance.
+The proposed model uses all six Xavier climate channels together with the ten spectral bands (sixteen features per timestep).
+Sequences are truncated or padded to a fixed length of $T=45$ timesteps.
+Soybean pixels are selected with the MapBiomas Collection~10 land-cover product (class~39), which defines the intramunicipal support of the downscaled maps.
+An ablation omits all climate covariates and uses the ten spectral bands alone.
+
+\subsection{Train / validation / test split}
+Splits follow a year-holdout design on municipalities.
+All municipality--year observations outside the holdout year are used for training; municipalities in the holdout year are partitioned into validation and test sets.
+The holdout year is \textbf{2021}.
+After restricting to harvest years $\{2020,2021,2022,2023,2024\}$, the training set contains 997 municipality--years, while validation and test contain 132 and 123 municipalities in 2021, respectively.
+Training target statistics used for loss normalization are mean $3.17$\,\si{t/ha} and standard deviation $0.93$\,\si{t/ha}.
+Quantitative evaluation uses municipal aggregates of the pixel predictions; intramunicipal structure is examined qualitatively through pixel maps.

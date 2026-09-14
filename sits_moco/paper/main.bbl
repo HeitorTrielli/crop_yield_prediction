@@ -1,0 +1,24 @@
+\begin{thebibliography}{2}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Xavier et~al.(2022)Xavier, Scanlon, King, and Alves]{xavier2022}
+Alexandre~C{\^a}ndido Xavier, Bridget~R. Scanlon, Carey~W. King, and Aline~I.
+  Alves.
+\newblock New improved {Brazilian} daily weather gridded data (1961--2020).
+\newblock \emph{International Journal of Climatology}, 42\penalty0
+  (16):\penalty0 8390--8404, 2022.
+\newblock \doi{10.1002/joc.7731}.
+
+\bibitem[Xu et~al.(2024)Xu, Ma, and Zhang]{xu2024sitsmoco}
+Yijia Xu, Yuchi Ma, and Zhou Zhang.
+\newblock Self-supervised pre-training for large-scale crop mapping using
+  {Sentinel-2} time series.
+\newblock \emph{ISPRS Journal of Photogrammetry and Remote Sensing},
+  207:\penalty0 312--325, 2024.
+\newblock \doi{10.1016/j.isprsjprs.2023.12.005}.
+
+\end{thebibliography}

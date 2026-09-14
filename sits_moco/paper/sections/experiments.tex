@@ -1,0 +1,26 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Proposed model}
+The proposed downscaling model combines Sentinel-2 reflectance with the full Xavier climate layout (precipitation plus cumulative ETo, Rs, Tmax, and Tmin) and uses one Transformer layer with $d_{\mathrm{model}}=128$, four attention heads, $d_{\mathrm{inner}}=128$, and dropout $0.3$.
+Model selection maximizes validation $R^2$ of municipal aggregates; the best validation epoch is 12.
+After selection, pixel scores from the same checkpoint are retained for intramunicipal maps.
+
+\subsection{Architecture search without climate}
+Separately, we grid-searched Transformer capacity and regularization using spectral inputs only:
+$d_{\mathrm{model}}\in\{64,96,128\}$, number of heads $\in\{4,8\}$, $d_{\mathrm{inner}}\in\{64,128\}$, and dropout $\in\{0.3,0.4\}$, with a single Transformer layer.
+Twenty-four configurations completed successfully.
+The best spectral-only model ($d_{\mathrm{model}}=96$, eight heads, $d_{\mathrm{inner}}=64$, dropout $0.3$) is used in the spectral-only ablation.
+
+\subsection{Evaluation protocol}
+Held-out evaluation scores municipal means of pixel predictions against PAM labels on the 2021 validation and test municipalities.
+We also report learning curves, predicted-versus-actual municipal scatters for harvest years 2020--2024, municipal error maps, and example intramunicipal pixel maps.
+
+\subsection{Ablations}
+We compare two ablations against the proposed model: a spectral-only setting that uses reflectance alone with the best spectral-only architecture from the grid search, and a temporal-pooling comparison that, with that spectral-only architecture fixed, contrasts NDVI-weighted pooling against mean pooling over valid timesteps.
+
+\subsection{Early-season evaluation}
+To assess whether downscaled estimates can be produced before the end of the season, we re-evaluate the proposed model using only the first $k$ months of imagery, $k=1,\ldots,6$.
+Season months are counted from 1~October (month 1 $=$ October, \ldots, month 6 $=$ March).
+For each $k$, observations in the retained window are truncated or padded to length $T=45$.
+Metrics are reported on municipal aggregates, pooled over municipalities and years, and separately for 2021.
