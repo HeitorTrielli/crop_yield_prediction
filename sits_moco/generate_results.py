@@ -359,7 +359,7 @@ def _build_dataset(
     min_coverage_ratio: float | None = DEFAULT_MIN_COVERAGE_RATIO,
     max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
 ) -> USCropsAggregatedNPY:
-    return USCropsAggregatedNPY(
+    dataset = USCropsAggregatedNPY(
         mode="all",
         root=datapath.resolve(),
         yield_csv=yield_csv,
@@ -376,6 +376,73 @@ def _build_dataset(
         max_coverage_ratio=max_coverage_ratio,
         legacy_input_scaling=ctx.legacy_input_scaling,
     )
+    _apply_run_extra_scaler(ctx, dataset)
+    return dataset
+
+
+def _apply_run_extra_scaler(ctx: ModelContext, dataset: USCropsAggregatedNPY) -> None:
+    """Attach the training InputScaler (incl. soil z-score) from the run config.
+
+    Without this, PixelTransform falls back to files/train_input_scaler.json which
+    may lack a soil block (mean=0, std=1) and feed raw clay/SOC (~50+) into early
+    fusion — destroying leave-out R² relative to training.
+    """
+    if ctx.legacy_input_scaling:
+        return
+    from datasets.extra_scaler import (
+        InputScaler,
+        apply_extra_scaler_to_dataset,
+        layout_needs_extra_scaler,
+    )
+    from datasets.feature_layout import feature_layout_needs_soil_sidecar
+
+    if not layout_needs_extra_scaler(ctx.feature_layout):
+        return
+
+    computed = ctx.run_config.get("computed") or {}
+    payload = computed.get("extra_scaler")
+    scaler: InputScaler | None = None
+    source = None
+    if isinstance(payload, dict) and payload.get("spectral") is not None:
+        scaler = InputScaler.from_dict(payload)
+        source = "run_config.computed.extra_scaler"
+    else:
+        path_raw = computed.get("extra_scaler_path")
+        if path_raw:
+            path = Path(str(path_raw))
+            # Prefer repo-local scaler if the absolute training path is gone.
+            local = Path("files/train_input_scaler.json")
+            if path.is_file():
+                scaler = InputScaler.load(path)
+                source = str(path)
+            elif local.is_file():
+                scaler = InputScaler.load(local)
+                source = str(local.resolve())
+
+    if scaler is None:
+        print(
+            "WARNING: no train input scaler found in run config; "
+            "PixelTransform will load files/train_input_scaler.json lazily."
+        )
+        return
+
+    apply_extra_scaler_to_dataset(dataset, scaler)
+    needs_soil = feature_layout_needs_soil_sidecar(ctx.feature_layout)
+    soil_ok = bool(np.any(np.abs(scaler.soil_mean) > 1e-6) or np.any(scaler.soil_std != 1.0))
+    print(f"Input scaler: {source}")
+    if needs_soil:
+        if soil_ok:
+            print(
+                "  soil z-score mean="
+                f"{np.array2string(scaler.soil_mean, precision=2)} "
+                f"std={np.array2string(scaler.soil_std, precision=2)}"
+            )
+        else:
+            print(
+                "  WARNING: scaler has no soil stats (mean=0,std=1) — soil channels "
+                "will be nearly unscaled. Re-fit with --refit-extra-scaler or use "
+                "the embedded training scaler."
+            )
 
 
 def _forecasts_dataframe_for_year(

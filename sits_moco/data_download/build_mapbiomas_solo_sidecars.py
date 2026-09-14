@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import argparse
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import geopandas as gpd
@@ -192,52 +193,91 @@ def _open_texture_bands(texture_paths: Path | tuple[Path, Path, Path]):
     return src, src, src, False
 
 
+class _SoilRasterCache:
+    """In-memory clay/silt/sand/SOC bands shared across ThreadPool workers.
+
+    Loading full PR rasters is ~6GB; do it once per season instead of once per
+    municipality (ProcessPool was OOM-killing workers on OneDrive/local).
+    """
+
+    __slots__ = (
+        "clay",
+        "silt",
+        "sand",
+        "carbon",
+        "tex_transform",
+        "tex_crs",
+        "tex_nodata",
+        "soc_transform",
+        "soc_crs",
+        "soc_nodata",
+    )
+
+    def __init__(
+        self,
+        texture_paths: Path | tuple[Path, Path, Path],
+        soc_path: Path,
+    ) -> None:
+        clay_src, silt_src, sand_src, separate = _open_texture_bands(texture_paths)
+        try:
+            print("  Loading texture bands into memory (once per season)...")
+            if separate:
+                self.clay = clay_src.read(1)
+                self.silt = silt_src.read(1)
+                self.sand = sand_src.read(1)
+            else:
+                self.clay = clay_src.read(1)
+                self.silt = clay_src.read(2)
+                self.sand = clay_src.read(3)
+            self.tex_transform = clay_src.transform
+            self.tex_crs = clay_src.crs
+            self.tex_nodata = clay_src.nodata
+        finally:
+            clay_src.close()
+            if separate:
+                silt_src.close()
+                sand_src.close()
+
+        print(f"  Loading SOC {soc_path.name} into memory...")
+        with rasterio.open(soc_path) as soc:
+            self.carbon = soc.read(1)
+            self.soc_transform = soc.transform
+            self.soc_crs = soc.crs
+            self.soc_nodata = soc.nodata
+
+    def sample(self, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+        n = int(lon.shape[0])
+        out = np.full((n, N_SOIL), SOIL_NODATA, dtype=np.float32)
+        tx, ty = _xy_to_crs(lon, lat, self.tex_crs)
+        sx, sy = _xy_to_crs(lon, lat, self.soc_crs)
+        rows_t, cols_t = rowcol(self.tex_transform, tx, ty)
+        rows_s, cols_s = rowcol(self.soc_transform, sx, sy)
+        rows_t = np.asarray(rows_t, dtype=np.int64)
+        cols_t = np.asarray(cols_t, dtype=np.int64)
+        rows_s = np.asarray(rows_s, dtype=np.int64)
+        cols_s = np.asarray(cols_s, dtype=np.int64)
+        _fill_from_band(out[:, 0], self.clay, rows_t, cols_t, self.tex_nodata)
+        _fill_from_band(out[:, 1], self.silt, rows_t, cols_t, self.tex_nodata)
+        _fill_from_band(out[:, 2], self.sand, rows_t, cols_t, self.tex_nodata)
+        _fill_from_band(out[:, 3], self.carbon, rows_s, cols_s, self.soc_nodata)
+        return out
+
+
 def _sample_rasters_at_lonlat(
     lon: np.ndarray,
     lat: np.ndarray,
     texture_paths: Path | tuple[Path, Path, Path],
     soc_path: Path,
+    *,
+    cache: _SoilRasterCache | None = None,
 ) -> np.ndarray:
     """Return [N, 4] float32 clay/silt/sand/soc; invalid → SOIL_NODATA."""
-    n = int(lon.shape[0])
-    out = np.full((n, N_SOIL), SOIL_NODATA, dtype=np.float32)
+    if cache is not None:
+        return cache.sample(lon, lat)
 
-    clay_src, silt_src, sand_src, separate = _open_texture_bands(texture_paths)
-    try:
-        with rasterio.open(soc_path) as soc:
-            tx, ty = _xy_to_crs(lon, lat, clay_src.crs)
-            sx, sy = _xy_to_crs(lon, lat, soc.crs)
-            rows_t, cols_t = rowcol(clay_src.transform, tx, ty)
-            rows_s, cols_s = rowcol(soc.transform, sx, sy)
-            rows_t = np.asarray(rows_t, dtype=np.int64)
-            cols_t = np.asarray(cols_t, dtype=np.int64)
-            rows_s = np.asarray(rows_s, dtype=np.int64)
-            cols_s = np.asarray(cols_s, dtype=np.int64)
-
-            if separate:
-                clay = clay_src.read(1)
-                silt = silt_src.read(1)
-                sand = sand_src.read(1)
-                tex_nd = clay_src.nodata
-            else:
-                clay = clay_src.read(1)
-                silt = clay_src.read(2)
-                sand = clay_src.read(3)
-                tex_nd = clay_src.nodata
-            carbon = soc.read(1)
-            soc_nd = soc.nodata
-
-            _fill_from_band(out[:, 0], clay, rows_t, cols_t, tex_nd)
-            _fill_from_band(out[:, 1], silt, rows_t, cols_t, tex_nd)
-            _fill_from_band(out[:, 2], sand, rows_t, cols_t, tex_nd)
-            _fill_from_band(out[:, 3], carbon, rows_s, cols_s, soc_nd)
-    finally:
-        clay_src.close()
-        if separate:
-            silt_src.close()
-            sand_src.close()
-
-    return out
+    # Fallback: load bands for this call only (avoid in ProcessPool at scale).
+    cache = _SoilRasterCache(texture_paths, soc_path)
+    return cache.sample(lon, lat)
 
 
 def _mean_masked(src, geoms, band: int = 1) -> float:
@@ -324,6 +364,8 @@ def build_soil_pixel_one(
     *,
     dry_run: bool,
     force: bool,
+    cache: _SoilRasterCache | None = None,
+    geometry_retries: int = 3,
 ) -> tuple[str, str]:
     if not npy_path.is_file():
         return code, f"error: missing npy {npy_path}"
@@ -341,10 +383,20 @@ def build_soil_pixel_one(
     if not tiff_paths:
         return code, f"error: no TIFFs in {tiff_dir}"
 
-    try:
-        _dates, rows, cols, transform, crs = _pixel_geometry_from_tiffs(code, tiff_paths)
-    except Exception as e:
-        return code, f"error: geometry {e}"
+    last_err: Exception | None = None
+    rows = cols = transform = crs = None
+    for attempt in range(max(1, int(geometry_retries))):
+        try:
+            _dates, rows, cols, transform, crs = _pixel_geometry_from_tiffs(
+                code, tiff_paths
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5 * (attempt + 1))
+    if last_err is not None or rows is None:
+        return code, f"error: geometry {last_err}"
 
     if len(rows) != n:
         return (
@@ -358,7 +410,9 @@ def build_soil_pixel_one(
 
     try:
         lon, lat = pixel_centroids_lonlat(rows, cols, transform, crs)
-        soil = _sample_rasters_at_lonlat(lon, lat, texture_paths, soc_path)
+        soil = _sample_rasters_at_lonlat(
+            lon, lat, texture_paths, soc_path, cache=cache
+        )
     except Exception as e:
         return code, f"error: sample {e}"
 
@@ -407,30 +461,27 @@ def build_soil_muni_mean_one(
     return code, "ok"
 
 
-def _worker_pixel(
+def _worker_pixel_thread(
     code: str,
-    npy_path: str,
-    tiff_dir: str,
-    soil_path: str,
-    texture_paths,
-    soc_path: str,
+    npy_path: Path,
+    tiff_dir: Path,
+    soil_path: Path,
+    texture_paths: Path | tuple[Path, Path, Path],
+    soc_path: Path,
     dry_run: bool,
     force: bool,
+    cache: _SoilRasterCache,
 ) -> tuple[str, str]:
-    tex = texture_paths
-    if isinstance(tex, list):
-        tex = tuple(Path(p) for p in tex)
-    elif isinstance(tex, str):
-        tex = Path(tex)
     return build_soil_pixel_one(
         code,
-        Path(npy_path),
-        Path(tiff_dir),
-        Path(soil_path),
-        tex,
-        Path(soc_path),
+        npy_path,
+        tiff_dir,
+        soil_path,
+        texture_paths,
+        soc_path,
         dry_run=dry_run,
         force=force,
+        cache=cache,
     )
 
 
@@ -525,50 +576,39 @@ def main() -> None:
         if not tiff_season.is_dir():
             raise SystemExit(f"Not a directory: {tiff_season}")
         workers = max(1, int(args.workers))
-        tex_arg: str | list[str]
-        if isinstance(texture_paths, tuple):
-            tex_arg = [str(p) for p in texture_paths]
-        else:
-            tex_arg = str(texture_paths)
 
         pixel_jobs = [
             (code, npy_path, tiff_season / code, soil_path)
             for code, npy_path, soil_path in jobs
         ]
+        # Load Solo bands once; ThreadPool shares the arrays (ProcessPool OOMed
+        # by re-reading ~6GB per worker).
+        soil_cache = _SoilRasterCache(texture_paths, soc_path)
+
+        def _run_one(job: tuple[str, Path, Path, Path]) -> tuple[str, str]:
+            code, npy_path, tiff_dir, soil_path = job
+            return _worker_pixel_thread(
+                code,
+                npy_path,
+                tiff_dir,
+                soil_path,
+                texture_paths,
+                soc_path,
+                args.dry_run,
+                args.force,
+                soil_cache,
+            )
+
         if workers <= 1:
-            for code, npy_path, tiff_dir, soil_path in tqdm(
-                pixel_jobs, desc="Municipalities", unit="muni"
-            ):
-                _c, status = build_soil_pixel_one(
-                    code,
-                    npy_path,
-                    tiff_dir,
-                    soil_path,
-                    texture_paths,
-                    soc_path,
-                    dry_run=args.dry_run,
-                    force=args.force,
-                )
+            for job in tqdm(pixel_jobs, desc="Municipalities", unit="muni"):
+                _c, status = _run_one(job)
                 key = status.split(":")[0]
                 counts[key] = counts.get(key, 0) + 1
                 if status.startswith("error"):
-                    print(f"[ERROR] {code}: {status}")
+                    print(f"[ERROR] {_c}: {status}")
         else:
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                futs = {
-                    ex.submit(
-                        _worker_pixel,
-                        code,
-                        str(npy_path),
-                        str(tiff_dir),
-                        str(soil_path),
-                        tex_arg,
-                        str(soc_path),
-                        args.dry_run,
-                        args.force,
-                    ): code
-                    for code, npy_path, tiff_dir, soil_path in pixel_jobs
-                }
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_run_one, job): job[0] for job in pixel_jobs}
                 for fut in tqdm(
                     as_completed(futs),
                     total=len(futs),
@@ -580,6 +620,8 @@ def main() -> None:
                     counts[key] = counts.get(key, 0) + 1
                     if status.startswith("error"):
                         print(f"[ERROR] {_c}: {status}")
+
+        del soil_cache
 
     print("Summary:", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 

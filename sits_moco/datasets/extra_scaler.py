@@ -332,16 +332,15 @@ class InputScaler:
         return dest
 
     @classmethod
-    def load(cls, path: Path | str | None = None) -> InputScaler:
-        src = Path(path) if path is not None else DEFAULT_INPUT_SCALER_PATH
-        src = src.expanduser().resolve()
-        if not src.is_file():
-            raise FileNotFoundError(_missing_scaler_msg(src))
-        payload = json.loads(src.read_text(encoding="utf-8"))
+    def from_dict(
+        cls, payload: dict[str, Any], *, path: Path | str | None = None
+    ) -> InputScaler:
+        """Build scaler from a saved JSON payload (file or embedded run-config)."""
         version = int(payload.get("version", 1))
         if version < 2 or "spectral" not in payload:
+            label = str(path) if path is not None else "payload"
             raise ValueError(
-                f"{src} is an extras-only scaler (version {version}). "
+                f"{label} is an extras-only scaler (version {version}). "
                 "Re-fit all channels with: python preprocessing/fit_xavier_extra_scaler.py"
             )
         spec = payload["spectral"]
@@ -369,6 +368,7 @@ class InputScaler:
         d_mean = {k: float(derived[k]["mean"]) for k in derived if "mean" in derived[k]}
         d_std = {k: float(derived[k]["std"]) for k in derived if "std" in derived[k]}
         d_var = {k: float(derived[k]["var"]) for k in derived if "var" in derived[k]}
+        src = Path(path).expanduser().resolve() if path is not None else None
         return cls(
             spectral_mean=spec["mean"],
             spectral_std=spec["std"],
@@ -389,6 +389,15 @@ class InputScaler:
             path=src,
             meta=meta,
         )
+
+    @classmethod
+    def load(cls, path: Path | str | None = None) -> InputScaler:
+        src = Path(path) if path is not None else DEFAULT_INPUT_SCALER_PATH
+        src = src.expanduser().resolve()
+        if not src.is_file():
+            raise FileNotFoundError(_missing_scaler_msg(src))
+        payload = json.loads(src.read_text(encoding="utf-8"))
+        return cls.from_dict(payload, path=src)
 
     @classmethod
     def try_load(cls, path: Path | str | None = None) -> InputScaler | None:
