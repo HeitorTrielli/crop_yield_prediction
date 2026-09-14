@@ -186,6 +186,9 @@ def apply_resume_params(
     out = dict(params)
     out["pretrained"] = str(Path(resume_checkpoint).resolve())
     out["overwrite_run"] = False
+    # Never re-fit the shared input scaler on resume; the interrupted run already
+    # had a fitted scaler (or will load the study cache).
+    out["refit_extra_scaler"] = False
     return out
 
 

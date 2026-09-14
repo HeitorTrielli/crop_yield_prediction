@@ -39,8 +39,8 @@ base:
   prefetch_chunks: 6
   auto_chunks_per_grad: true
   auto_chunks_per_grad_min: 1
-  auto_chunks_per_grad_vram_frac: 0.95
-  auto_chunks_per_grad_vram_target_frac: 0.90
+  auto_chunks_per_grad_vram_frac: 0.90
+  auto_chunks_per_grad_vram_target_frac: 0.85
   auto_pixel_chunk_size_min: 3500
   auto_pixel_chunk_size_step: 100
   quiet_training: true

@@ -1246,9 +1246,20 @@ def train(args):
 
         pretrain_state = pretrained_checkpoint["model_state"]
         model_dict = model.state_dict()
-        path_looks_moco = "moco" in str(pretrained_path).lower()
+        # Detect MoCo by checkpoint contents only. Do NOT substring-match the
+        # full path: this repo lives under sits_moco/, so "moco" in path is
+        # always true and would treat yield resumes as MoCo (0 tensors loaded,
+        # fresh epoch 1). Optional path hint: path *component* named moco /
+        # contrastive, or a filename that clearly starts with moco.
         has_encoder_q = any(k.startswith("encoder_q.") for k in pretrain_state)
-        moco_weight_init = path_looks_moco or has_encoder_q
+        path_parts = {p.lower() for p in pretrained_path.parts}
+        name_l = pretrained_path.name.lower()
+        path_looks_moco = (
+            "moco" in path_parts
+            or "contrastive" in path_parts
+            or name_l.startswith("moco")
+        )
+        moco_weight_init = has_encoder_q or path_looks_moco
 
         if moco_weight_init:
             # MoCo: remap encoder_q.* → trunk; skip MoCo projection head / PE buffer.
