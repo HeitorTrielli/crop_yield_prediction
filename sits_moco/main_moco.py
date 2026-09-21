@@ -1,13 +1,16 @@
 """
-This script is for SITS-MoCo pre-training task.
+SITS-MoCo pre-training for Paraná municipal pixel .npy cubes.
 
-Paraná municipal .npy (files/npy/YYYY-YYYY/…) is used when --datapath points at that
-layout; otherwise the original US-toy MoCoDataset path is kept.
+Requires ``SITS_MOCO_DATAPATH`` (or ``--datapath``) pointing at a Paraná season layout.
+The original US-toy MoCo path lives under ``archive/paper_us_classification/``.
 """
 import argparse
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
+import torch
 import torch.nn as nn
 from tqdm import tqdm
 

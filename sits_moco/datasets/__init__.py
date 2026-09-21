@@ -1,4 +1,3 @@
-from .uscrops import USCrops, MoCoDataset, BERTDataset
 from .moco_parana import (
     ParanaMoCoDataset,
     harvest_years_to_year_ranges,
@@ -12,7 +11,7 @@ from .feature_layout import (
 from .pixel_transform import PixelTransform, SPECTRAL_MEAN, SPECTRAL_STD
 from .datautils import *
 
-
+# Primary yield dataset (lazy to keep import light)
 def __getattr__(name: str):
     if name == "USCropsAggregatedNPY":
         from .uscrops_aggregated_npy_polars import USCropsAggregatedNPY

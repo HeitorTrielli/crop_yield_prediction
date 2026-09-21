@@ -2,8 +2,8 @@
 # Keeps code + data on the mount, venv on the Linux filesystem.
 #
 #   source scripts/wsl_env.sh
-#   python Calor_municipio_tiff.py
 #   uv sync          # or: bash scripts/wsl_uv_sync.sh
+#   python run_tuning_study.py show tuning/studies/productivity_soil_sidecar_moco.yaml
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "Source this file instead of executing it:" >&2

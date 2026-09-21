@@ -1,5 +1,5 @@
 """
-Derived mega-pixel / pixel feature recipes.
+Derived municipal-aggregate / pixel feature recipes.
 
 Computed at train time from the existing 17-channel .npy
 (10 S2 + DOY + 2 rain + 4 cum climate). No new files.
@@ -428,6 +428,11 @@ def recipe_input_dim(spectral: str, indices: tuple[str, ...], climate: str) -> i
 
 
 def layout_name(spectral_key: str, climate_key: str) -> str:
+    return f"ma_{spectral_key}__{climate_key}"
+
+
+def legacy_layout_name(spectral_key: str, climate_key: str) -> str:
+    """Pre-rename id (``mp_*``); kept as alias for old study configs."""
     return f"mp_{spectral_key}__{climate_key}"
 
 
@@ -442,6 +447,7 @@ def recipe_layout_records() -> list[dict[str, Any]]:
             records.append(
                 {
                     "name": layout_name(skey, ckey),
+                    "legacy_name": legacy_layout_name(skey, ckey),
                     "input_dim": dim,
                     "extra_channels_slice": (11, 17) if need_extras else None,
                     "recipe": {
@@ -450,7 +456,7 @@ def recipe_layout_records() -> list[dict[str, Any]]:
                         "climate": ckey,
                     },
                     "description": (
-                        f"Mega-pixel recipe spectral={skey} ({spectral}, "
+                        f"Municipal-aggregate recipe spectral={skey} ({spectral}, "
                         f"idx={list(indices) or 'none'}) climate={ckey} → dim {dim}."
                     ),
                 }

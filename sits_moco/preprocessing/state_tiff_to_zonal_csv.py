@@ -9,7 +9,7 @@ The TIFFs from ``download_soy_bdc_daily_tiff.py`` are already:
 
 Writes the same CSV layout as ``download_soy_gee_zonal_mean.py`` /
 ``download_soy_bdc_zonal_mean.py``, so ``zonal_csv_to_muni_npy.py`` builds
-mega-pixel .npy the same way Paraná was built from GEE zonal CSVs.
+municipal aggregate .npy the same way Paraná was built from GEE zonal CSVs.
 
 Pipeline per season:
   1. Each daily TIFF → ``{output}/{season}/_by_date/{date}.csv`` (all munis)

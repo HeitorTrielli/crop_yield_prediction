@@ -81,7 +81,7 @@ def _year_loo_folds_for_layout(search: dict, *, needs_climate: bool) -> list[dic
 
 
 def _feature_sweep_trials(search: dict) -> list[dict[str, Any]]:
-    """One trial per mp_* layout. ``year_loo`` nests holdout years inside the trial."""
+    """One trial per ma_* (alias mp_*) layout. ``year_loo`` nests holdout years inside the trial."""
     from datasets.feature_recipes import recipe_layout_records
 
     records = recipe_layout_records()

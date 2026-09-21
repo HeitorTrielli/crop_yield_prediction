@@ -4,6 +4,9 @@ Polars-optimized version for faster index loading.
 
 Pixel-level predictions are z-scores of the municipal target, mean-pooled,
 then converted back to original units (t/ha or tons) with ``z * σ + μ``.
+
+Helpers live in ``yield_utils`` (epoch loops/metrics), ``training/`` (batch/chunk/VRAM),
+and ``datasets/`` (loaders + feature layouts). Prefer ``run_tuning_study.py`` for studies.
 """
 
 import argparse
@@ -55,7 +58,7 @@ from utils import (
     recursive_todevice,
     save,
 )
-from utils_aggregated import (
+from yield_utils import (
     HEAD_OUTPUT_RAW,
     HEAD_OUTPUT_ZSCORE,
     TARGET_SPECS,
@@ -413,7 +416,7 @@ def parse_args():
             "(requires 17-channel .npy); "
             "'spectral_xavier_climate_soil' = climate + MapBiomas Solo sidecars "
             "(use --soil-fusion early|late); "
-            "'mp_*' = derived index/climate recipes (see datasets/feature_recipes.py). "
+            "'ma_*' (alias 'mp_*') = derived index/climate recipes (see datasets/feature_recipes.py). "
             "See datasets/feature_layout.py."
         ),
     )
@@ -448,7 +451,7 @@ def parse_args():
         help=(
             "Write checkpoint_epoch_*.pth every N epochs (default: 5). "
             "Set 0 to skip periodic checkpoints (model_best.pth is still saved). "
-            "Useful for fast mega-pixel runs."
+            "Useful for fast municipal-aggregate runs."
         ),
     )
     parser.add_argument(

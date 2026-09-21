@@ -22,10 +22,10 @@ from .extra_scaler import (
 )
 from .feature_layout import normalize_feature_layout, resolve_feature_layout
 from .feature_recipes import assemble_recipe, extras_from_chunk
+from .constants import NO_DATA_VALUE
 
 DOY_CHANNEL = 10
 NUM_SPECTRAL_CHANNELS = 10
-NO_DATA_VALUE = -9999
 N_SOIL = 4
 
 
@@ -167,7 +167,7 @@ class PixelTransform:
             if self._soil_sidecar:
                 raise ValueError(
                     f"Layout {self.feature_layout!r} uses soil_sidecar with a recipe; "
-                    "soil is not supported for mp_* recipes."
+                    "soil is not supported for ma_* / mp_* recipes."
                 )
             extras = extras_from_chunk(chunk_arr)
             recipe_scaler = (

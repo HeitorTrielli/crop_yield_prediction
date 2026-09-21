@@ -237,7 +237,7 @@ def ensure_moco_checkpoint(
         raise RuntimeError(
             f"MoCo checkpoint missing and moco.reuse_only is set: {ckpt}. "
             "Train that trunk on pixel .npy first "
-            "(e.g. productivity_top5_moco_parana); mega-pixel studies do not pretrain."
+            "(e.g. productivity_top5_moco_parana); municipal aggregate studies do not pretrain."
         )
 
     argv = build_moco_argv(trial_params, moco_cfg, repo_root=repo_root)

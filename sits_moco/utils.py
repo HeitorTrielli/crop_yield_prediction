@@ -1,153 +1,31 @@
 import re
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms as transforms
-from sklearn.ensemble import RandomForestClassifier
 from torch.utils.data.sampler import SubsetRandomSampler
 
 import moco.builder
-import moco.loader
-from datasets import *
-from models import *
+from datasets import (
+    ParanaMoCoDataset,
+    RandomAddNoise,
+    RandomSampleTimeSteps,
+    RandomTempRemoval,
+    RandomTempShift,
+    harvest_years_to_year_ranges,
+    is_parana_npy_layout,
+)
+from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
+from models import STNet, TransformerModel
 
 
 # -------------------------- #
 #          dataset           #
 # -------------------------- #
-def get_sup_dataloader(
-    modelname,
-    datapath,
-    year,
-    batchsize,
-    workers,
-    sequencelength,
-    num,
-    interp,
-    rc,
-    useall=False,
-    nclasses=20,
-    seed=111,
-):
-    train_dataaug = RandomTempShift()
-
-    if modelname in ["rf", "RF"]:
-        num_train = int(num * 0.9)
-        num_val = num - num_train
-        traindataset = USCrops(
-            mode="train",
-            root=datapath,
-            year=year,
-            sequencelength=sequencelength,
-            dataaug=train_dataaug,
-            num=num_train,
-            interp=interp,
-            nclasses=nclasses,
-            seed=seed,
-        )
-        testdataset = USCrops(
-            mode="eval",
-            root=datapath,
-            year=year,
-            sequencelength=sequencelength,
-            useall=useall,
-            num=num_val,
-            nclasses=nclasses,
-            interp=interp,
-            seed=seed,
-        )
-
-        X_train = traindataset.X_list
-        for i, X in enumerate(X_train):
-            X_train[i] = USCrops.transform(traindataset, X, interp=interp, rc=rc)[
-                0
-            ].numpy()
-        X_train = np.array(X_train).reshape(len(X_train), -1)
-        y_train = traindataset.index["classid"].values
-
-        X_test = testdataset.X_list
-        for i, X in enumerate(X_test):
-            X_test[i] = USCrops.transform(testdataset, X, interp=interp, rc=rc)[
-                0
-            ].numpy()
-        X_test = np.array(X_test).reshape(len(X_test), -1)
-        y_test = testdataset.index["classid"].values
-
-        meta = dict(
-            ndims=10 * sequencelength,
-            num_classes=traindataset.nclasses + 1,
-        )
-
-        return (X_train, y_train, X_test, y_test), meta
-
-    else:
-        num_train = int(num * 0.9)
-        num_val = num - num_train
-        traindataset = USCrops(
-            mode="train",
-            root=datapath,
-            year=year,
-            sequencelength=sequencelength,
-            dataaug=train_dataaug,
-            useall=useall,
-            num=num_train,
-            randomchoice=rc,
-            interp=interp,
-            nclasses=nclasses,
-            seed=seed,
-        )
-        valdataset = USCrops(
-            mode="valid",
-            root=datapath,
-            year=year,
-            sequencelength=sequencelength,
-            useall=useall,
-            num=num_val,
-            randomchoice=rc,
-            interp=interp,
-            nclasses=nclasses,
-            seed=seed,
-        )
-        testdataset = USCrops(
-            mode="eval",
-            root=datapath,
-            year=year,
-            sequencelength=sequencelength,
-            useall=useall,
-            num=num_val,
-            randomchoice=rc,
-            interp=interp,
-            nclasses=nclasses,
-            seed=seed,
-        )
-
-        traindataloader = torch.utils.data.DataLoader(
-            traindataset,
-            batch_size=batchsize,
-            shuffle=True,
-            num_workers=workers,
-            pin_memory=True,
-        )
-        valdataloader = torch.utils.data.DataLoader(
-            valdataset, batch_size=batchsize, shuffle=False, num_workers=workers
-        )
-        testdataloader = torch.utils.data.DataLoader(
-            testdataset,
-            batch_size=batchsize,
-            shuffle=False,
-            num_workers=workers,
-            pin_memory=True,
-        )
-        meta = dict(
-            ndims=10,
-            num_classes=traindataset.nclasses + 1,
-        )
-
-        return (traindataloader, valdataloader, testdataloader), meta
-
-
 def get_moco_dataloader(
     datapath,
     year,
@@ -163,8 +41,7 @@ def get_moco_dataloader(
     rebuild_cache=False,
     feature_layout="spectral",
 ):
-    from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
-
+    """Paraná municipal .npy MoCo dataloader (US-toy path archived)."""
     feature_layout = normalize_feature_layout(feature_layout)
     input_dim = feature_layout_input_dim(feature_layout)
 
@@ -178,36 +55,27 @@ def get_moco_dataloader(
     )
 
     datapath = Path(datapath)
-    if year_ranges or is_parana_npy_layout(datapath):
-        if not year_ranges:
-            # Single --year Y interpreted as harvest year → (Y-1)-Y
-            year_ranges = harvest_years_to_year_ranges([int(year)])
-        # --useall / --num only affect max_samples when Paraná layout is used
-        if useall:
-            n_samples = int(max_samples) if max_samples and max_samples > 0 else 500_000
-        else:
-            n_samples = int(num) if num and num > 0 else int(max_samples)
-        pretraindataset = ParanaMoCoDataset(
-            root=datapath,
-            year_ranges=list(year_ranges),
-            sequencelength=sequencelength,
-            dataaug=train_dataaug,
-            max_samples=n_samples,
-            seed=seed,
-            rebuild_cache=rebuild_cache,
-            feature_layout=feature_layout,
-        )
+    if not year_ranges:
+        if not is_parana_npy_layout(datapath):
+            raise ValueError(
+                f"MoCo expects a Paraná municipal .npy layout under {datapath}. "
+                "The US-toy MoCo path was moved to archive/paper_us_classification/."
+            )
+        year_ranges = harvest_years_to_year_ranges([int(year)])
+    if useall:
+        n_samples = int(max_samples) if max_samples and max_samples > 0 else 500_000
     else:
-        pretraindataset = MoCoDataset(
-            root=datapath,
-            year=year,
-            sequencelength=sequencelength,
-            dataaug=train_dataaug,
-            num=num,
-            randomchoice=rc,
-            seed=seed,
-            useall=useall,
-        )
+        n_samples = int(num) if num and num > 0 else int(max_samples)
+    pretraindataset = ParanaMoCoDataset(
+        root=datapath,
+        year_ranges=list(year_ranges),
+        sequencelength=sequencelength,
+        dataaug=train_dataaug,
+        max_samples=n_samples,
+        seed=seed,
+        rebuild_cache=rebuild_cache,
+        feature_layout=feature_layout,
+    )
 
     num = len(pretraindataset)
     num_train = int(num * 0.9)
@@ -243,100 +111,20 @@ def get_moco_dataloader(
     return traindataloader, valdataloader, meta
 
 
-def get_bert_dataloader(
-    datapath, year, batchsize, workers, sequencelength, num, rc, seed, useall
-):
-    pretraindataset = BERTDataset(
-        root=datapath,
-        year=year,
-        sequencelength=sequencelength,
-        num=num,
-        randomchoice=rc,
-        seed=seed,
-        useall=useall,
-    )
-    num = len(pretraindataset)
-    num_train = int(num * 0.9)
-    indices = list(range(num))
-    np.random.shuffle(indices)
-
-    train_idx, valid_idx = indices[:num_train], indices[num_train:]
-    train_sampler = SubsetRandomSampler(train_idx)
-    valid_sampler = SubsetRandomSampler(valid_idx)
-
-    traindataloader = torch.utils.data.DataLoader(
-        pretraindataset,
-        batch_size=batchsize,
-        sampler=train_sampler,
-        num_workers=workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    valdataloader = torch.utils.data.DataLoader(
-        pretraindataset,
-        batch_size=batchsize,
-        sampler=valid_sampler,
-        num_workers=workers,
-        drop_last=True,
-    )
-    meta = dict(
-        ndims=10,
-    )
-
-    return traindataloader, valdataloader, meta
-
-
 # -------------------------- #
 #           Model            #
 # -------------------------- #
-def get_model(modelname, ndims, num_classes, sequencelength, device):
-    modelname = modelname.lower()  # make case invariant
-    if modelname == "transformer":
-        model = TransformerModel(
-            input_dim=ndims, num_classes=num_classes, max_seq_len=sequencelength
-        ).to(device)
-    elif modelname == "tempcnn":
-        model = TempCNN(
-            input_dim=ndims, num_classes=num_classes, max_seq_len=sequencelength
-        ).to(device)
-    elif modelname == "lstm":
-        model = LSTM(input_dim=ndims, num_classes=num_classes).to(device)
-    elif modelname == "ltae":
-        model = LTAE(
-            input_dim=ndims, num_classes=num_classes, max_seq_len=sequencelength
-        ).to(device)
-    elif modelname == "rf":
-        model = RandomForestClassifier(n_estimators=500, max_depth=25)
-    elif modelname == "stnet":
-        model = STNet(
-            input_dim=ndims, num_classes=num_classes, max_seq_len=sequencelength
-        ).to(device)
-    else:
-        raise ValueError(
-            "invalid model argument. choose from 'Transformer', 'TempCNN', 'LSTM', 'LTAE', 'RF', or 'STNet' "
-        )
-
-    return model
-
-
 def get_moco_model(modelname, device, args):
-    from functools import partial
-
-    from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
-
     modelname = modelname.lower()
     if modelname == "transformer":
         basemodel = TransformerModel
-    elif modelname == "tempcnn":
-        basemodel = TempCNN
-    elif modelname == "lstm":
-        basemodel = LSTM
-    elif modelname == "ltae":
-        basemodel = LTAE
     elif modelname == "stnet":
         basemodel = STNet
     else:
-        raise ValueError("invalid model - basemodel argument")
+        raise ValueError(
+            "invalid MoCo backbone; choose 'transformer' or 'stnet' "
+            "(LSTM/LTAE/TempCNN archived under archive/paper_us_classification/)"
+        )
 
     feature_layout = normalize_feature_layout(
         getattr(args, "feature_layout", "spectral")
@@ -348,26 +136,15 @@ def get_moco_model(modelname, device, args):
     d_inner = int(getattr(args, "model_d_inner", 128))
     dropout = float(getattr(args, "model_dropout", 0.2))
 
-    if modelname in ("transformer", "stnet"):
-        basemodel_factory = partial(
-            basemodel,
-            input_dim=input_dim,
-            d_model=d_model,
-            n_head=n_head,
-            n_layers=n_layers,
-            d_inner=d_inner,
-            dropout=dropout,
-        )
-    elif modelname == "ltae":
-        basemodel_factory = partial(
-            basemodel,
-            input_dim=input_dim,
-            d_model=d_model,
-            n_head=n_head,
-            dropout=dropout,
-        )
-    else:
-        basemodel_factory = partial(basemodel, input_dim=input_dim, dropout=dropout)
+    basemodel_factory = partial(
+        basemodel,
+        input_dim=input_dim,
+        d_model=d_model,
+        n_head=n_head,
+        n_layers=n_layers,
+        d_inner=d_inner,
+        dropout=dropout,
+    )
 
     model = moco.builder.MoCo(
         basemodel_factory, args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Append Xavier rain to municipal mega-pixel .npy, masked to MapBiomas soy.
+Append Xavier rain to municipal municipal aggregate .npy, masked to MapBiomas soy.
 
 No Earth Engine. Soy locations come from the public MapBiomas Collection 10
 COG (windowed HTTP read of each municipality shapefile). Rain is Xavier daily
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
         "--npy-root",
         type=Path,
         default=Path("~/sits_moco_data/npy_muni_mean"),
-        help="Municipal mega-pixel root {YYYY-YYYY}/{code}/{code}.npy",
+        help="Municipal municipal aggregate root {YYYY-YYYY}/{code}/{code}.npy",
     )
     p.add_argument(
         "--shapefile-dir",

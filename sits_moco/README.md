@@ -1,60 +1,80 @@
-# SITS-MoCo
+# sits_moco — Paraná soy productivity (pixel-level)
 
-PyTorch implementation of  ["Self-supervised pre-training for large-scale crop mapping using Sentinel-2 time series"](http://dx.doi.org/10.1016/j.isprsjprs.2023.12.005)
+Predict municipal soy **productivity** (t/ha) from Sentinel-2 time series at **pixel** resolution, then aggregate to municipalities for training against IBGE/PAM labels. Optional **MoCo** pretraining warms the encoder.
 
-<img src="png/Figure_3_1.png" title="" alt="" data-align="center">
+Forked from [SITS-MoCo](http://dx.doi.org/10.1016/j.isprsjprs.2023.12.005) (US crop mapping). The live product path is Brazilian yield regression, not US classification.
 
-**Abstract:** Large-scale crop mapping is essential for various agricultural applications, such as yield prediction and agricultural resource management. The current most advanced techniques for crop mapping utilize deep learning (DL) models on satellite imagery time series (SITS). Despite advancements, the efficacy of DL-based crop mapping methods is impeded by the arduous task of acquiring crop-type labels and the extensive pre-processing required on satellite data. To address these issues, we proposed a Transformer-based DL model and a self-supervised pre-training framework for the label-scarce crop mapping task. Specifically, we first developed a Transformer-based Spectral Temporal Network (STNet) which is designed to extract task-informative features from time-series remote sensing (RS) imagery via the self-attention mechanism. A self-supervised pre-training strategy, namely SITS-MoCo, was then proposed to learn robust and generalizable representations from time-series RS imagery that is invariant to spectral noise, temporal shift, and irregular-length data. To evaluate the proposed framework, experiments were conducted using Sentinel-2 time series and high-confident Cropland Data Layer (CDL) reference data on six geographically scattered study sites across the United States from 2019 to 2021. The experimental results demonstrated that the framework had superior performance in comparison to other advanced DL models and self-supervised pre-training techniques. The pre-training strategy was proven to effectively alleviate the need for complex data pre-processing and training labels for the downstream crop mapping task. Overall, this research presented a novel pipeline for improving model performance on lar  ge-scale crop mapping with limited labels and provided a viable solution to efficiently exploit available satellite data that can be easily adapted to other large-area classification tasks.
+## Setup
 
-## Requirements
-
-* Pytorch 3.8.12, PyTorch 1.11.0, and more in `environment.yml`
-
-## Usage
-
-Setup conda environment and activate
-
-```
-conda env create -f environment.yml
-conda activate py38
+```bash
+uv sync
+cp .env.example .env   # set SITS_MOCO_DATAPATH to your municipal .npy root
 ```
 
-Set `DATAPATH` in `main_tscls.py` or `main_moco.py` to your data path. 
+Requires Python `>=3.10,<3.13`. Dependencies live in [`pyproject.toml`](pyproject.toml) (do not use the old conda `environment.yml` workflow).
 
+## Primary pipeline
 
+1. **Download** imagery / climate / soil / PAM — see [`docs/PIPELINE.md`](docs/PIPELINE.md)
+2. **Preprocess** daily TIFF → municipal pixel `.npy` (+ MapBiomas soil sidecars)
+3. **Train / tune**
+4. **Predict** municipal forecasts and pixel heatmaps
 
-Example: pre-train model using SITS-MoCo
+```bash
+# Hyperparameter study (recommended)
+python run_tuning_study.py run tuning/studies/productivity_soil_sidecar_moco.yaml --skip-completed
 
-```
+# Single training run
+python main_yield_regression_polars.py --help
+
+# MoCo encoder pretrain (Paraná pixels)
 python main_moco.py transformer --rc --use-doy --useall --mlp
+
+# Inference / maps
+python eval/predict_yield.py --help
+python viz/create_pixel_heatmap.py --help
+python eval/generate_results.py --help
 ```
 
-Train STNet with pre-trained model
+Entry points to remember: `main_yield_regression_polars.py`, `main_moco.py`, `run_tuning_study.py`.
 
-```
-python main_tscls.py stnet --rc --pretrained checkpoints/pretrained/MoCoV2_TRSF_doy/model_best.pth
-```
+## Secondary tracks
 
-## Reference
+Kept for ablations; not the default onboarding path:
 
-In case you find SITS-MoCo or the code useful, please consider citing our paper using the following BibTex entry:
+- **Municipal aggregate** — one mean/median time series per municipality (`npy_muni_mean` / `npy_muni_median`). Studies under `tuning/studies/secondary/`.
+- **Zonal mean** — municipality stats from GEE/BDC zonal CSVs instead of daily pixel cubes.
 
-```
+## Layout (code)
+
+| Path | Role |
+|------|------|
+| `datasets/` | Pixel loaders, feature layouts, soil sidecars |
+| `models/` | `STNetRegression` (+ MoCo transfer) |
+| `training/` | Batch/chunk/VRAM training internals |
+| `tuning/` | YAML study runner |
+| `preprocessing/` | TIFF → npy, aggregation |
+| `data_download/` | Ingest (BDC/GEE, Xavier, MapBiomas, PAM) |
+| `eval/` | Predict, metrics, result bundles |
+| `viz/` | Heatmaps and scatter/choropleth plots |
+| `tools/` | Debug and profiling helpers |
+| `archive/` | Original US classification paper code |
+
+Full data DAG and study triage: [`docs/PIPELINE.md`](docs/PIPELINE.md).
+
+## Citation
+
+If you use the MoCo / STNet ideas from the original paper:
+
+```bibtex
 @article{xu_self-supervised_2024,
-	title = {Self-supervised pre-training for large-scale crop mapping using Sentinel-2 time series},
-	volume = {207},
-	issn = {0924-2716},
-	doi = {10.1016/j.isprsjprs.2023.12.005},
-	pages = {312--325},
-	journaltitle = {{ISPRS} Journal of Photogrammetry and Remote Sensing},
-	shortjournal = {{ISPRS} Journal of Photogrammetry and Remote Sensing},
-	author = {Xu, Yijia and Ma, Yuchi and Zhang, Zhou},
+  title = {Self-supervised pre-training for large-scale crop mapping using Sentinel-2 time series},
+  volume = {207},
+  doi = {10.1016/j.isprsjprs.2023.12.005},
+  journal = {ISPRS Journal of Photogrammetry and Remote Sensing},
+  author = {Xu, Yijia and Ma, Yuchi and Zhang, Zhou},
+  year = {2024},
 }
-
 ```
 
-## Credits
-
-- The implementation of MoCo is based on [the official implementation](https://github.com/facebookresearch/moco)
-
-- The Sentinel-2 imagery were accessed from the [GEE platform (Sentinel-2 MSI, Level-2A)](https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2_SR); and the annotations used in the dataset from the [Cropland Data Layer (CDL) by USDA NASS](https://www.nass.usda.gov/Research_and_Science/Cropland/SARS1a.php), which were also accessed from the [GEE platform (USDA NASS Cropland Data Layer)](https://developers.google.com/earth-engine/datasets/catalog/USDA_NASS_CDL)
+MoCo implementation based on [Facebook MoCo](https://github.com/facebookresearch/moco).
