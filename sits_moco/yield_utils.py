@@ -488,6 +488,7 @@ def aggregate_municipality_from_pixel_chunks(
     head_output: str = HEAD_OUTPUT_RAW,
     target_mean=None,
     target_std=None,
+    debug_callback=None,
 ) -> float | None:
     """Run STNet on pixel chunks; aggregate to municipality prediction (sum or mean)."""
     from torch.amp import autocast
@@ -498,7 +499,7 @@ def aggregate_municipality_from_pixel_chunks(
     acc = MunicipalityPixelAccumulator(pool)
     model.eval()
     with torch.no_grad():
-        for pixel_chunk in pixel_chunks:
+        for chunk_index, pixel_chunk in enumerate(pixel_chunks):
             unpacked = unpack_pixel_chunk(pixel_chunk)
             if unpacked is None:
                 continue
@@ -509,6 +510,8 @@ def aggregate_municipality_from_pixel_chunks(
                 else torch.no_grad()
             ):
                 chunk_predictions = model(municipality_X_chunk)
+            if debug_callback is not None:
+                debug_callback(chunk_index, unpacked, chunk_predictions)
             acc.add(chunk_predictions)
 
     result = acc.value()

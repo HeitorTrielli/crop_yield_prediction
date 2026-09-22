@@ -1,5 +1,5 @@
 """
-End-to-end post-training results pipeline for a single STNet checkpoint.
+End-to-end post-training results pipeline for a single STNet / DualSTNet checkpoint.
 
 Loads the model once and produces:
   1. Incomplete-series municipal evaluation (k=1..6) with per-year forecast CSVs.
@@ -51,13 +51,12 @@ from datasets import (
     USCropsAggregatedNPY,
     filter_yield_pandas_by_coverage,
 )
-from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
+from datasets.feature_layout import normalize_feature_layout
 from evaluate_incomplete_series import (
     batched_predict_all_periods,
     inference_args_from_run_config,
     inference_batch_size_from_run_config,
 )
-from models import STNetRegression
 from plot_municipal_yield_map import plot_choropleth_column
 from plot_productivity_scatter import run_productivity_scatter_for_forecasts
 from predict_yield_talhoes import run_talhao_predictions
@@ -70,17 +69,14 @@ from run_paths import (
     resolve_checkpoint_path,
     run_dir_from_path,
 )
+from training.inference_core import build_stnet_from_checkpoint, load_checkpoint
 from utils_aggregated import (
     regression_metrics,
-    resolve_head_output,
     resolve_inference_chunk_size,
-    resolve_inference_target,
-    resolve_model_kwargs,
     resolve_pixel_chunk_size,
-    stnet_regression_input_dim_from_state_dict,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 YIELD_CSV = REPO_ROOT / "files" / "pam_soy_pr_2019_2025.csv"
 DEFAULT_TIFFPATH = REPO_ROOT / "files" / "daily_tiff"
 DEFAULT_TALHOES = REPO_ROOT / "benchmark" / "talhoes_baseline.geojson"
@@ -99,7 +95,7 @@ class ModelContext:
     run_dir: Path
     run_config: dict
     checkpoint_data: dict
-    model: STNetRegression
+    model: torch.nn.Module
     device: torch.device
     input_dim: int
     feature_layout: str
@@ -117,6 +113,8 @@ class ModelContext:
     target_mean: float | None
     target_std: float | None
     legacy_input_scaling: bool = False
+    climate_sequencelength: int = 183
+    is_dual: bool = False
 
 
 @dataclass
@@ -146,7 +144,7 @@ def load_model_context(
     interp: bool | None = None,
     legacy_input_scaling: bool = False,
 ) -> ModelContext:
-    """Load checkpoint, run config, and STNet model once for reuse across pipeline steps."""
+    """Load checkpoint, run config, and STNet/DualSTNet once for reuse across pipeline steps."""
     checkpoint = resolve_checkpoint_path(checkpoint)
     run_dir = run_dir_from_path(checkpoint)
     run_config = load_latest_run_config(checkpoint)
@@ -185,43 +183,15 @@ def load_model_context(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    checkpoint_data = torch.load(
-        checkpoint, map_location=torch_device, weights_only=False
-    )
-    state_dict = checkpoint_data["model_state"]
-    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
+    checkpoint_data = load_checkpoint(checkpoint, torch_device)
     layout = normalize_feature_layout(args.feature_layout)
-    expected_dim = feature_layout_input_dim(layout)
-    if input_dim != expected_dim:
-        raise ValueError(
-            f"Checkpoint has input_dim={input_dim} but feature_layout {layout!r} "
-            f"implies {expected_dim}."
-        )
-    ck_fl = checkpoint_data.get("feature_layout")
-    if ck_fl is not None and normalize_feature_layout(ck_fl) != layout:
-        raise ValueError(
-            f"Checkpoint feature_layout={ck_fl!r} does not match config {layout!r}."
-        )
-
-    model_kw = resolve_model_kwargs(run_config, checkpoint_data)
-    model = STNetRegression(
-        input_dim=input_dim,
-        num_outputs=1,
-        max_seq_len=args.sequencelength,
-        **model_kw,
-    ).to(torch_device)
-    if hasattr(model, "_orig_mod"):
-        model._orig_mod.load_state_dict(state_dict, strict=False)
-    else:
-        model.load_state_dict(state_dict, strict=False)
-    model.eval()
-
-    target, target_column, aggregation, target_unit = resolve_inference_target(
-        run_config, checkpoint_data
+    model, meta = build_stnet_from_checkpoint(
+        checkpoint_data,
+        device=torch_device,
+        sequencelength=args.sequencelength,
+        run_config=run_config,
+        feature_layout=layout,
     )
-    head_output = resolve_head_output(checkpoint_data, run_config)
-    target_mean = checkpoint_data.get("target_mean")
-    target_std = checkpoint_data.get("target_std")
 
     return ModelContext(
         checkpoint=checkpoint,
@@ -230,22 +200,24 @@ def load_model_context(
         checkpoint_data=checkpoint_data,
         model=model,
         device=torch_device,
-        input_dim=input_dim,
+        input_dim=meta["input_dim"],
         feature_layout=layout,
         sequencelength=args.sequencelength,
         seed=args.seed,
         rc=rc,
         interp=interp,
-        target=target,
-        target_column=target_column,
-        aggregation=aggregation,
-        target_unit=target_unit,
+        target=meta["target"],
+        target_column=meta["target_column"],
+        aggregation=meta["aggregation"],
+        target_unit=meta["target_unit"],
         chunk_size=chunk_size,
         reference_date=reference_date,
-        head_output=head_output,
-        target_mean=target_mean,
-        target_std=target_std,
+        head_output=meta["head_output"],
+        target_mean=meta.get("target_mean"),
+        target_std=meta.get("target_std"),
         legacy_input_scaling=bool(legacy_input_scaling),
+        climate_sequencelength=int(meta["climate_sequencelength"]),
+        is_dual=bool(meta["is_dual"]),
     )
 
 
@@ -385,6 +357,7 @@ def _build_dataset(
         min_coverage_ratio=min_coverage_ratio,
         max_coverage_ratio=max_coverage_ratio,
         legacy_input_scaling=ctx.legacy_input_scaling,
+        climate_sequencelength=ctx.climate_sequencelength,
     )
     _apply_run_extra_scaler(ctx, dataset)
     return dataset
@@ -738,6 +711,7 @@ def run_guarapuava_heatmaps(
             legacy_input_scaling=ctx.legacy_input_scaling,
             feature_layout=ctx.feature_layout,
             extra_scaler=extra_scaler,
+            climate_sequencelength=ctx.climate_sequencelength,
         )
         if bundle[0] is None:
             print(f"  Skipped {label}: inference failed")
@@ -844,6 +818,7 @@ def run_talhao_evaluations(
             aggregation=ctx.aggregation,
             run_config=ctx.run_config,
             legacy_input_scaling=ctx.legacy_input_scaling,
+            climate_sequencelength=ctx.climate_sequencelength,
         )
         outputs[harvest_year] = output_csv
     return outputs
@@ -972,7 +947,19 @@ def generate_results(
     """
     from env_config import resolve_datapath
 
-    yield_csv_path = Path(yield_csv) if yield_csv else YIELD_CSV
+    if yield_csv is not None:
+        yield_csv_path = Path(yield_csv)
+    else:
+        config = load_latest_run_config(resolve_checkpoint_path(checkpoint))
+        configured = ((config.get("cli") or {}).get("yield_csv"))
+        candidates = []
+        if configured:
+            configured_path = Path(str(configured))
+            candidates.extend(
+                [configured_path, REPO_ROOT / "files" / configured_path.name]
+            )
+        candidates.append(YIELD_CSV)
+        yield_csv_path = next((p for p in candidates if p.is_file()), YIELD_CSV)
     datapath_resolved = resolve_datapath(datapath)
     tiffpath_resolved = Path(tiffpath) if tiffpath else DEFAULT_TIFFPATH
 
@@ -993,9 +980,49 @@ def generate_results(
 
     years = resolve_harvest_years(ctx, harvest_years, yield_csv_path)
     leave_out_years = resolve_leave_out_years(ctx, holdout_year)
+
+    # A municipal-mean dataset has one aggregate series per municipality-year.
+    # It supports municipal evaluation, but cannot be mapped back to TIFF pixels.
+    municipal_samples: list[Path] = []
+    for pattern in ("*/*/*.npy", "*/*.npy"):
+        for candidate in datapath_resolved.glob(pattern):
+            if candidate.stem == candidate.parent.name:
+                municipal_samples.append(candidate)
+                if len(municipal_samples) >= 8:
+                    break
+        if len(municipal_samples) >= 8:
+            break
+    is_municipal_mean = bool(municipal_samples)
+    for sample in municipal_samples:
+        try:
+            if len(np.load(sample, mmap_mode="r")) != 1:
+                is_municipal_mean = False
+                break
+        except (OSError, ValueError):
+            is_municipal_mean = False
+            break
+    if is_municipal_mean and (not skip_guarapuava or not skip_talhoes):
+        print(
+            "Municipal-mean inputs detected (one series per municipality-year): "
+            "skipping Guarapuava heatmaps and talhão evaluation because no "
+            "pixel-level spatial mapping exists."
+        )
+        skip_guarapuava = True
+        skip_talhoes = True
+
     if verbose:
         print(f"Checkpoint: {ctx.checkpoint}")
         print(f"Run dir:    {ctx.run_dir}")
+        print(
+            f"Model: {'DualSTNet' if ctx.is_dual else 'STNet'} "
+            f"(layout={ctx.feature_layout}, input_dim={ctx.input_dim}"
+            + (
+                f", climate_seq={ctx.climate_sequencelength}"
+                if ctx.is_dual
+                else ""
+            )
+            + ")"
+        )
         print(f"Harvest years: {years}")
         print(f"Holdout year:  {holdout_year}")
         if ctx.legacy_input_scaling:

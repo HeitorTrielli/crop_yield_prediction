@@ -1519,6 +1519,23 @@ class USCropsAggregatedNPY(Dataset):
     ):
         """Yield STNet batches for one k from a DOY-sorted in-season packing."""
         k = int(num_periods)
+        climate_period = climate
+        if climate is not None and k < 6:
+            # Daily climate has no explicit DOY channel: it is stored Oct 1 onward.
+            # Keep only the same first k season months as Sentinel. A 183-day
+            # sidecar identifies a leap-season February.
+            clim_arr = np.asarray(climate)
+            time_axis = 0 if clim_arr.ndim == 2 else 1
+            n_days = int(clim_arr.shape[time_axis])
+            cumulative_days = [31, 61, 92, 123, 151, n_days]
+            if n_days >= 183:
+                cumulative_days[4] += 1
+            stop = min(n_days, cumulative_days[k - 1])
+            climate_period = (
+                clim_arr[:stop]
+                if clim_arr.ndim == 2
+                else clim_arr[:, :stop, :]
+            )
         counts = ((season_sorted >= 1) & (season_sorted <= k)).sum(axis=1)
         # Keep earliest sequencelength days (matches incomplete-series docstring).
         counts_eff = np.minimum(counts, int(self.sequencelength))
@@ -1532,7 +1549,7 @@ class USCropsAggregatedNPY(Dataset):
             stacked = np.ascontiguousarray(gathered[idx, :length])
             soil_chunk = None if soil is None else np.ascontiguousarray(soil[idx])
             yield self._transform_chunk(
-                stacked, soil=soil_chunk, climate=climate
+                stacked, soil=soil_chunk, climate=climate_period
             )
 
     def iter_period_pixel_chunks_from_data(

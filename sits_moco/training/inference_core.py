@@ -28,6 +28,20 @@ def load_checkpoint(path: str | Path, device: str | torch.device) -> dict[str, A
     return torch.load(path, map_location=device, weights_only=False)
 
 
+def resolve_climate_sequencelength(
+    run_config: dict | None = None,
+    model_kw: dict | None = None,
+) -> int:
+    """Climate pad length from model kwargs / CLI, else ``CLIMATE_MAX_SEQ_LEN``."""
+    kw = model_kw or {}
+    cli = (run_config or {}).get("cli") or {}
+    return int(
+        kw.get("climate_max_seq_len")
+        or cli.get("climate_sequencelength")
+        or CLIMATE_MAX_SEQ_LEN
+    )
+
+
 def build_stnet_from_checkpoint(
     checkpoint: dict[str, Any],
     *,
@@ -35,11 +49,13 @@ def build_stnet_from_checkpoint(
     sequencelength: int,
     run_config: dict | None = None,
     feature_layout: str | None = None,
-) -> tuple[STNetRegression, dict[str, Any]]:
+) -> tuple[STNetRegression | DualSTNetRegression, dict[str, Any]]:
     """
-    Construct ``STNetRegression``, load weights, return ``(model, meta)``.
+    Construct ``STNetRegression`` or ``DualSTNetRegression``, load weights,
+    return ``(model, meta)``.
 
-    ``meta`` includes input_dim, feature_layout, head_output, target_*, model_kw.
+    ``meta`` includes input_dim, feature_layout, head_output, target_*,
+    model_kw, climate_sequencelength, is_dual.
     """
     state_dict = checkpoint["model_state"]
     input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
@@ -62,7 +78,9 @@ def build_stnet_from_checkpoint(
     )
     head_output = resolve_head_output(checkpoint, run_config)
     model_kw = resolve_model_kwargs(run_config or {}, checkpoint)
-    if is_dual_stnet_state_dict(state_dict):
+    climate_seq = resolve_climate_sequencelength(run_config, model_kw)
+    is_dual = is_dual_stnet_state_dict(state_dict)
+    if is_dual:
         spec_w = state_dict.get("spectral.mlp1.0.lin.weight")
         clim_w = state_dict.get("climate.mlp1.0.lin.weight")
         spectral_dim = int(spec_w.shape[1]) if spec_w is not None else 10
@@ -87,12 +105,7 @@ def build_stnet_from_checkpoint(
                 "climate_max_seq_len",
             }
         }
-        cli = (run_config or {}).get("cli") or {}
-        climate_seq = int(
-            dual_kw.pop("climate_max_seq_len", None)
-            or cli.get("climate_sequencelength")
-            or CLIMATE_MAX_SEQ_LEN
-        )
+        dual_kw.pop("climate_max_seq_len", None)
         model = DualSTNetRegression(
             spectral_dim=spectral_dim,
             climate_dim=climate_dim,
@@ -131,5 +144,7 @@ def build_stnet_from_checkpoint(
         "target_std": checkpoint.get("target_std", 1.0),
         "head_output": head_output,
         "model_kw": model_kw,
+        "climate_sequencelength": climate_seq,
+        "is_dual": is_dual,
     }
     return model, meta

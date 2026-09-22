@@ -89,13 +89,17 @@ def _try_muni_agg_inference(
         is_muni_agg_batch(num_pixels_list) and dataset_supports_muni_agg_stack(dataset)
     ):
         return None
+    # Municipal-mean inputs already contain exactly one full-season series.
+    # For k=6, use the identical transform used by validation/training instead
+    # of the incomplete-series sort/filter path.
+    full_season = num_periods is not None and int(num_periods) >= 6
     stacked, kept = load_stacked_muni_agg_batch(
         dataset,
         municipalities,
         years,
         workers=max(1, int(getattr(args, "workers", 8) or 8)),
-        num_periods=num_periods,
-        reference_date=reference_date,
+        num_periods=None if full_season else num_periods,
+        reference_date=None if full_season else reference_date,
     )
     if stacked is None or not kept:
         return None

@@ -48,13 +48,13 @@ from rasterio.warp import Resampling, reproject
 from torch.amp import autocast
 from tqdm import tqdm
 
+from datasets.daily_climate import climate_sidecar_path
 from datasets.feature_layout import (
-    feature_layout_input_dim,
+    feature_layout_needs_climate_sidecar,
     feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
 )
 from datasets.pixel_transform import N_SOIL, PixelTransform
-from models import STNetRegression
 from run_paths import (
     apply_run_config_to_args,
     load_latest_run_config,
@@ -62,12 +62,12 @@ from run_paths import (
     resolve_checkpoint_path,
     run_dir_from_path,
 )
+from training.inference_core import build_stnet_from_checkpoint, load_checkpoint
 from utils_aggregated import (
     denormalize_head_output,
     regression_metrics,
     resolve_head_output,
     resolve_inference_target,
-    resolve_model_kwargs,
     stnet_regression_input_dim_from_state_dict,
 )
 
@@ -305,6 +305,7 @@ def transform_pixel(
     x,
     pixel_transform: PixelTransform,
     soil: np.ndarray | None = None,
+    climate: np.ndarray | None = None,
 ):
     """Delegate to PixelTransform (same as training / predict_yield on .npy)."""
     raw = np.asarray(x, dtype=np.float32)
@@ -312,10 +313,10 @@ def transform_pixel(
     if soil is not None:
         soil_arr = np.asarray(soil, dtype=np.float32).reshape(-1)[:N_SOIL]
         soil_batch = soil_arr[np.newaxis, :]
-    x, mask, doy, weight = pixel_transform.transform_chunk(
-        raw[np.newaxis, :], soil=soil_batch
+    batch = pixel_transform.transform_chunk(
+        raw[np.newaxis, :], soil=soil_batch, climate=climate
     )
-    return x[0], mask[0], doy[0], weight[0]
+    return tuple(t[0] for t in batch)
 
 
 def load_soil_sidecar(
@@ -343,6 +344,21 @@ def load_soil_sidecar(
             np.zeros((n_pixels, N_SOIL), dtype=np.float32) if required else None
         )
     return soil
+
+
+def load_climate_sidecar(npy_path: Path, *, required: bool = False) -> np.ndarray | None:
+    """Load ``{stem}_climate_daily.npy`` next to the municipal .npy."""
+    clim_path = climate_sidecar_path(npy_path)
+    if not clim_path.is_file():
+        if required:
+            print(f"  ⚠️  Warning: missing climate sidecar {clim_path}")
+        return None
+    try:
+        return np.load(clim_path, mmap_mode="r")
+    except OSError as e:
+        if required:
+            print(f"  ⚠️  Warning: could not load {clim_path}: {e}")
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -539,11 +555,9 @@ def load_baseline_agg(baseline_csv: Path, year_range: str) -> pd.DataFrame:
 
 
 def _run_model_chunk(model, chunk, device) -> np.ndarray:
-    chunk_x = torch.stack([p[0] for p in chunk])
-    chunk_mask = torch.stack([p[1] for p in chunk])
-    chunk_doy = torch.stack([p[2] for p in chunk])
-    chunk_weight = torch.stack([p[3] for p in chunk])
-    batch = recursive_todevice((chunk_x, chunk_mask, chunk_doy, chunk_weight), device)
+    n_fields = len(chunk[0])
+    batch = tuple(torch.stack([p[i] for p in chunk]) for i in range(n_fields))
+    batch = recursive_todevice(batch, device)
     ctx = (
         autocast("cuda", dtype=torch.bfloat16)
         if device.type == "cuda"
@@ -590,12 +604,14 @@ def predict_pixel_grid_daily(
     )
     if keep_mask is None:
         return None
-
-    ref_transform, ref_crs, height, width = _reference_grid_from_first_tiff(daily_tiffs)
+    height, width = keep_mask.shape
+    ref_transform, ref_crs, _, _ = _reference_grid_from_first_tiff(daily_tiffs)
     if ref_transform is None:
         return None
 
-    if talhao_only and talhao_mask is not None:
+    if talhao_only:
+        if talhao_mask is None or talhao_mask.shape != keep_mask.shape:
+            return None
         infer_mask = keep_mask & talhao_mask
         n_infer = int(infer_mask.sum())
         n_keep = int(keep_mask.sum())
@@ -617,6 +633,10 @@ def predict_pixel_grid_daily(
     soil_data = load_soil_sidecar(
         npy_path, len(municipality_data), required=needs_soil
     )
+    needs_climate = feature_layout_needs_climate_sidecar(pixel_transform.feature_layout)
+    climate_data = load_climate_sidecar(npy_path, required=needs_climate)
+    if needs_climate and climate_data is None:
+        return None
 
     transform = ref_transform
     crs = ref_crs
@@ -655,7 +675,9 @@ def predict_pixel_grid_daily(
                 if infer_mask[row, col]:
                     X = municipality_data[npy_pixel_idx]
                     soil_row = None if soil_data is None else soil_data[npy_pixel_idx]
-                    tup = transform_pixel(X, pixel_transform, soil=soil_row)
+                    tup = transform_pixel(
+                        X, pixel_transform, soil=soil_row, climate=climate_data
+                    )
                     current_chunk.append(tup)
                     chunk_rc.append((row, col))
                     if len(current_chunk) >= chunk_size:
@@ -698,35 +720,23 @@ def load_model(
     sequencelength: int,
     feature_layout: str,
 ):
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint["model_state"]
-    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
-    resolved_layout = normalize_feature_layout(feature_layout)
-    expected = feature_layout_input_dim(resolved_layout)
-    if input_dim != expected:
-        raise ValueError(
-            f"Checkpoint input_dim={input_dim} vs feature_layout {resolved_layout!r} ({expected})"
-        )
-    ck_fl = checkpoint.get("feature_layout")
-    if ck_fl is not None and normalize_feature_layout(ck_fl) != resolved_layout:
-        raise ValueError(
-            f"Checkpoint feature_layout={ck_fl!r} does not match config {resolved_layout!r}"
-        )
+    checkpoint = load_checkpoint(checkpoint_path, device)
     run_config = load_latest_run_config(checkpoint_path)
-    model_kw = resolve_model_kwargs(run_config, checkpoint)
-    model = STNetRegression(
-        input_dim=input_dim,
-        num_outputs=1,
-        max_seq_len=sequencelength,
-        **model_kw,
-    ).to(device)
-    if hasattr(model, "_orig_mod"):
-        model._orig_mod.load_state_dict(state_dict, strict=False)
-    else:
-        model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    _, _, aggregation, _ = resolve_inference_target(run_config, checkpoint)
-    return model, input_dim, resolved_layout, aggregation
+    resolved_layout = normalize_feature_layout(feature_layout)
+    model, meta = build_stnet_from_checkpoint(
+        checkpoint,
+        device=device,
+        sequencelength=sequencelength,
+        run_config=run_config,
+        feature_layout=resolved_layout,
+    )
+    return (
+        model,
+        meta["input_dim"],
+        resolved_layout,
+        meta["aggregation"],
+        int(meta["climate_sequencelength"]),
+    )
 
 
 def run_talhao_predictions(
@@ -754,6 +764,7 @@ def run_talhao_predictions(
     run_config: dict | None = None,
     verbose: bool = True,
     legacy_input_scaling: bool = False,
+    climate_sequencelength: int | None = None,
 ) -> pd.DataFrame:
     """
     Predict yield per talhão for one harvest season and optionally write a CSV.
@@ -801,9 +812,11 @@ def run_talhao_predictions(
             raise ValueError("Either model or checkpoint must be provided")
         if feature_layout is None:
             raise ValueError("feature_layout is required when model is not provided")
-        model, input_dim, feature_layout, aggregation = load_model(
+        model, input_dim, feature_layout, aggregation, climate_seq_loaded = load_model(
             checkpoint, device, sequencelength, feature_layout
         )
+        if climate_sequencelength is None:
+            climate_sequencelength = climate_seq_loaded
     else:
         if feature_layout is None:
             raise ValueError("feature_layout is required when passing a pre-loaded model")
@@ -820,6 +833,11 @@ def run_talhao_predictions(
             if not hasattr(model, "_orig_mod")
             else model._orig_mod.state_dict()
         )
+
+    if climate_sequencelength is None:
+        from training.inference_core import resolve_climate_sequencelength
+
+        climate_sequencelength = resolve_climate_sequencelength(run_config)
 
     if run_config is not None and checkpoint is not None:
         ck = torch.load(checkpoint, map_location=device, weights_only=False)
@@ -866,6 +884,7 @@ def run_talhao_predictions(
         extra_scaler=extra_scaler,
         legacy_input_scaling=legacy_input_scaling,
         deterministic_head=True,
+        climate_sequencelength=int(climate_sequencelength),
     )
 
     results: list[dict] = []

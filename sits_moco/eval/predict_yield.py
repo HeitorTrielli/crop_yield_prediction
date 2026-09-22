@@ -16,6 +16,8 @@ from path_setup import ensure_repo_on_path
 ensure_repo_on_path()
 
 import argparse
+import hashlib
+import json
 
 import numpy as np
 import pandas as pd
@@ -46,6 +48,149 @@ from utils_aggregated import (
 from training.inference_core import build_stnet_from_checkpoint, load_checkpoint
 
 YIELD_CSV = Path("files/pam_soy_pr_2019_2025.csv")
+MODEL_INPUT_NAMES = (
+    "spectral_x",
+    "spectral_mask",
+    "spectral_doy",
+    "spectral_weight",
+    "climate_x",
+    "climate_mask",
+    "climate_doy",
+    "climate_weight",
+)
+
+
+def _array_summary(arr: np.ndarray) -> dict:
+    contiguous = np.ascontiguousarray(arr)
+    summary = {
+        "shape": list(contiguous.shape),
+        "dtype": str(contiguous.dtype),
+        "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+    }
+    if np.issubdtype(contiguous.dtype, np.number):
+        finite = np.isfinite(contiguous)
+        summary["finite_count"] = int(finite.sum())
+        summary["total_count"] = int(contiguous.size)
+        if finite.any():
+            values = contiguous[finite].astype(np.float64, copy=False)
+            summary.update(
+                min=float(values.min()),
+                max=float(values.max()),
+                mean=float(values.mean()),
+                std=float(values.std()),
+            )
+    return summary
+
+
+class InputDebugDumper:
+    """Write raw sidecars and exact model tensors for reproducible comparisons."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._summaries: dict[str, dict] = {}
+
+    def write_run_metadata(self, args, run_config: dict, checkpoint: dict, scaler) -> None:
+        checkpoint_path = Path(args.checkpoint)
+        checkpoint_sha = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+        metadata = {
+            "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+            "checkpoint_sha256": checkpoint_sha,
+            "checkpoint_keys": sorted(checkpoint.keys()),
+            "checkpoint_meta": {
+                key: checkpoint.get(key)
+                for key in (
+                    "feature_layout",
+                    "target",
+                    "target_column",
+                    "aggregation",
+                    "target_mean",
+                    "target_std",
+                    "head_output",
+                )
+            },
+            "run_config": run_config,
+            "torch_version": torch.__version__,
+            "numpy_version": np.__version__,
+            "cuda_device": (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            ),
+        }
+        (self.root / "run_metadata.json").write_text(
+            json.dumps(metadata, indent=2, default=str), encoding="utf-8"
+        )
+        if scaler is not None:
+            (self.root / "input_scaler.json").write_text(
+                json.dumps(scaler.to_dict(), indent=2), encoding="utf-8"
+            )
+
+    def prepare_municipality(self, dataset, municipality_code: str, year=None) -> None:
+        code = str(municipality_code)
+        out_dir = self.root / code
+        out_dir.mkdir(parents=True, exist_ok=True)
+        load_year = dataset._resolve_load_year(code, year)
+        npy_path = dataset._resolve_npy_path(code, load_year)
+        arrays: dict[str, np.ndarray] = {}
+        sources: dict[str, str] = {}
+        if npy_path is not None and Path(npy_path).is_file():
+            path = Path(npy_path)
+            candidates = {
+                "raw_spectral": path,
+                "raw_soil": path.with_name(f"{path.stem}_soil.npy"),
+                "raw_climate": path.with_name(f"{path.stem}_climate_daily.npy"),
+            }
+            for name, source in candidates.items():
+                if source.is_file():
+                    arrays[name] = np.asarray(np.load(source, mmap_mode="r"))
+                    sources[name] = str(source.resolve())
+        if arrays:
+            np.savez_compressed(out_dir / "source_arrays.npz", **arrays)
+        self._summaries[code] = {
+            "municipality_code": code,
+            "requested_year": year,
+            "resolved_year": load_year,
+            "sources": sources,
+            "source_arrays": {
+                name: _array_summary(value) for name, value in arrays.items()
+            },
+            "chunks": [],
+        }
+
+    def callback(self, municipality_code: str):
+        code = str(municipality_code)
+
+        def dump(chunk_index, unpacked, predictions) -> None:
+            out_dir = self.root / code
+            arrays = {}
+            chunk_summary = {"chunk_index": int(chunk_index), "inputs": {}}
+            for index, tensor in enumerate(unpacked):
+                name = (
+                    MODEL_INPUT_NAMES[index]
+                    if index < len(MODEL_INPUT_NAMES)
+                    else f"input_{index}"
+                )
+                value = tensor.detach().cpu().numpy()
+                arrays[name] = value
+                chunk_summary["inputs"][name] = _array_summary(value)
+            pred = predictions.detach().float().cpu().numpy()
+            arrays["model_output_raw"] = pred
+            chunk_summary["model_output_raw"] = _array_summary(pred)
+            np.savez_compressed(
+                out_dir / f"model_input_chunk_{int(chunk_index):04d}.npz", **arrays
+            )
+            self._summaries[code]["chunks"].append(chunk_summary)
+
+        return dump
+
+    def finalize(self, municipality_code: str, forecast) -> None:
+        code = str(municipality_code)
+        summary = self._summaries[code]
+        summary["forecast_denormalized"] = (
+            None if forecast is None else float(forecast)
+        )
+        (self.root / code / "summary.json").write_text(
+            json.dumps(summary, indent=2, default=str), encoding="utf-8"
+        )
 
 
 def parse_args():
@@ -139,6 +284,15 @@ def parse_args():
         help="Number of pixels to process at once (default: 2000)",
     )
     parser.add_argument(
+        "--debug-input-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Dump raw .npy/sidecars, exact transformed model tensors, raw outputs, "
+            "checksums, scaler, and run metadata for every predicted municipality"
+        ),
+    )
+    parser.add_argument(
         "-d",
         "--device",
         type=str,
@@ -215,12 +369,17 @@ def predict_municipality(
     head_output: str = "raw",
     target_mean=None,
     target_std=None,
+    debug_dumper: InputDebugDumper | None = None,
 ):
     """Predict yield via USCropsAggregatedNPY (same transform as training)."""
+    if debug_dumper is not None:
+        debug_dumper.prepare_municipality(
+            dataset, str(municipality_code), year=year
+        )
     chunks = dataset.load_pixels_from_municipality(
         municipality_code, year=year, chunk_size=chunk_size
     )
-    return aggregate_municipality_from_pixel_chunks(
+    prediction = aggregate_municipality_from_pixel_chunks(
         model,
         chunks,
         device,
@@ -228,7 +387,15 @@ def predict_municipality(
         head_output=head_output,
         target_mean=target_mean,
         target_std=target_std,
+        debug_callback=(
+            debug_dumper.callback(str(municipality_code))
+            if debug_dumper is not None
+            else None
+        ),
     )
+    if debug_dumper is not None:
+        debug_dumper.finalize(str(municipality_code), prediction)
+    return prediction
 
 
 def main():
@@ -255,6 +422,10 @@ def main():
     ck_fl = meta["feature_layout"]
     if ck_fl is not None:
         print(f"Checkpoint feature_layout={ck_fl!r} (saved at training)")
+    if meta.get("is_dual"):
+        print(
+            f"DualSTNet climate_sequencelength={meta['climate_sequencelength']}"
+        )
     target = meta["target"]
     target_column = meta["target_column"]
     aggregation = meta["aggregation"]
@@ -293,7 +464,48 @@ def main():
         target_column=target_column,
         min_coverage_ratio=args.min_coverage_ratio,
         max_coverage_ratio=args.max_coverage_ratio,
+        climate_sequencelength=int(meta["climate_sequencelength"]),
     )
+    scaler = None
+    if not bool(getattr(args, "legacy_input_scaling", False)):
+        from datasets.extra_scaler import (
+            InputScaler,
+            apply_extra_scaler_to_dataset,
+            layout_needs_extra_scaler,
+        )
+
+        if layout_needs_extra_scaler(feature_layout):
+            computed = run_config.get("computed") or {}
+            payload = computed.get("extra_scaler")
+            scaler = None
+            source = None
+            if isinstance(payload, dict) and payload.get("spectral") is not None:
+                scaler = InputScaler.from_dict(payload)
+                source = "run config"
+            else:
+                path_raw = computed.get("extra_scaler_path")
+                candidates = []
+                if path_raw:
+                    candidates.append(Path(str(path_raw)))
+                    candidates.append(Path("files") / Path(str(path_raw)).name)
+                for candidate in candidates:
+                    if candidate.is_file():
+                        scaler = InputScaler.load(candidate)
+                        source = str(candidate)
+                        break
+            if scaler is None:
+                raise FileNotFoundError(
+                    "This checkpoint requires its training InputScaler, but no scaler "
+                    "payload or usable path was found in training/config.json."
+                )
+            apply_extra_scaler_to_dataset(dataset, scaler)
+            print(f"Applied training InputScaler from {source}")
+
+    debug_dumper = None
+    if args.debug_input_dir is not None:
+        debug_dumper = InputDebugDumper(Path(args.debug_input_dir))
+        debug_dumper.write_run_metadata(args, run_config, checkpoint, scaler)
+        print(f"Input debug dump enabled: {debug_dumper.root.resolve()}")
 
     # Get list of municipalities to predict
     municipality_list = None
@@ -437,6 +649,7 @@ def main():
             head_output=head_output,
             target_mean=target_mean,
             target_std=target_std,
+            debug_dumper=debug_dumper,
         )
 
         if prediction is not None:

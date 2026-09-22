@@ -32,10 +32,12 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from datasets.datautils import getWeight
+from datasets.daily_climate import CLIMATE_MAX_SEQ_LEN, climate_sidecar_path
 from datasets.extra_scaler import InputScaler, scale_soil_channels, scale_soil_channels_legacy
 from datasets.feature_layout import (
     feature_layout_choices,
     feature_layout_input_dim,
+    feature_layout_needs_climate_sidecar,
     feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
 )
@@ -947,6 +949,7 @@ def reconstruct_spatial_predictions(
     feature_layout: str | None = None,
     extra_scaler: InputScaler | None = None,
     use_mask_cache: bool = True,
+    climate_sequencelength: int | None = None,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
@@ -1004,6 +1007,7 @@ def reconstruct_spatial_predictions(
         else _feature_layout_from_input_dim(input_dim)
     )
     needs_soil = feature_layout_needs_soil_sidecar(layout) or int(input_dim) >= 20
+    needs_climate = feature_layout_needs_climate_sidecar(layout)
 
     soil_data = None
     soil_path = Path(muni_npy_file).with_name(f"{Path(muni_npy_file).stem}_soil.npy")
@@ -1022,11 +1026,26 @@ def reconstruct_spatial_predictions(
         else:
             print(f"  ⚠️  Warning: missing soil sidecar {soil_path}")
 
+    climate_data = None
+    if needs_climate:
+        clim_path = climate_sidecar_path(muni_npy_file)
+        if clim_path.is_file():
+            try:
+                climate_data = np.load(clim_path, mmap_mode="r")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Could not load climate sidecar {clim_path}: {e}")
+                return None, None, None, None, None, None, None
+        else:
+            print(f"  ⚠️  Warning: missing climate sidecar {clim_path}")
+            return None, None, None, None, None, None, None
+
     if len(municipality_data) == 0:
         print(f"  ⚠️  Warning: {municipality_code} has 0 pixels")
         return None, None, None, None, None, None, None
 
     print(f"  Loaded {muni_npy_file} shape={municipality_data.shape}")
+    if needs_climate and climate_data is not None:
+        print(f"  Loaded climate sidecar shape={np.asarray(climate_data).shape}")
     if input_dim == 16 and municipality_data.shape[-1] < 17:
         print(
             "  ⚠️  Warning: checkpoint uses spectral_xavier_climate (16 inputs) but .npy has "
@@ -1084,6 +1103,11 @@ def reconstruct_spatial_predictions(
         extra_scaler=extra_scaler,
         legacy_input_scaling=legacy_input_scaling,
         deterministic_head=True,
+        climate_sequencelength=(
+            int(climate_sequencelength)
+            if climate_sequencelength is not None
+            else CLIMATE_MAX_SEQ_LEN
+        ),
     )
 
     model.eval()
@@ -1123,10 +1147,14 @@ def reconstruct_spatial_predictions(
                 if soil_chunk is None
                 else np.concatenate([soil_chunk, soil_chunk], axis=0)
             )
-            batch = pixel_transform.transform_chunk(stacked_run, soil=soil_run)
+            batch = pixel_transform.transform_chunk(
+                stacked_run, soil=soil_run, climate=climate_data
+            )
             preds = _forward_pixel_batch(model, batch, device)[:1]
         else:
-            batch = pixel_transform.transform_chunk(stacked, soil=soil_chunk)
+            batch = pixel_transform.transform_chunk(
+                stacked, soil=soil_chunk, climate=climate_data
+            )
             preds = _forward_pixel_batch(model, batch, device)
         _store_preds(local_idx, preds)
 
