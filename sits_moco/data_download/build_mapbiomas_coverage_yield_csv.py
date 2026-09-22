@@ -4,7 +4,7 @@ Build a training yield CSV from MapBiomas soy area vs IBGE PAM planted area.
 
 Keeps municipality–years whose mapbiomas_soy_area_ha / area_planted_ha is in
 [min_ratio, max_ratio] (default 0.8–1.2) and that have a municipal .npy
-(existing mega-pixel cube and/or a zonal CSV that can be converted).
+(existing municipal aggregate cube and/or a zonal CSV that can be converted).
 
 Splits are copied from --existing-yield-csv when the (muni, year) or municipality
 already has a label. New non-holdout rows are train. New holdout-year municipalities
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         "--npy-root",
         type=Path,
         default=Path("~/sits_moco_data/npy_muni_mean"),
-        help="Municipal mega-pixel .npy root",
+        help="Municipal municipal aggregate .npy root",
     )
     p.add_argument(
         "--min-ratio",

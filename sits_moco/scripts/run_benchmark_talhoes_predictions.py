@@ -142,7 +142,7 @@ def run_one(
     reproject_tiffs: bool,
     no_mask_cache: bool,
 ) -> None:
-    predict_py = _ROOT / "predict_yield_talhoes.py"
+    predict_py = _ROOT / "eval" / "predict_yield_talhoes.py"
     cmd = [
         sys.executable,
         str(predict_py),

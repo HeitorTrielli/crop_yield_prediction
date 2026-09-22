@@ -27,7 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
-NO_DATA_VALUE = -9999
+from .constants import NO_DATA_VALUE
+
 MIN_VALID_DAYS_PREPROCESS = 3  # kept if count > 2
 
 SEASON_RE = re.compile(r"^\d{4}-\d{4}$")

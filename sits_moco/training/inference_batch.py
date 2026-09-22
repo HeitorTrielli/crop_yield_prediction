@@ -61,7 +61,7 @@ def _finalize_accumulator(
     )
 
 
-def _try_megapixel_inference(
+def _try_muni_agg_inference(
     *,
     model,
     dataset,
@@ -77,19 +77,19 @@ def _try_megapixel_inference(
     num_periods: int | None = None,
     reference_date: date | None = None,
 ) -> dict[tuple[str, int], float] | None:
-    from training.megapixel_batch import (
+    from training.muni_agg_batch import (
         _log_fastpath_once,
-        dataset_supports_megapixel_stack,
-        forward_megapixel_batch,
-        is_megapixel_batch,
-        load_stacked_megapixel_batch,
+        dataset_supports_muni_agg_stack,
+        forward_muni_agg_batch,
+        is_muni_agg_batch,
+        load_stacked_muni_agg_batch,
     )
 
     if not (
-        is_megapixel_batch(num_pixels_list) and dataset_supports_megapixel_stack(dataset)
+        is_muni_agg_batch(num_pixels_list) and dataset_supports_muni_agg_stack(dataset)
     ):
         return None
-    stacked, kept = load_stacked_megapixel_batch(
+    stacked, kept = load_stacked_muni_agg_batch(
         dataset,
         municipalities,
         years,
@@ -102,7 +102,7 @@ def _try_megapixel_inference(
     _log_fastpath_once(len(kept))
     model.eval()
     with torch.no_grad():
-        preds = forward_megapixel_batch(model, stacked, device, args)
+        preds = forward_muni_agg_batch(model, stacked, device, args)
     out: dict[tuple[str, int], float] = {}
     for i, muni_idx in enumerate(kept):
         value = _finalize_pred(
@@ -141,7 +141,7 @@ def run_period_inference_batch(
     num_pixels_list = [
         _entry_pixel_count(dataset, code, year) for code, year in entries
     ]
-    mega = _try_megapixel_inference(
+    mega = _try_muni_agg_inference(
         model=model,
         dataset=dataset,
         entries=entries,
@@ -239,7 +239,7 @@ def run_multiperiod_inference_batch(
         _entry_pixel_count(dataset, code, year) for code, year in entries
     ]
 
-    # Megapixel fast-path still goes one k at a time (tiny payload).
+    # Municipal-aggregate fast-path still goes one k at a time (tiny payload).
     if max(num_pixels_list, default=0) <= 1:
         out: dict[int, dict[tuple[str, int], float]] = {}
         for k in periods:
@@ -334,7 +334,7 @@ def run_standard_inference_batch(
     num_pixels_list = [
         _entry_pixel_count(dataset, code, year) for code, year in entries
     ]
-    mega = _try_megapixel_inference(
+    mega = _try_muni_agg_inference(
         model=model,
         dataset=dataset,
         entries=entries,

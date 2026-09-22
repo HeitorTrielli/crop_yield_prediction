@@ -22,11 +22,12 @@ from typing import Any
 
 import numpy as np
 
+from .constants import NO_DATA_VALUE
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_SCALER_PATH = REPO_ROOT / "files" / "train_input_scaler.json"
 DEFAULT_EXTRA_SCALER_PATH = DEFAULT_INPUT_SCALER_PATH
 
-NO_DATA_VALUE = -9999
 STD_FLOOR = 1e-6
 N_SPECTRAL = 10
 N_EXTRA = 6

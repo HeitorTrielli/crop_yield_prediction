@@ -26,7 +26,7 @@ import multiprocessing as mp
 _MP_CTX = mp.get_context("spawn")
 
 # Must match GEE export and downstream (clip, training). Merged output always uses this.
-NO_DATA_VALUE = -9999
+from datasets.constants import NO_DATA_VALUE
 
 
 def _log(msg: str) -> None:

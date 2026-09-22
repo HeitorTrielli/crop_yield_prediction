@@ -30,6 +30,7 @@ from .pixel_transform import (
     NUM_SPECTRAL_CHANNELS,
     PixelTransform,
 )
+from .constants import NO_DATA_VALUE
 
 
 def _doy_to_season_month(doy, reference_date):
@@ -61,7 +62,6 @@ def _season_months_from_doys(doys: np.ndarray, reference_date: date) -> np.ndarr
 
 
 # Missing markers stored by preprocess_daily_to_npy.
-NO_DATA_VALUE = -9999
 # Daily .npy DOY is season-relative with day 1 = Oct 1 (see season_start_from_year_range).
 DEFAULT_SEASON_REFERENCE_DATE = date(2000, 10, 1)
 
@@ -1136,7 +1136,7 @@ class USCropsAggregatedNPY(Dataset):
     def _validate_npy_channel_requirement(self) -> None:
         """Drop municipality–years whose .npy is too narrow for the layout.
 
-        2019-2020 mega-pixel files are often rain-only (C=13). Layouts that
+        2019-2020 municipal aggregate files are often rain-only (C=13). Layouts that
         need climate extras (C=17) skip those files instead of aborting a
         mixed-year loader. An empty split after filtering is an error.
         """

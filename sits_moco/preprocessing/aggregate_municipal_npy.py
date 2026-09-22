@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Collapse each municipal .npy from [N, T, C] to a single mega-pixel [1, T, C].
+Collapse each municipal .npy from [N, T, C] to a single municipal aggregate [1, T, C].
 
 For every date (axis T), spectral bands 0–9 are reduced over pixels that have
 data that day (finite, not 0, not -9999). Extra channels (rain/climate at 11+)
@@ -72,7 +72,7 @@ def _extra_valid(extra: np.ndarray) -> np.ndarray:
     return np.isfinite(extra) & (extra != NO_DATA_VALUE)
 
 
-def reduce_to_megapixel(data: np.ndarray, stat: str) -> np.ndarray:
+def reduce_to_muni_agg(data: np.ndarray, stat: str) -> np.ndarray:
     """Reduce [N, T, C] → [T, C] with per-date available-pixel mean or median."""
     if stat not in STATS:
         raise ValueError(f"stat must be one of {STATS}, got {stat!r}")
@@ -182,7 +182,7 @@ def process_one(
             n = int(existing.shape[0]) if existing.ndim >= 1 else 0
             return (src.as_posix(), n, None)
         data = np.load(src, mmap_mode="r")
-        reduced = reduce_to_megapixel(data, stat)
+        reduced = reduce_to_muni_agg(data, stat)
         mega = np.ascontiguousarray(reduced[np.newaxis, ...], dtype=np.float32)
         _save_npy_atomic(dest, mega)
         return (src.as_posix(), int(data.shape[0]), None)
@@ -232,7 +232,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--overwrite",
         action="store_true",
-        help="Rewrite existing mega-pixel files",
+        help="Rewrite existing municipal aggregate files",
     )
     return p.parse_args()
 

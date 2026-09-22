@@ -46,7 +46,7 @@ from preprocessing.preprocess_tiff_to_npy import (
     season_start_from_year_range,
 )
 
-NO_DATA_VALUE = -9999
+from datasets.constants import NO_DATA_VALUE
 NUM_SPECTRAL_BANDS = 10
 
 

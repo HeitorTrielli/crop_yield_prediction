@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert GEE zonal-mean CSVs to municipal mega-pixel .npy files [1, T, C].
+Convert GEE zonal-mean CSVs to municipal municipal aggregate .npy files [1, T, C].
 
 Spectral channels stay in Sentinel-2 DN (same as daily TIFF .npy; training
 applies *1e-4). Channel 10 is season DOY (Oct 1 = 1), not calendar DOY.
@@ -37,7 +37,7 @@ if str(_REPO) not in sys.path:
 # Keep constants local so this script does not import datasets/ (pulls torch).
 DOY_CHANNEL = 10
 NUM_SPECTRAL_CHANNELS = 10
-NO_DATA_VALUE = -9999
+from datasets.constants import NO_DATA_VALUE
 
 from preprocessing.preprocess_daily_to_npy import _save_npy_atomic
 from preprocessing.preprocess_tiff_to_npy import (

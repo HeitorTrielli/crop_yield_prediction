@@ -30,16 +30,16 @@ def run_eval_batch(
     """
     from torch.amp import autocast
 
-    from training.megapixel_batch import (
-        dataset_supports_megapixel_stack,
-        forward_megapixel_batch,
-        is_megapixel_batch,
-        load_stacked_megapixel_batch,
+    from training.muni_agg_batch import (
+        dataset_supports_muni_agg_stack,
+        forward_muni_agg_batch,
+        is_muni_agg_batch,
+        load_stacked_muni_agg_batch,
         _log_fastpath_once,
     )
 
-    if is_megapixel_batch(num_pixels_list) and dataset_supports_megapixel_stack(dataset):
-        stacked, kept = load_stacked_megapixel_batch(
+    if is_muni_agg_batch(num_pixels_list) and dataset_supports_muni_agg_stack(dataset):
+        stacked, kept = load_stacked_muni_agg_batch(
             dataset,
             municipalities,
             years,
@@ -47,7 +47,7 @@ def run_eval_batch(
         )
         if stacked is not None and kept:
             _log_fastpath_once(len(kept))
-            preds = forward_megapixel_batch(model, stacked, device, args)
+            preds = forward_muni_agg_batch(model, stacked, device, args)
             by_kept = {idx: preds[i : i + 1] for i, idx in enumerate(kept)}
             return [
                 by_kept[muni_idx]

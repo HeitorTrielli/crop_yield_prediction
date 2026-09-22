@@ -49,7 +49,7 @@ except ImportError:
     raise SystemExit("Install rasterio: pip install rasterio")
 
 # Must match GEE export and merge (NO_DATA_VALUE). Output TIFFs and valid-pixel check use this.
-NO_DATA_VALUE = -9999
+from datasets.constants import NO_DATA_VALUE
 
 
 def parse_args() -> argparse.Namespace:

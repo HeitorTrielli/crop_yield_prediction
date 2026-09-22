@@ -132,15 +132,15 @@ def process_train_batch(
     """
     from torch.amp import autocast
 
-    from training.megapixel_batch import (
-        dataset_supports_megapixel_stack,
-        is_megapixel_batch,
-        process_train_megapixel_batch,
+    from training.muni_agg_batch import (
+        dataset_supports_muni_agg_stack,
+        is_muni_agg_batch,
+        process_train_muni_agg_batch,
     )
     from training_runtime import mark_cudagraph_step, zero_grad
 
-    if is_megapixel_batch(num_pixels_list) and dataset_supports_megapixel_stack(dataset):
-        return process_train_megapixel_batch(
+    if is_muni_agg_batch(num_pixels_list) and dataset_supports_muni_agg_stack(dataset):
+        return process_train_muni_agg_batch(
             model=model,
             optimizer=optimizer,
             scaler=scaler,

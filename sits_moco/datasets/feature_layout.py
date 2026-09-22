@@ -53,7 +53,7 @@ _LAYOUT: dict[str, dict[str, Any]] = {
 
 
 def _register_recipe_layouts() -> None:
-    """Add mp_* derived layouts from datasets.feature_recipes (mega-pixel sweep)."""
+    """Add ma_* derived layouts (municipal-aggregate sweep); alias legacy mp_* names."""
     from .feature_recipes import recipe_layout_records
 
     for rec in recipe_layout_records():
@@ -66,6 +66,11 @@ def _register_recipe_layouts() -> None:
             "recipe": dict(rec["recipe"]),
             "description": rec["description"],
         }
+        legacy = rec.get("legacy_name")
+        if legacy and legacy != name:
+            if legacy in _LAYOUT or legacy in _ALIASES:
+                raise ValueError(f"legacy recipe alias collision: {legacy}")
+            _ALIASES[legacy] = name
 
 
 _ALIASES: dict[str, str] = {
