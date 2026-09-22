@@ -21,6 +21,7 @@ from torch.utils.data import Dataset
 
 from .feature_layout import (
     feature_layout_choices,
+    feature_layout_needs_climate_sidecar,
     feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
     resolve_feature_layout,
@@ -30,7 +31,7 @@ from .pixel_transform import (
     NUM_SPECTRAL_CHANNELS,
     PixelTransform,
 )
-from .constants import NO_DATA_VALUE
+from .daily_climate import CLIMATE_MAX_SEQ_LEN, climate_sidecar_path
 
 
 def _doy_to_season_month(doy, reference_date):
@@ -571,6 +572,7 @@ class USCropsAggregatedNPY(Dataset):
         max_coverage_ratio: float | None = DEFAULT_MAX_COVERAGE_RATIO,
         min_images: int = 0,
         min_months: int = 0,
+        climate_sequencelength: int | None = None,
         season_reference_date: Optional[date] = None,
         train_mid_yield_keep_fraction: float | None = DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
         train_mid_yield_lo: float = DEFAULT_TRAIN_MID_YIELD_LO,
@@ -595,6 +597,15 @@ class USCropsAggregatedNPY(Dataset):
         ]
         self._soil_sidecar = bool(_lay.get("soil_sidecar")) or feature_layout_needs_soil_sidecar(
             self.feature_layout
+        )
+        self._climate_sidecar = bool(
+            _lay.get("climate_sidecar")
+        ) or feature_layout_needs_climate_sidecar(self.feature_layout)
+        self.climate_input_dim = int(_lay.get("climate_input_dim") or 0)
+        self.climate_sequencelength = int(
+            climate_sequencelength
+            if climate_sequencelength is not None
+            else CLIMATE_MAX_SEQ_LEN
         )
         # Backward-compatible flag for logging / meta (any Xavier extras starting at ch 11)
         self.use_xavier = (
@@ -994,6 +1005,8 @@ class USCropsAggregatedNPY(Dataset):
         self._validate_npy_channel_requirement()
         if self._soil_sidecar:
             self._validate_soil_sidecar_requirement()
+        if self._climate_sidecar:
+            self._validate_climate_sidecar_requirement()
 
         self.pixel_transform = PixelTransform(
             sequencelength,
@@ -1002,6 +1015,7 @@ class USCropsAggregatedNPY(Dataset):
             interp=interp,
             seed=seed,
             legacy_input_scaling=self.legacy_input_scaling,
+            climate_sequencelength=self.climate_sequencelength,
         )
         if self.legacy_input_scaling:
             print(
@@ -1013,11 +1027,19 @@ class USCropsAggregatedNPY(Dataset):
                 "  Soil sidecars: enabled "
                 f"(layout {self.feature_layout!r} → +4 channels from {{code}}_soil.npy)"
             )
+        if self._climate_sidecar:
+            print(
+                "  Daily climate sidecars: enabled "
+                f"(layout {self.feature_layout!r} → DualSTNet climate "
+                f"T={self.climate_sequencelength}, dim={self.climate_input_dim} "
+                "from {code}_climate_daily.npy)"
+            )
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)
         self.npy_cache = OrderedDict()
         self.npy_cache_max_size = int(npy_cache_size)
         self.soil_cache = OrderedDict()
+        self.climate_cache = OrderedDict()
         self._temporal_keep_cache: OrderedDict = OrderedDict()
         self._temporal_keep_cache_max = 64
 
@@ -1097,6 +1119,14 @@ class USCropsAggregatedNPY(Dataset):
         soil = npy_path.with_name(f"{npy_path.stem}_soil.npy")
         return soil if soil.is_file() else None
 
+    def _resolve_climate_path(self, municipality_code, year):
+        """Return Path to {code}_climate_daily.npy beside the time-series .npy."""
+        npy_path = self._resolve_npy_path(municipality_code, year)
+        if npy_path is None:
+            return None
+        clim = climate_sidecar_path(npy_path)
+        return clim if clim.is_file() else None
+
     def _validate_soil_sidecar_requirement(self) -> None:
         """Drop municipality–years missing {code}_soil.npy when layout needs soil."""
         dropped: list[tuple[object, str]] = []
@@ -1131,6 +1161,42 @@ class USCropsAggregatedNPY(Dataset):
                 f"Feature layout {self.feature_layout!r} requires {{code}}_soil.npy "
                 f"sidecars next to each .npy. Build them with "
                 f"data_download/build_mapbiomas_solo_sidecars.py. Missing e.g.: {examples}"
+            )
+
+    def _validate_climate_sidecar_requirement(self) -> None:
+        """Drop municipality–years missing {code}_climate_daily.npy."""
+        dropped: list[tuple[object, str]] = []
+        keep: list = []
+        for key in self.municipality_list:
+            if isinstance(key, tuple):
+                code, year = key
+            else:
+                code = key
+                year = self.municipality_years.get(code, self.year)
+            npy = self._resolve_npy_path(code, year)
+            clim = self._resolve_climate_path(code, year)
+            if npy is not None and clim is None:
+                dropped.append((key, str(climate_sidecar_path(npy))))
+                continue
+            keep.append(key)
+
+        if dropped:
+            for key, _path in dropped:
+                self.municipality_pixel_counts.pop(key, None)
+                self.municipality_years.pop(key, None)
+            self.municipality_list = sorted(keep)
+            examples = "; ".join(path for _, path in dropped[:3])
+            print(
+                f"  Dropped {len(dropped)} municipality–year(s) missing daily climate sidecar "
+                f"(layout {self.feature_layout!r}), e.g. {examples}"
+            )
+
+        if not self.municipality_list:
+            examples = "; ".join(path for _, path in dropped[:5])
+            raise ValueError(
+                f"Feature layout {self.feature_layout!r} requires {{code}}_climate_daily.npy "
+                f"sidecars next to each .npy. Build them with "
+                f"data_download/build_muni_daily_climate_npy.py. Missing e.g.: {examples}"
             )
 
     def _validate_npy_channel_requirement(self) -> None:
@@ -1197,9 +1263,11 @@ class USCropsAggregatedNPY(Dataset):
                 f"  ⚠️  Could not read any .npy to verify channel count for layout {self.feature_layout!r}."
             )
 
-    def _transform_chunk(self, chunk_arr, soil=None):
+    def _transform_chunk(self, chunk_arr, soil=None, climate=None):
         """Vectorized transform (delegates to PixelTransform — same as training)."""
-        return self.pixel_transform.transform_chunk(chunk_arr, soil=soil)
+        return self.pixel_transform.transform_chunk(
+            chunk_arr, soil=soil, climate=climate
+        )
 
     def _temporal_keep_mask(self, municipality_data) -> np.ndarray:
         """Boolean keep-mask for temporal image/month thresholds."""
@@ -1337,6 +1405,30 @@ class USCropsAggregatedNPY(Dataset):
             return None
         return soil
 
+    def mmap_climate(self, municipality_code, year=None):
+        """Memory-map {code}_climate_daily.npy. None if missing / unused."""
+        if not self._climate_sidecar:
+            return None
+        year = self._resolve_load_year(municipality_code, year)
+        if year is None:
+            return None
+        clim_path = self._resolve_climate_path(municipality_code, year)
+        if clim_path is None:
+            return None
+        if self.npy_cache_max_size <= 0:
+            climate = np.load(clim_path, mmap_mode="r")
+        else:
+            key = str(clim_path)
+            if key not in self.climate_cache:
+                if len(self.climate_cache) >= self.npy_cache_max_size:
+                    self.climate_cache.popitem(last=False)
+                self.climate_cache[key] = np.load(clim_path, mmap_mode="r")
+            self.climate_cache.move_to_end(key)
+            climate = self.climate_cache[key]
+        if climate.ndim < 2 or climate.shape[-1] == 0:
+            return None
+        return climate
+
     def load_pixels_from_municipality(
         self, municipality_code, year=None, chunk_size=10000
     ):
@@ -1353,6 +1445,7 @@ class USCropsAggregatedNPY(Dataset):
         year_resolved = self._resolve_load_year(municipality_code, year)
         cache_key = self._resolve_npy_path(municipality_code, year_resolved)
         soil = self.mmap_soil(municipality_code, year=year_resolved)
+        climate = self.mmap_climate(municipality_code, year=year_resolved)
         if self._soil_sidecar:
             if soil is None:
                 return
@@ -1368,6 +1461,8 @@ class USCropsAggregatedNPY(Dataset):
             municipality_data = self.filter_municipality_data(
                 municipality_data, cache_key=cache_key
             )
+        if self._climate_sidecar and climate is None:
+            return
         if municipality_data is None or len(municipality_data) == 0:
             return
 
@@ -1376,7 +1471,7 @@ class USCropsAggregatedNPY(Dataset):
             end = min(start + chunk_size, num_pixels)
             soil_chunk = None if soil is None else soil[start:end]
             yield self._transform_chunk(
-                municipality_data[start:end], soil=soil_chunk
+                municipality_data[start:end], soil=soil_chunk, climate=climate
             )
 
     def _pack_sorted_in_season_chunk(
@@ -1420,6 +1515,7 @@ class USCropsAggregatedNPY(Dataset):
         season_sorted: np.ndarray,
         num_periods: int,
         soil: np.ndarray | None = None,
+        climate: np.ndarray | None = None,
     ):
         """Yield STNet batches for one k from a DOY-sorted in-season packing."""
         k = int(num_periods)
@@ -1435,7 +1531,9 @@ class USCropsAggregatedNPY(Dataset):
                 continue
             stacked = np.ascontiguousarray(gathered[idx, :length])
             soil_chunk = None if soil is None else np.ascontiguousarray(soil[idx])
-            yield self._transform_chunk(stacked, soil=soil_chunk)
+            yield self._transform_chunk(
+                stacked, soil=soil_chunk, climate=climate
+            )
 
     def iter_period_pixel_chunks_from_data(
         self,
@@ -1446,12 +1544,17 @@ class USCropsAggregatedNPY(Dataset):
         reference_date: date,
         cache_key=None,
         soil=None,
+        climate=None,
     ):
         """Yield batched STNet inputs after incomplete-series month filtering."""
         if self._soil_sidecar and soil is None:
             raise ValueError(
                 f"Layout {self.feature_layout!r} requires soil sidecar rows "
                 "aligned with municipality_data"
+            )
+        if self._climate_sidecar and climate is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires a daily climate sidecar"
             )
         municipality_data, soil = self.filter_municipality_pair(
             municipality_data, soil, cache_key=cache_key
@@ -1471,7 +1574,11 @@ class USCropsAggregatedNPY(Dataset):
                 continue
             gathered, season_sorted = packed
             yield from self._yield_period_transforms_from_packed(
-                gathered, season_sorted, num_periods, soil=soil_view
+                gathered,
+                season_sorted,
+                num_periods,
+                soil=soil_view,
+                climate=climate,
             )
 
     def iter_multiperiod_pixel_chunks_from_data(
@@ -1483,6 +1590,7 @@ class USCropsAggregatedNPY(Dataset):
         reference_date: date,
         cache_key=None,
         soil=None,
+        climate=None,
     ):
         """
         Yield ``(num_periods, STNet_chunk)`` for every k in ``period_list``.
@@ -1497,6 +1605,10 @@ class USCropsAggregatedNPY(Dataset):
             raise ValueError(
                 f"Layout {self.feature_layout!r} requires soil sidecar rows "
                 "aligned with municipality_data"
+            )
+        if self._climate_sidecar and climate is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires a daily climate sidecar"
             )
         municipality_data, soil = self.filter_municipality_pair(
             municipality_data, soil, cache_key=cache_key
@@ -1519,7 +1631,11 @@ class USCropsAggregatedNPY(Dataset):
             gathered, season_sorted = packed
             for num_periods in periods:
                 for pixel_chunk in self._yield_period_transforms_from_packed(
-                    gathered, season_sorted, num_periods, soil=soil_view
+                    gathered,
+                    season_sorted,
+                    num_periods,
+                    soil=soil_view,
+                    climate=climate,
                 ):
                     yield int(num_periods), pixel_chunk
 
@@ -1541,6 +1657,7 @@ class USCropsAggregatedNPY(Dataset):
         year_resolved = self._resolve_load_year(municipality_code, year)
         cache_key = self._resolve_npy_path(municipality_code, year_resolved)
         soil = self.mmap_soil(municipality_code, year=year_resolved)
+        climate = self.mmap_climate(municipality_code, year=year_resolved)
         yield from self.iter_period_pixel_chunks_from_data(
             municipality_data,
             num_periods=num_periods,
@@ -1548,6 +1665,7 @@ class USCropsAggregatedNPY(Dataset):
             reference_date=reference_date,
             cache_key=cache_key,
             soil=soil,
+            climate=climate,
         )
 
     def __len__(self):

@@ -1,0 +1,157 @@
+# DualSTNet mega-pixel yield + dual MoCo init (S2 trunk + daily climate trunk).
+#
+# Each unique (d_model, n_head, d_inner, n_layers) trains / reuses TWO MoCo runs:
+#   moco.spectral  → pixel S2 (feature_layout=spectral, input_dim=10)
+#   moco.climate   → municipal daily Xavier sidecars (daily_climate, C=5)
+# Yield then loads them into DualSTNetRegression.spectral / .climate.
+#
+# Grid is smaller than dual_stnet_wide: MoCo is the expensive step (cached per arch).
+# Unique arches ≈ 3×2×2 = 12 → up to 24 MoCo trunks; yield grid = 72 + extras.
+#
+# Requires:
+#   - ~/sits_moco_data/npy (pixel) for spectral MoCo
+#   - climate + soil sidecars under npy_muni_mean (already built)
+#   - files/train_input_scaler_dual_muni_mean.json
+#
+# Preview / run:
+#   python run_tuning_study.py show tuning/studies/secondary/productivity_muni_mean_dual_stnet_moco.yaml --list-trials
+#   python run_tuning_study.py run  tuning/studies/secondary/productivity_muni_mean_dual_stnet_moco.yaml --skip-completed
+
+name: productivity_muni_mean_dual_stnet_moco
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+moco:
+  model: transformer
+  rc: true
+  use_doy: true
+  useall: true
+  mlp: true
+  epochs: 100
+  workers: 8
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  seed: 111
+  model_dropout: 0.2
+  harvest_years: "2020,2021,2022,2023,2024"
+  logdir: ./results
+
+  # Sentinel-2 trunk (matches DualSTNet.spectral input_dim=10)
+  spectral:
+    feature_layout: spectral
+    datapath: ~/sits_moco_data/npy
+    sequencelength: 70
+    batchsize: 512
+    max_samples: 500000
+
+  # Daily Xavier trunk (matches DualSTNet.climate input_dim=5, T≈183)
+  climate:
+    feature_layout: daily_climate
+    datapath: ~/sits_moco_data/npy_muni_mean
+    sequencelength: 183
+    batchsize: 64
+    max_samples: 10000
+    extra_scaler: files/train_input_scaler_dual_muni_mean.json
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: dual_spectral_daily_climate_soil
+  soil_fusion: late
+  climate_sequencelength: 183
+  temporal_pooling: ndvi
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  extra_scaler: files/train_input_scaler_dual_muni_mean.json
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [40, 120]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 15
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  suffix_prefix: dual_stnet_moco
+  model_n_layers: 1
+
+search:
+  strategy: grid
+
+  parameters:
+    model_d_model:
+      type: choice
+      values: [64, 96, 128]
+
+    model_n_head:
+      type: choice
+      values: [4, 8]
+
+    model_d_inner:
+      type: choice
+      values: [64, 128]
+
+    model_dropout:
+      type: choice
+      values: [0.3, 0.4]
+
+    learning_rate:
+      type: choice
+      # MoCo-init often wants a slightly higher finetune LR than from-scratch 1e-5.
+      values: [1.0e-4, 5.0e-4, 1.0e-3]
+
+  extra_trials:
+    # Smoke winner corner (n_head=16) × higher LRs
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      learning_rate: 1.0e-4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      learning_rate: 5.0e-4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      learning_rate: 1.0e-3
+
+    - model_d_model: 128
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 5.0e-4
+
+    # Attention pooling corners
+    - model_d_model: 64
+      model_n_head: 8
+      model_d_inner: 128
+      model_dropout: 0.3
+      learning_rate: 5.0e-4
+      temporal_pooling: attention
+      attn_pool_queries: 4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      learning_rate: 5.0e-4
+      temporal_pooling: attention
+      attn_pool_queries: 4

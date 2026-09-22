@@ -210,8 +210,117 @@ def build_moco_argv(
         argv.append("--rebuild-cache")
     if moco_cfg.get("warmup_epochs") is not None:
         argv.extend(["--warmup-epochs", str(int(moco_cfg["warmup_epochs"]))])
+    if moco_cfg.get("extra_scaler") is not None:
+        argv.extend(["--extra-scaler", str(moco_cfg["extra_scaler"])])
 
     return argv
+
+
+def is_dual_moco_cfg(moco_cfg: dict | None) -> bool:
+    """True when study YAML nests ``moco.spectral`` + ``moco.climate`` trunks."""
+    if not isinstance(moco_cfg, dict):
+        return False
+    return isinstance(moco_cfg.get("spectral"), dict) and isinstance(
+        moco_cfg.get("climate"), dict
+    )
+
+
+def expand_dual_moco_cfgs(moco_cfg: dict) -> tuple[dict, dict]:
+    """
+    Merge shared ``moco:`` keys into nested spectral / climate sub-configs.
+
+    Nested keys win over shared defaults.
+    """
+    if not is_dual_moco_cfg(moco_cfg):
+        raise ValueError("expand_dual_moco_cfgs requires moco.spectral and moco.climate")
+    shared = {
+        k: v for k, v in moco_cfg.items() if k not in ("spectral", "climate")
+    }
+    spectral = {**shared, **dict(moco_cfg["spectral"])}
+    climate = {**shared, **dict(moco_cfg["climate"])}
+    spectral.setdefault("feature_layout", "spectral")
+    climate.setdefault("feature_layout", "daily_climate")
+    return spectral, climate
+
+
+def ensure_trial_moco_pretrains(
+    trial_params: dict,
+    moco_cfg: dict,
+    *,
+    repo_root: Path | None = None,
+    dry_run: bool = False,
+    capture_log_dir: Path | None = None,
+) -> dict[str, Path]:
+    """
+    Ensure MoCo checkpoint(s) for a yield trial.
+
+    Single-trunk studies return ``{"pretrained": path}``.
+    Dual DualSTNet studies return
+    ``{"pretrained": spectral_path, "pretrained_climate": climate_path}``.
+    """
+    repo_root = repo_root or REPO_ROOT
+    if is_dual_moco_cfg(moco_cfg):
+        spectral_cfg, climate_cfg = expand_dual_moco_cfgs(moco_cfg)
+        spectral_log = None
+        climate_log = None
+        if capture_log_dir is not None:
+            spectral_log = Path(capture_log_dir) / "moco_spectral_stdout.log"
+            climate_log = Path(capture_log_dir) / "moco_climate_stdout.log"
+        spectral_ckpt = ensure_moco_checkpoint(
+            trial_params,
+            spectral_cfg,
+            repo_root=repo_root,
+            dry_run=dry_run,
+            capture_log=spectral_log,
+        )
+        climate_ckpt = ensure_moco_checkpoint(
+            trial_params,
+            climate_cfg,
+            repo_root=repo_root,
+            dry_run=dry_run,
+            capture_log=climate_log,
+        )
+        return {
+            "pretrained": spectral_ckpt,
+            "pretrained_climate": climate_ckpt,
+        }
+
+    log = None
+    if capture_log_dir is not None:
+        log = Path(capture_log_dir) / "moco_stdout.log"
+    ckpt = ensure_moco_checkpoint(
+        trial_params,
+        moco_cfg,
+        repo_root=repo_root,
+        dry_run=dry_run,
+        capture_log=log,
+    )
+    return {"pretrained": ckpt}
+
+
+def predict_trial_moco_paths(
+    trial_params: dict,
+    moco_cfg: dict,
+    *,
+    repo_root: Path | None = None,
+) -> dict[str, Path]:
+    """Predicted checkpoint paths without training (for dry-run / show)."""
+    repo_root = repo_root or REPO_ROOT
+    if is_dual_moco_cfg(moco_cfg):
+        spectral_cfg, climate_cfg = expand_dual_moco_cfgs(moco_cfg)
+        return {
+            "pretrained": predict_moco_checkpoint_path(
+                trial_params, spectral_cfg, repo_root=repo_root
+            ),
+            "pretrained_climate": predict_moco_checkpoint_path(
+                trial_params, climate_cfg, repo_root=repo_root
+            ),
+        }
+    return {
+        "pretrained": predict_moco_checkpoint_path(
+            trial_params, moco_cfg, repo_root=repo_root
+        )
+    }
 
 
 def ensure_moco_checkpoint(

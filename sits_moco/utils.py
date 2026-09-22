@@ -40,6 +40,7 @@ def get_moco_dataloader(
     max_samples=500_000,
     rebuild_cache=False,
     feature_layout="spectral",
+    extra_scaler_path=None,
 ):
     """Paraná municipal .npy MoCo dataloader (US-toy path archived)."""
     feature_layout = normalize_feature_layout(feature_layout)
@@ -75,6 +76,7 @@ def get_moco_dataloader(
         seed=seed,
         rebuild_cache=rebuild_cache,
         feature_layout=feature_layout,
+        extra_scaler_path=extra_scaler_path,
     )
 
     num = len(pretraindataset)
@@ -144,6 +146,7 @@ def get_moco_model(modelname, device, args):
         n_layers=n_layers,
         d_inner=d_inner,
         dropout=dropout,
+        max_seq_len=int(getattr(args, "sequencelength", 70)),
     )
 
     model = moco.builder.MoCo(

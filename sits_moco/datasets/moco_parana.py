@@ -20,10 +20,18 @@ import moco.loader
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from datasets.extra_scaler import N_SOIL
+from datasets.daily_climate import (
+    N_DAILY_CLIMATE,
+    climate_sidecar_path,
+    load_climate_sidecar,
+    season_doy_axis,
+)
+from datasets.extra_scaler import DEFAULT_INPUT_SCALER_PATH, N_SOIL, InputScaler
 from datasets.feature_layout import (
     feature_layout_extra_slice,
     feature_layout_input_dim,
+    feature_layout_is_climate_only,
+    feature_layout_is_dual,
     feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
 )
@@ -93,6 +101,37 @@ def list_muni_npy_files(
     return files
 
 
+def list_climate_sidecar_files(root: Path, year_ranges: list[str]) -> list[Path]:
+    """Return ``{code}_climate_daily.npy`` paths that sit next to a municipal .npy."""
+    out: list[Path] = []
+    skipped = 0
+    for npy in list_muni_npy_files(root, year_ranges, require_soil=False):
+        clim = climate_sidecar_path(npy)
+        if clim.is_file():
+            out.append(clim)
+        else:
+            skipped += 1
+    if skipped:
+        print(
+            f"  Skipped {skipped} municipality–year(s) missing "
+            f"{{code}}_climate_daily.npy (required for daily_climate MoCo)"
+        )
+    return out
+
+
+def _clean_climate_row(arr: np.ndarray) -> np.ndarray | None:
+    """Drop all-nodata days from a daily climate series ``[T, 5]``."""
+    row = np.asarray(arr, dtype=np.float32)
+    if row.ndim != 2 or row.shape[1] < N_DAILY_CLIMATE:
+        return None
+    row = row[:, :N_DAILY_CLIMATE]
+    invalid = (row == NO_DATA_VALUE) | ~np.isfinite(row)
+    keep = ~np.all(invalid, axis=1)
+    if int(np.count_nonzero(keep)) < 3:
+        return None
+    return np.ascontiguousarray(row[keep], dtype=np.float32)
+
+
 def _min_channels_for_layout(feature_layout: str) -> int:
     """Minimum .npy channel count to keep DOY (+ extras when required)."""
     sl = feature_layout_extra_slice(feature_layout)
@@ -140,6 +179,7 @@ class ParanaMoCoDataset(Dataset):
         seed: int = 111,
         rebuild_cache: bool = False,
         feature_layout: str = "spectral",
+        extra_scaler_path: Path | str | None = None,
     ):
         super().__init__()
         self.root = Path(root).expanduser().resolve()
@@ -148,16 +188,40 @@ class ParanaMoCoDataset(Dataset):
         self.max_samples = int(max_samples)
         self.seed = int(seed)
         self.feature_layout = normalize_feature_layout(feature_layout)
+        if feature_layout_is_dual(self.feature_layout):
+            raise ValueError(
+                f"MoCo does not support dual yield layout {self.feature_layout!r}. "
+                "Pretrain separate trunks with feature_layout='spectral' and "
+                "'daily_climate', then load them into DualSTNetRegression."
+            )
         self.input_dim = feature_layout_input_dim(self.feature_layout)
-        self._needs_soil = feature_layout_needs_soil_sidecar(self.feature_layout)
-        self._min_channels = _min_channels_for_layout(self.feature_layout)
-        self._pixel_tx = PixelTransform(
-            sequencelength=sequencelength,
-            feature_layout=self.feature_layout,
-            randomchoice=False,
-            interp=False,
-            seed=seed,
+        self._climate_only = feature_layout_is_climate_only(self.feature_layout)
+        self._needs_soil = (
+            False
+            if self._climate_only
+            else feature_layout_needs_soil_sidecar(self.feature_layout)
         )
+        self._min_channels = (
+            N_DAILY_CLIMATE
+            if self._climate_only
+            else _min_channels_for_layout(self.feature_layout)
+        )
+        self.extra_scaler_path = (
+            Path(extra_scaler_path).expanduser()
+            if extra_scaler_path is not None
+            else DEFAULT_INPUT_SCALER_PATH
+        )
+        self._pixel_tx: PixelTransform | None = None
+        self._climate_scaler: InputScaler | None = None
+        if not self._climate_only:
+            self._pixel_tx = PixelTransform(
+                sequencelength=sequencelength,
+                feature_layout=self.feature_layout,
+                randomchoice=False,
+                interp=False,
+                seed=seed,
+                extra_scaler_path=self.extra_scaler_path,
+            )
         # Parallel list of [4] soil vectors when layout needs sidecars; else unused.
         self.soil_list: list[np.ndarray] | None = None
 
@@ -171,11 +235,12 @@ class ParanaMoCoDataset(Dataset):
         # Soil layouts append _v2soil so climate caches stay reusable; soil
         # records are {"x", "soil"} object arrays.
         soil_tag = "_v2soil" if self._needs_soil else ""
+        clim_tag = "_clim" if self._climate_only else ""
         self.cache = (
             cache_dir
             / (
                 f"Unsupervised_Parana_{years_tag}_{self.feature_layout}"
-                f"_N{self.max_samples}_S{self.seed}{soil_tag}.npy"
+                f"_N{self.max_samples}_S{self.seed}{soil_tag}{clim_tag}.npy"
             )
         )
 
@@ -183,6 +248,7 @@ class ParanaMoCoDataset(Dataset):
             f"Load Paraná unsupervised MoCo set "
             f"(years={self.year_ranges}, layout={self.feature_layout}, "
             f"input_dim={self.input_dim}, soil_sidecar={self._needs_soil}, "
+            f"climate_only={self._climate_only}, "
             f"max_samples={self.max_samples}, seed={self.seed})"
         )
         if self.cache.exists() and not rebuild_cache:
@@ -192,6 +258,9 @@ class ParanaMoCoDataset(Dataset):
 
     def transform(self, x: np.ndarray, soil: np.ndarray | None = None):
         """Normalize features with the same layout rules as yield training."""
+        if self._climate_only:
+            return self._transform_climate(x)
+        assert self._pixel_tx is not None
         chunk = np.ascontiguousarray(x[None, ...], dtype=np.float32)
         soil_chunk = None
         if self._needs_soil:
@@ -212,6 +281,21 @@ class ParanaMoCoDataset(Dataset):
             chunk, soil=soil_chunk
         )
         return feats[0].astype(np.float32), doy[0].astype(np.float32)
+
+    def _transform_climate(self, x: np.ndarray):
+        """Z-score daily climate and attach season-relative DOY (1 = Oct 1)."""
+        if self._climate_scaler is None:
+            self._climate_scaler = InputScaler.require_load(self.extra_scaler_path)
+        clim = np.asarray(x, dtype=np.float32)
+        if clim.ndim != 2 or clim.shape[1] < N_DAILY_CLIMATE:
+            raise ValueError(
+                f"daily climate series must be [T, {N_DAILY_CLIMATE}], got {clim.shape}"
+            )
+        clim_z = self._climate_scaler.transform_daily_climate(
+            clim[:, :N_DAILY_CLIMATE]
+        )
+        doy = season_doy_axis(clim_z.shape[0]).astype(np.float32)
+        return clim_z.astype(np.float32), doy
 
     def load_cached_dataset(self) -> None:
         print(f"precached dataset files found at {self.cache}")
@@ -246,6 +330,10 @@ class ParanaMoCoDataset(Dataset):
         print(f"  loaded {len(self.X_list)} time series")
 
     def cache_dataset(self) -> None:
+        if self._climate_only:
+            self._cache_climate_dataset()
+            return
+
         files = list_muni_npy_files(
             self.root, self.year_ranges, require_soil=self._needs_soil
         )
@@ -363,6 +451,48 @@ class ParanaMoCoDataset(Dataset):
                 allow_pickle=True,
             )
         print(f"  cached {len(self.X_list)} series → {self.cache}")
+
+    def _cache_climate_dataset(self) -> None:
+        """One MoCo series per municipality–year daily climate sidecar."""
+        files = list_climate_sidecar_files(self.root, self.year_ranges)
+        if not files:
+            raise FileNotFoundError(
+                f"No {{code}}_climate_daily.npy under {self.root} for year ranges "
+                f"{self.year_ranges}. Build with "
+                "data_download/build_muni_daily_climate_npy.py."
+            )
+
+        rng = np.random.default_rng(self.seed)
+        n_take = (
+            min(self.max_samples, len(files)) if self.max_samples > 0 else len(files)
+        )
+        if n_take < len(files):
+            pick = rng.choice(len(files), size=n_take, replace=False)
+            files = [files[i] for i in sorted(pick)]
+
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        series: list[np.ndarray] = []
+        for f in tqdm(files, desc="loading daily climate sidecars for MoCo"):
+            cleaned = _clean_climate_row(load_climate_sidecar(f))
+            if cleaned is None:
+                continue
+            series.append(cleaned)
+
+        if len(series) < 2:
+            raise RuntimeError(
+                f"Climate MoCo cache ended with only {len(series)} usable series "
+                f"(need at least 2). Check sidecars under {self.root}."
+            )
+
+        order = rng.permutation(len(series))
+        self.X_list = [series[i] for i in order]
+        self.soil_list = None
+        np.save(
+            self.cache,
+            np.array(self.X_list, dtype=object),
+            allow_pickle=True,
+        )
+        print(f"  cached {len(self.X_list)} climate series → {self.cache}")
 
     def __len__(self) -> int:
         return len(self.X_list)

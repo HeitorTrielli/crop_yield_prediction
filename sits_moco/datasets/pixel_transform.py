@@ -23,6 +23,14 @@ from .extra_scaler import (
 from .feature_layout import normalize_feature_layout, resolve_feature_layout
 from .feature_recipes import assemble_recipe, extras_from_chunk
 from .constants import NO_DATA_VALUE
+from .daily_climate import (
+    CLIMATE_MAX_SEQ_LEN,
+    N_DAILY_CLIMATE,
+    broadcast_climate,
+    climate_to_tensors,
+    pad_climate_to_length,
+    season_doy_axis,
+)
 
 DOY_CHANNEL = 10
 NUM_SPECTRAL_CHANNELS = 10
@@ -90,6 +98,7 @@ class PixelTransform:
         extra_scaler_path: str | Path | None = None,
         legacy_input_scaling: bool = False,
         deterministic_head: bool = False,
+        climate_sequencelength: int | None = None,
     ):
         self.sequencelength = int(sequencelength)
         self.feature_layout = normalize_feature_layout(feature_layout)
@@ -97,6 +106,13 @@ class PixelTransform:
         self.input_feature_dim = int(lay["input_dim"])
         self._extra_channels_slice: tuple[int, int] | None = lay["extra_channels_slice"]
         self._soil_sidecar = bool(lay.get("soil_sidecar"))
+        self._climate_sidecar = bool(lay.get("climate_sidecar"))
+        self.climate_input_dim = int(lay.get("climate_input_dim") or 0)
+        self.climate_sequencelength = int(
+            climate_sequencelength
+            if climate_sequencelength is not None
+            else CLIMATE_MAX_SEQ_LEN
+        )
         self._recipe = lay.get("recipe")
         self.rc = bool(randomchoice)
         self.interp = bool(interp)
@@ -116,7 +132,11 @@ class PixelTransform:
                 raise ValueError(
                     "legacy_input_scaling only supports slice layouts "
                     "(spectral / spectral_xavier / spectral_xavier_climate / "
-                    "spectral_xavier_climate_soil), not recipes"
+                    "spectral_xavier_climate_soil), not recipes or dual layouts"
+                )
+            if self._climate_sidecar:
+                raise ValueError(
+                    "legacy_input_scaling does not support dual daily-climate layouts"
                 )
             self._extra_scaler = None
         elif extra_scaler is not None:
@@ -144,6 +164,72 @@ class PixelTransform:
             self._extra_scaler = InputScaler.require_load(self.extra_scaler_path)
             self._apply_spectral_stats(self._extra_scaler)
         return self._extra_scaler
+
+    def _drop_empty_spectral_days(self, chunk_arr: np.ndarray) -> np.ndarray:
+        """Keep timesteps where any pixel has a valid S2 observation."""
+        spec = chunk_arr[:, :, :NUM_SPECTRAL_CHANNELS]
+        day_valid = np.any(
+            (spec != NO_DATA_VALUE) & (spec != 0) & np.isfinite(spec),
+            axis=(0, 2),
+        )
+        if not np.any(day_valid):
+            return chunk_arr[:, :0, :]
+        if bool(np.all(day_valid)):
+            return chunk_arr
+        return np.ascontiguousarray(chunk_arr[:, day_valid, :])
+
+    def transform_climate(
+        self,
+        climate: np.ndarray,
+        n_pixels: int,
+    ) -> BatchChunk:
+        """Z-score and pad daily climate to climate_sequencelength."""
+        if climate.ndim == 2:
+            clim_tc = np.ascontiguousarray(climate, dtype=np.float32)
+            if clim_tc.shape[-1] < N_DAILY_CLIMATE:
+                raise ValueError(
+                    f"climate has C={clim_tc.shape[-1]}, expected {N_DAILY_CLIMATE}"
+                )
+            clim_ntc = broadcast_climate(clim_tc[..., :N_DAILY_CLIMATE], n_pixels)
+        elif climate.ndim == 3:
+            arr = np.ascontiguousarray(climate, dtype=np.float32)
+            if arr.shape[-1] < N_DAILY_CLIMATE:
+                raise ValueError(
+                    f"climate has C={arr.shape[-1]}, expected {N_DAILY_CLIMATE}"
+                )
+            arr = arr[..., :N_DAILY_CLIMATE]
+            if arr.shape[0] == n_pixels:
+                clim_ntc = arr
+            elif arr.shape[0] == 1:
+                clim_ntc = broadcast_climate(arr[0], n_pixels)
+            else:
+                with np.errstate(all="ignore"):
+                    mean_tc = np.nanmean(
+                        np.where(
+                            (arr == NO_DATA_VALUE) | ~np.isfinite(arr),
+                            np.nan,
+                            arr,
+                        ),
+                        axis=0,
+                    ).astype(np.float32)
+                clim_ntc = broadcast_climate(mean_tc, n_pixels)
+        else:
+            raise ValueError(f"climate must be [T,C] or [N,T,C], got {climate.shape}")
+
+        invalid = (clim_ntc == NO_DATA_VALUE) | ~np.isfinite(clim_ntc)
+        clim_z = np.where(invalid, 0.0, clim_ntc).astype(np.float32)
+        scaler = self.extra_scaler()
+        clim_z = scaler.transform_daily_climate(clim_z)
+        valid = ~np.all(invalid, axis=-1)
+        weight = valid.astype(np.float64)
+        doy = np.broadcast_to(
+            season_doy_axis(clim_z.shape[1])[None, :],
+            (n_pixels, clim_z.shape[1]),
+        ).copy()
+        x_pad, mask_bool, doy_pad, weight_pad = pad_climate_to_length(
+            clim_z, doy, weight, self.climate_sequencelength
+        )
+        return climate_to_tensors(x_pad, mask_bool, doy_pad, weight_pad)
 
     def features_from_chunk(
         self,
@@ -255,12 +341,21 @@ class PixelTransform:
         self,
         chunk_arr: np.ndarray,
         soil: np.ndarray | None = None,
+        climate: np.ndarray | None = None,
     ) -> BatchChunk:
-        """Return (x, mask, doy, weight) each [N, T, ...] — batched, no per-pixel list."""
+        """Return (x, mask, doy, weight) or dual 8-tuple with climate tensors."""
         if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
             chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
+        if self._climate_sidecar:
+            chunk_arr = self._drop_empty_spectral_days(chunk_arr)
         n, t, _ = chunk_arr.shape
-        x, weight, doy = self.features_from_chunk(chunk_arr, soil=soil)
+        if t == 0:
+            fdim = self.input_feature_dim
+            x = np.zeros((n, 0, fdim), dtype=np.float32)
+            weight = np.zeros((n, 0), dtype=np.float64)
+            doy = np.zeros((n, 0), dtype=np.int32)
+        else:
+            x, weight, doy = self.features_from_chunk(chunk_arr, soil=soil)
         fdim = self.input_feature_dim
         seq_len = self.sequencelength
 
@@ -323,13 +418,35 @@ class PixelTransform:
                 mask = np.ones((n, seq_len), dtype=np.int32)
 
         x_pad = np.ascontiguousarray(x_pad.astype(np.float32))
+        if self._soil_sidecar and soil is not None and x_pad.shape[-1] >= N_SOIL:
+            # Soil is static: keep it on padded S2 steps so late fusion can read t=0.
+            soil_arr = np.asarray(soil, dtype=np.float32)
+            if soil_arr.ndim == 2 and soil_arr.shape[0] == n and soil_arr.shape[1] >= N_SOIL:
+                soil_arr = soil_arr[:, :N_SOIL]
+                soil_arr = np.where(
+                    (soil_arr == NO_DATA_VALUE) | ~np.isfinite(soil_arr), 0.0, soil_arr
+                )
+                if self.legacy_input_scaling:
+                    soil_s = scale_soil_channels_legacy(soil_arr)
+                else:
+                    soil_s = scale_soil_channels(soil_arr, scaler=self.extra_scaler())
+                x_pad[:, :, -N_SOIL:] = soil_s[:, None, :]
         mask_bool = mask == 0
         doy_pad_broadcast = np.ascontiguousarray(doy_pad_broadcast.astype(np.int64))
         weight_pad = np.ascontiguousarray(weight_pad.astype(np.float32))
 
-        return (
+        s2 = (
             torch.from_numpy(x_pad),
             torch.from_numpy(mask_bool),
             torch.from_numpy(doy_pad_broadcast),
             torch.from_numpy(weight_pad),
         )
+        if not self._climate_sidecar:
+            return s2
+        if climate is None:
+            raise ValueError(
+                f"Layout {self.feature_layout!r} requires a daily climate sidecar "
+                "passed to transform_chunk"
+            )
+        clim = self.transform_climate(climate, n)
+        return s2 + clim

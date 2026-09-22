@@ -39,7 +39,11 @@ from tuning.collect import (
     trial_row,
 )
 from tuning.config import load_study_config, merge_trial_params
-from tuning.moco_ensure import ensure_moco_checkpoint, predict_moco_checkpoint_path
+from tuning.moco_ensure import (
+    ensure_trial_moco_pretrains,
+    is_dual_moco_cfg,
+    predict_trial_moco_paths,
+)
 from tuning.resume import plan_trial_resume
 from tuning.runner import apply_resume_params, predict_run_dir, run_trial_subprocess
 from tuning.search import generate_trials
@@ -211,21 +215,21 @@ def _run_one_yield_job(
 
     moco_cfg = cfg.get("moco")
     if moco_cfg and resume_plan is None:
-        expected_moco = predict_moco_checkpoint_path(
-            merged, moco_cfg, repo_root=repo_root
-        )
+        expected = predict_trial_moco_paths(merged, moco_cfg, repo_root=repo_root)
         if args.dry_run:
-            print(f"[{label}] would ensure MoCo: {expected_moco}")
+            for role, path in expected.items():
+                print(f"[{label}] would ensure MoCo ({role}): {path}")
             train_params = dict(train_params)
-            train_params["pretrained"] = str(expected_moco)
+            for role, path in expected.items():
+                train_params[role] = str(path)
         else:
             try:
-                moco_ckpt = ensure_moco_checkpoint(
+                moco_paths = ensure_trial_moco_pretrains(
                     merged,
                     moco_cfg,
                     repo_root=repo_root,
                     dry_run=False,
-                    capture_log=log_path.parent / "moco_stdout.log",
+                    capture_log_dir=log_path.parent,
                 )
             except RuntimeError as exc:
                 print(f"[{label}] FAILED MoCo ensure: {exc}")
@@ -235,9 +239,10 @@ def _run_one_yield_job(
                     "returncode": 1,
                     "run_dir": str(run_dir.resolve()),
                 }
-            print(f"[{label}] MoCo pretrained: {moco_ckpt}")
             train_params = dict(train_params)
-            train_params["pretrained"] = str(moco_ckpt)
+            for role, path in moco_paths.items():
+                print(f"[{label}] MoCo {role}: {path}")
+                train_params[role] = str(path)
 
     if args.dry_run:
         if resume_plan is not None:
@@ -392,7 +397,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Strategy: {cfg['search']['strategy']} -> {len(trials)} trial(s)")
     print(f"Output: {study_dir.resolve()}")
     if cfg.get("moco"):
-        if cfg["moco"].get("reuse_only"):
+        if is_dual_moco_cfg(cfg["moco"]):
+            print(
+                "MoCo: dual auto-ensure "
+                "(spectral + climate trunks before each yield trial)"
+            )
+        elif cfg["moco"].get("reuse_only"):
             print("MoCo: reuse existing checkpoints only (will not train MoCo)")
         else:
             print("MoCo: auto-ensure enabled (train matching trunk before each yield trial)")
@@ -633,22 +643,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Fresh yield start (not resuming a yield ckpt): ensure matching MoCo exists.
         moco_cfg = cfg.get("moco")
         if moco_cfg and resume_plan is None:
-            expected_moco = predict_moco_checkpoint_path(
-                merged, moco_cfg, repo_root=repo_root
-            )
+            expected = predict_trial_moco_paths(merged, moco_cfg, repo_root=repo_root)
             if args.dry_run:
-                print(f"[{trial_id}] would ensure MoCo: {expected_moco}")
+                for role, path in expected.items():
+                    print(f"[{trial_id}] would ensure MoCo ({role}): {path}")
                 train_params = dict(train_params)
-                train_params["pretrained"] = str(expected_moco)
-                merged["pretrained"] = str(expected_moco)
+                for role, path in expected.items():
+                    train_params[role] = str(path)
+                    merged[role] = str(path)
             else:
                 try:
-                    moco_ckpt = ensure_moco_checkpoint(
+                    moco_paths = ensure_trial_moco_pretrains(
                         merged,
                         moco_cfg,
                         repo_root=repo_root,
                         dry_run=False,
-                        capture_log=trial_dir / "moco_stdout.log",
+                        capture_log_dir=trial_dir,
                     )
                 except RuntimeError as exc:
                     finished = _utc_now_iso()
@@ -675,10 +685,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                     if best:
                         _save_json(study_dir / "best_trial.json", best)
                     continue
-                print(f"[{trial_id}] MoCo pretrained: {moco_ckpt}")
                 train_params = dict(train_params)
-                train_params["pretrained"] = str(moco_ckpt)
-                merged["pretrained"] = str(moco_ckpt)
+                for role, path in moco_paths.items():
+                    print(f"[{trial_id}] MoCo {role}: {path}")
+                    train_params[role] = str(path)
+                    merged[role] = str(path)
                 _save_json(trial_dir / "params.json", merged)
 
         if args.dry_run:

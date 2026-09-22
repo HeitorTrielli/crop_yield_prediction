@@ -69,6 +69,7 @@ INT_PARAMS = frozenset(
         "min_months",
         "holdout_year",
         "attn_pool_queries",
+        "climate_sequencelength",
     }
 )
 
