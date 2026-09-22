@@ -21,7 +21,9 @@ SCOPES_DRIVE = ["https://www.googleapis.com/auth/drive"]
 
 def build_drive_service(credentials_dir: Path) -> Any:
     """Build Drive API service using credentials_dir/credentials.json and token.json."""
-    credentials_dir = credentials_dir.resolve()
+    from google.auth.exceptions import RefreshError
+
+    credentials_dir = Path(credentials_dir).resolve()
     creds_file = credentials_dir / "credentials.json"
     token_file = credentials_dir / "token.json"
 
@@ -34,17 +36,35 @@ def build_drive_service(credentials_dir: Path) -> Any:
     creds = None
     if token_file.exists():
         creds = Credentials.from_authorized_user_file(str(token_file), SCOPES_DRIVE)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+
+    need_login = not creds or not creds.valid
+    if creds and creds.expired and creds.refresh_token:
+        try:
             creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(creds_file), SCOPES_DRIVE
+            need_login = False
+        except RefreshError as exc:
+            # invalid_grant / revoked token → force a fresh browser login
+            print(
+                f"Drive token refresh failed ({exc}). "
+                f"Removing {token_file.name} and starting a new login…"
             )
-            creds = flow.run_local_server(port=0)
+            try:
+                token_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            creds = None
+            need_login = True
+
+    if need_login:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(creds_file), SCOPES_DRIVE
+        )
+        # Opens a browser; in WSL use a Windows browser if available.
+        creds = flow.run_local_server(port=0, open_browser=True)
         credentials_dir.mkdir(parents=True, exist_ok=True)
-        with open(token_file, "w") as f:
+        with open(token_file, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
+        print(f"Saved new Drive token → {token_file}")
 
     return build("drive", "v3", credentials=creds)
 

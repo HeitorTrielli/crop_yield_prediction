@@ -23,6 +23,11 @@ from typing import Any
 import numpy as np
 
 from .constants import NO_DATA_VALUE
+from .daily_climate import (
+    DAILY_CLIMATE_CHANNEL_NAMES,
+    N_DAILY_CLIMATE,
+    climate_sidecar_path,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_SCALER_PATH = REPO_ROOT / "files" / "train_input_scaler.json"
@@ -151,6 +156,9 @@ class InputScaler:
         soil_mean: np.ndarray | None = None,
         soil_std: np.ndarray | None = None,
         soil_var: np.ndarray | None = None,
+        daily_climate_mean: np.ndarray | None = None,
+        daily_climate_std: np.ndarray | None = None,
+        daily_climate_var: np.ndarray | None = None,
         n_frames: int | dict[str, int] = 0,
         path: Path | str | None = None,
         meta: dict[str, Any] | None = None,
@@ -180,6 +188,20 @@ class InputScaler:
         self.soil_mean = _vec(soil_mean, N_SOIL, "soil mean")
         self.soil_std = _std_vec(soil_std, N_SOIL, "soil std")
         self.soil_var = _var_or_sq(soil_var, self.soil_std, N_SOIL)
+
+        if daily_climate_mean is None:
+            daily_climate_mean = np.zeros(N_DAILY_CLIMATE, dtype=np.float32)
+            daily_climate_std = np.ones(N_DAILY_CLIMATE, dtype=np.float32)
+            daily_climate_var = np.ones(N_DAILY_CLIMATE, dtype=np.float32)
+        self.daily_climate_mean = _vec(
+            daily_climate_mean, N_DAILY_CLIMATE, "daily climate mean"
+        )
+        self.daily_climate_std = _std_vec(
+            daily_climate_std, N_DAILY_CLIMATE, "daily climate std"
+        )
+        self.daily_climate_var = _var_or_sq(
+            daily_climate_var, self.daily_climate_std, N_DAILY_CLIMATE
+        )
 
         d_mean = dict(derived_mean or {})
         d_std = dict(derived_std or {})
@@ -255,6 +277,18 @@ class InputScaler:
             )
         return ((out - self.soil_mean) / self.soil_std).astype(np.float32)
 
+    def transform_daily_climate(self, climate: np.ndarray) -> np.ndarray:
+        """Z-score raw daily Xavier channels [..., 5]. No clip."""
+        out = np.asarray(climate, dtype=np.float32)
+        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        if int(out.shape[-1]) != N_DAILY_CLIMATE:
+            raise ValueError(
+                f"Expected last dim {N_DAILY_CLIMATE} (daily climate), got {out.shape[-1]}"
+            )
+        return ((out - self.daily_climate_mean) / self.daily_climate_std).astype(
+            np.float32
+        )
+
     def to_dict(self) -> dict[str, Any]:
         n_frames = self.n_frames
         if isinstance(n_frames, dict):
@@ -294,6 +328,13 @@ class InputScaler:
                 self.soil_var,
                 np.zeros(N_SOIL, dtype=int),
             ),
+            "daily_climate": _block(
+                DAILY_CLIMATE_CHANNEL_NAMES,
+                self.daily_climate_mean,
+                self.daily_climate_std,
+                self.daily_climate_var,
+                np.zeros(N_DAILY_CLIMATE, dtype=int),
+            ),
             "derived": {
                 name: {
                     "mean": self.derived_mean[name],
@@ -306,6 +347,7 @@ class InputScaler:
                 "spectral": "reflectance_0_1_after_1e-4",
                 "extras": "raw_npy_units",
                 "soil": "mapbiomas_solo_pct_and_t_ha",
+                "daily_climate": "raw_daily_xavier_pr_eto_rs_tmax_tmin",
             },
         }
         # Prefer per-channel counts stored in meta when present.
@@ -315,6 +357,7 @@ class InputScaler:
             ("extras_n_frames_per_channel", "extras"),
             ("extras_delta_n_frames_per_channel", "extras_delta"),
             ("soil_n_frames_per_channel", "soil"),
+            ("daily_climate_n_frames_per_channel", "daily_climate"),
         ):
             if key in meta:
                 payload[block]["n_frames_per_channel"] = meta.pop(key)
@@ -349,6 +392,7 @@ class InputScaler:
         delta = payload.get("extras_delta") or {}
         derived = payload.get("derived") or {}
         soil = payload.get("soil") or {}
+        daily_climate = payload.get("daily_climate") or {}
         reserved = {
             "version",
             "aggregation",
@@ -358,6 +402,7 @@ class InputScaler:
             "extras",
             "extras_delta",
             "soil",
+            "daily_climate",
             "derived",
             "units",
             "channels",
@@ -383,6 +428,9 @@ class InputScaler:
             soil_mean=soil.get("mean"),
             soil_std=soil.get("std"),
             soil_var=soil.get("var"),
+            daily_climate_mean=daily_climate.get("mean"),
+            daily_climate_std=daily_climate.get("std"),
+            daily_climate_var=daily_climate.get("var"),
             derived_mean=d_mean,
             derived_std=d_std,
             derived_var=d_var,
@@ -435,6 +483,14 @@ class InputScaler:
         lines.append("  soil (sidecar)")
         for name, mu, sd, va in zip(
             SOIL_CHANNEL_NAMES, self.soil_mean, self.soil_std, self.soil_var
+        ):
+            lines.append(f"    {name:18s}  mean={mu:12.4f}  std={sd:12.4f}  var={va:12.4f}")
+        lines.append("  daily_climate (raw Xavier sidecar)")
+        for name, mu, sd, va in zip(
+            DAILY_CLIMATE_CHANNEL_NAMES,
+            self.daily_climate_mean,
+            self.daily_climate_std,
+            self.daily_climate_var,
         ):
             lines.append(f"    {name:18s}  mean={mu:12.4f}  std={sd:12.4f}  var={va:12.4f}")
         lines.append("  extras_delta")
@@ -520,6 +576,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
     extra_frames: list[np.ndarray] = []
     delta_frames: list[np.ndarray] = []
     soil_rows: list[np.ndarray] = []
+    daily_climate_frames: list[np.ndarray] = []
     n_series = 0
     n_missing = 0
     for key in iterator:
@@ -573,6 +630,34 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
                         soil_rows.append(spatial_soil.astype(np.float32, copy=False))
             except OSError:
                 pass
+        clim_path = None
+        resolve_clim = getattr(dataset, "_resolve_climate_path", None)
+        if callable(resolve_clim):
+            clim_path = resolve_clim(code, year)
+        elif path is not None:
+            clim_path = climate_sidecar_path(path)
+        if clim_path is not None and Path(clim_path).is_file():
+            try:
+                clim = np.load(clim_path, mmap_mode="r")
+                clim = np.asarray(clim, dtype=np.float32)
+                if clim.ndim == 3:
+                    with np.errstate(all="ignore"):
+                        clim = np.nanmean(
+                            np.where(
+                                (clim == NO_DATA_VALUE) | ~np.isfinite(clim),
+                                np.nan,
+                                clim,
+                            ),
+                            axis=0,
+                        )
+                if clim.ndim == 2 and clim.shape[1] >= N_DAILY_CLIMATE:
+                    clim = clim[:, :N_DAILY_CLIMATE]
+                    invalid = (clim == NO_DATA_VALUE) | ~np.isfinite(clim)
+                    clim = np.where(invalid, np.nan, clim)
+                    if np.isfinite(clim).any():
+                        daily_climate_frames.append(clim.astype(np.float32, copy=False))
+            except OSError:
+                pass
         n_series += 1
 
     if not spec_frames:
@@ -623,6 +708,15 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         soil_var = np.ones(N_SOIL)
         soil_n = np.zeros(N_SOIL, dtype=np.int64)
 
+    if daily_climate_frames:
+        clim_mat = np.concatenate(daily_climate_frames, axis=0)
+        dc_mean, dc_std, dc_var, dc_n = _moments(clim_mat)
+    else:
+        dc_mean = np.zeros(N_DAILY_CLIMATE)
+        dc_std = np.ones(N_DAILY_CLIMATE)
+        dc_var = np.ones(N_DAILY_CLIMATE)
+        dc_n = np.zeros(N_DAILY_CLIMATE, dtype=np.int64)
+
     harvest_years: list[int] = []
     if keys and isinstance(keys[0], tuple):
         harvest_years = sorted({int(y) for _, y in keys})
@@ -632,6 +726,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         "extras": int(e_n.max()) if e_n.size else 0,
         "extras_delta": int(d_n.max()) if d_n.size else 0,
         "soil": int(soil_n.max()) if soil_n.size else 0,
+        "daily_climate": int(dc_n.max()) if dc_n.size else 0,
     }
     meta = {
         "datapath": str(Path(dataset.root).expanduser().resolve()),
@@ -641,6 +736,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         "extras_n_frames_per_channel": [int(x) for x in e_n],
         "extras_delta_n_frames_per_channel": [int(x) for x in d_n],
         "soil_n_frames_per_channel": [int(x) for x in soil_n],
+        "daily_climate_n_frames_per_channel": [int(x) for x in dc_n],
         "harvest_years": harvest_years,
         "feature_layout": getattr(dataset, "feature_layout", None),
     }
@@ -657,6 +753,9 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         soil_mean=soil_mean,
         soil_std=soil_std,
         soil_var=soil_var,
+        daily_climate_mean=dc_mean,
+        daily_climate_std=dc_std,
+        daily_climate_var=dc_var,
         derived_mean=derived_mean,
         derived_std=derived_std,
         derived_var=derived_var,

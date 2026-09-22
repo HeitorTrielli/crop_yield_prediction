@@ -25,7 +25,14 @@ import torch.optim
 from torch.utils.data import DataLoader
 
 # Import Polars version of dataset
-from datasets.feature_layout import feature_layout_cli_choices, normalize_feature_layout
+from datasets.daily_climate import CLIMATE_MAX_SEQ_LEN
+from datasets.feature_layout import (
+    feature_layout_cli_choices,
+    feature_layout_is_dual,
+    feature_layout_needs_soil_sidecar,
+    feature_layout_spectral_dim,
+    normalize_feature_layout,
+)
 from datasets.uscrops_aggregated_npy_polars import (
     DEFAULT_MAX_COVERAGE_RATIO,
     DEFAULT_MIN_COVERAGE_RATIO,
@@ -139,9 +146,20 @@ def parse_args():
         "--sequencelength",
         type=int,
         default=DEFAULT_SEQUENCELENGTH,
+        dest="sequencelength",
+        metavar="SEQLENGTH",
         help=(
-            f"Max time steps per pixel (pad/sample to this; default: {DEFAULT_SEQUENCELENGTH}). "
-            "Match your .npy data; larger values use more GPU memory."
+            f"Max Sentinel time steps per sample (pad/sample to this; "
+            f"default: {DEFAULT_SEQUENCELENGTH}). Match your .npy data."
+        ),
+    )
+    parser.add_argument(
+        "--climate-sequencelength",
+        type=int,
+        default=CLIMATE_MAX_SEQ_LEN,
+        help=(
+            "Daily climate STNet sequence length for dual layouts "
+            f"(Oct 1–Mar 31, default: {CLIMATE_MAX_SEQ_LEN})."
         ),
     )
     parser.add_argument(
@@ -209,6 +227,16 @@ def parse_args():
     )
     parser.add_argument(
         "--pretrained", default=None, type=str, help="path to pretrained checkpoint"
+    )
+    parser.add_argument(
+        "--pretrained-climate",
+        default=None,
+        type=str,
+        help=(
+            "MoCo checkpoint for DualSTNet climate trunk "
+            "(encoder_q → model.climate.*). Use with --pretrained for the "
+            "spectral trunk."
+        ),
     )
     parser.add_argument(
         "--no-compile",
@@ -416,6 +444,8 @@ def parse_args():
             "(requires 17-channel .npy); "
             "'spectral_xavier_climate_soil' = climate + MapBiomas Solo sidecars "
             "(use --soil-fusion early|late); "
+            "'dual_spectral_daily_climate' = DualSTNet (S2 megapixel STNet + daily Xavier STNet); "
+            "'dual_spectral_daily_climate_soil' = same + soil late-fused into the decoder; "
             "'ma_*' (alias 'mp_*') = derived index/climate recipes (see datasets/feature_recipes.py). "
             "See datasets/feature_layout.py."
         ),
@@ -507,10 +537,10 @@ def parse_args():
         choices=["early", "late"],
         default="early",
         help=(
-            "How MapBiomas Solo channels enter STNet when using a soil layout "
-            "(spectral_xavier_climate_soil, input_dim=20): "
-            "'early' = soil through MLP+transformer with spectral/climate (default); "
-            "'late' = soil concatenated after temporal pooling into the decoder only."
+            "How MapBiomas Solo channels enter the model when using a soil layout. "
+            "'early' = soil through MLP+transformer with spectral/climate (single STNet); "
+            "'late' = soil concatenated after temporal pooling into the decoder only. "
+            "Dual STNet layouts always use late fusion (soil is static)."
         ),
     )
     parser.add_argument(
@@ -671,10 +701,15 @@ def parse_args():
         args.max_coverage_ratio = None
 
     # WSL/Linux convenience: convert Windows absolute paths (e.g. C:\...) to /mnt/c/...
-    if args.pretrained:
+    if args.pretrained or getattr(args, "pretrained_climate", None):
         from run_paths import normalize_user_path
 
-        args.pretrained = str(normalize_user_path(args.pretrained))
+        if args.pretrained:
+            args.pretrained = str(normalize_user_path(args.pretrained))
+        if getattr(args, "pretrained_climate", None):
+            args.pretrained_climate = str(
+                normalize_user_path(args.pretrained_climate)
+            )
 
     args.harvest_years_set = {
         int(x.strip()) for x in args.harvest_years.split(",") if x.strip()
@@ -962,8 +997,8 @@ def cli_optimizer_hparams(args) -> dict:
 
 
 def model_kwargs_from_args(args) -> dict:
-    """STNetRegression constructor kwargs from CLI."""
-    return {
+    """STNetRegression / DualSTNetRegression constructor kwargs from CLI."""
+    kw = {
         "d_model": int(args.model_d_model),
         "n_head": int(args.model_n_head),
         "n_layers": int(args.model_n_layers),
@@ -973,6 +1008,18 @@ def model_kwargs_from_args(args) -> dict:
         "attn_pool_queries": int(getattr(args, "attn_pool_queries", 4)),
         "soil_fusion": str(getattr(args, "soil_fusion", "early")),
     }
+    if feature_layout_is_dual(getattr(args, "feature_layout", "spectral")):
+        if feature_layout_needs_soil_sidecar(args.feature_layout):
+            kw["soil_fusion"] = "late"
+        else:
+            kw["soil_fusion"] = "none"
+        kw["climate_pooling"] = "mean"
+        if kw["temporal_pooling"] == "attention":
+            kw["climate_pooling"] = "attention"
+        kw["climate_max_seq_len"] = int(
+            getattr(args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN)
+        )
+    return kw
 
 
 def optimizer_hparams_changed(ck: dict | None, args) -> bool:
@@ -1126,6 +1173,9 @@ def train(args):
         max_coverage_ratio=args.max_coverage_ratio,
         min_images=args.min_images,
         min_months=args.min_months,
+        climate_sequencelength=getattr(
+            args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN
+        ),
         train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
@@ -1154,6 +1204,9 @@ def train(args):
         max_coverage_ratio=args.max_coverage_ratio,
         min_images=args.min_images,
         min_months=args.min_months,
+        climate_sequencelength=getattr(
+            args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN
+        ),
         train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
@@ -1182,6 +1235,9 @@ def train(args):
         max_coverage_ratio=args.max_coverage_ratio,
         min_images=args.min_images,
         min_months=args.min_months,
+        climate_sequencelength=getattr(
+            args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN
+        ),
         train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
@@ -1213,21 +1269,35 @@ def train(args):
 
     print("=> creating model")
     device = torch.device(args.device)
-    from models import STNetRegression
+    from models import DualSTNetRegression, STNetRegression
 
     input_dim = int(traindataloader.dataset.input_feature_dim)
+    dual = feature_layout_is_dual(args.feature_layout)
     print(
         f"Model input_dim={input_dim} (--feature-layout {args.feature_layout}; "
         f"soil_fusion={getattr(args, 'soil_fusion', 'early')}; "
+        f"dual={dual}; "
         "see datasets/feature_layout.py)"
     )
     model_kw = model_kwargs_from_args(args)
-    model = STNetRegression(
-        input_dim=input_dim,
-        num_outputs=int(args.num_outputs),
-        max_seq_len=args.sequencelength,
-        **model_kw,
-    ).to(device)
+    if dual:
+        spectral_dim = feature_layout_spectral_dim(args.feature_layout)
+        climate_dim = int(getattr(traindataloader.dataset, "climate_input_dim", 5) or 5)
+        model = DualSTNetRegression(
+            spectral_dim=spectral_dim,
+            climate_dim=climate_dim,
+            input_dim=input_dim,
+            num_outputs=int(args.num_outputs),
+            max_seq_len=args.sequencelength,
+            **model_kw,
+        ).to(device)
+    else:
+        model = STNetRegression(
+            input_dim=input_dim,
+            num_outputs=int(args.num_outputs),
+            max_seq_len=args.sequencelength,
+            **model_kw,
+        ).to(device)
     print("Model architecture: " + ", ".join(f"{k}={v}" for k, v in model_kw.items()))
 
     print(
@@ -1240,20 +1310,8 @@ def train(args):
     pretrained_checkpoint = None
     moco_weight_init = False
     moco_init_state = None
-    if args.pretrained:
-        pretrained_path = Path(args.pretrained)
-        print(f"Loading pretrained model from {pretrained_path}")
-        pretrained_checkpoint = torch.load(
-            pretrained_path, map_location=device, weights_only=False
-        )
 
-        pretrain_state = pretrained_checkpoint["model_state"]
-        model_dict = model.state_dict()
-        # Detect MoCo by checkpoint contents only. Do NOT substring-match the
-        # full path: this repo lives under sits_moco/, so "moco" in path is
-        # always true and would treat yield resumes as MoCo (0 tensors loaded,
-        # fresh epoch 1). Optional path hint: path *component* named moco /
-        # contrastive, or a filename that clearly starts with moco.
+    def _looks_like_moco(pretrain_state: dict, pretrained_path: Path) -> bool:
         has_encoder_q = any(k.startswith("encoder_q.") for k in pretrain_state)
         path_parts = {p.lower() for p in pretrained_path.parts}
         name_l = pretrained_path.name.lower()
@@ -1262,20 +1320,73 @@ def train(args):
             or "contrastive" in path_parts
             or name_l.startswith("moco")
         )
-        moco_weight_init = has_encoder_q or path_looks_moco
+        return has_encoder_q or path_looks_moco
 
-        if moco_weight_init:
-            # MoCo: remap encoder_q.* → trunk; skip MoCo projection head / PE buffer.
-            # Do not resume epoch/optimizer from the contrastive checkpoint.
-            # Narrower first Linear (rain 12 → climate 16) copies overlapping
-            # in_features; extra climate columns stay at random init.
-            state_dict, skipped_shape, padded_keys = remap_moco_encoder_state(
-                pretrain_state, model_dict
+    def _apply_moco_ckpt(ckpt_path: Path, *, key_prefix: str = "") -> int:
+        nonlocal moco_weight_init
+        print(f"Loading MoCo encoder from {ckpt_path}" + (f" → {key_prefix!r}" if key_prefix else ""))
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        pretrain_state = ckpt["model_state"]
+        if not _looks_like_moco(pretrain_state, ckpt_path):
+            raise ValueError(
+                f"{ckpt_path} does not look like a MoCo checkpoint "
+                "(expected encoder_q.* weights)"
             )
-
-            load_result = model.load_state_dict(state_dict, strict=False)
+        model_dict = model.state_dict()
+        state_dict, skipped_shape, padded_keys = remap_moco_encoder_state(
+            pretrain_state, model_dict, key_prefix=key_prefix
+        )
+        load_result = model.load_state_dict(state_dict, strict=False)
+        label = key_prefix.rstrip(".") or "encoder"
+        print(
+            f"  ✓ MoCo {label} init: loaded {len(state_dict)}/{len(model_dict)} "
+            "matching tensors (fresh optimizer/epoch)"
+        )
+        for name, src_shape, dst_shape in padded_keys:
             print(
-                f"  ✓ MoCo encoder init: loaded {len(state_dict)}/{len(model_dict)} "
+                f"  ✓ Partial Linear load {name}: copied in_features "
+                f"{src_shape[1]}/{dst_shape[1]} (extra columns stay random init)"
+            )
+        if skipped_shape:
+            print(
+                f"  ⚠️  Skipped {len(skipped_shape)} tensors due to shape mismatch "
+                f"(e.g. input_dim / d_model): {skipped_shape[:4]}..."
+            )
+        if load_result.missing_keys:
+            print(
+                f"  ℹ️  Random init for {len(load_result.missing_keys)} keys "
+                f"(incl. regression head): {list(load_result.missing_keys)[:5]}..."
+            )
+        moco_weight_init = True
+        return len(state_dict)
+
+    dual = feature_layout_is_dual(args.feature_layout)
+    climate_ckpt = getattr(args, "pretrained_climate", None)
+    if climate_ckpt and not dual:
+        raise ValueError(
+            "--pretrained-climate requires a dual feature layout "
+            "(dual_spectral_daily_climate[_soil])"
+        )
+
+    if args.pretrained:
+        pretrained_path = Path(args.pretrained)
+        print(f"Loading pretrained model from {pretrained_path}")
+        pretrained_checkpoint = torch.load(
+            pretrained_path, map_location=device, weights_only=False
+        )
+
+        pretrain_state = pretrained_checkpoint["model_state"]
+        if _looks_like_moco(pretrain_state, pretrained_path):
+            # MoCo: remap encoder_q.* → trunk (spectral. for DualSTNet).
+            prefix = "spectral." if dual else ""
+            model_dict = model.state_dict()
+            state_dict, skipped_shape, padded_keys = remap_moco_encoder_state(
+                pretrain_state, model_dict, key_prefix=prefix
+            )
+            load_result = model.load_state_dict(state_dict, strict=False)
+            label = "spectral" if dual else "encoder"
+            print(
+                f"  ✓ MoCo {label} init: loaded {len(state_dict)}/{len(model_dict)} "
                 "matching tensors (fresh optimizer/epoch)"
             )
             for name, src_shape, dst_shape in padded_keys:
@@ -1294,12 +1405,10 @@ def train(args):
                     f"(incl. regression head): {list(load_result.missing_keys)[:5]}..."
                 )
             pretrained_checkpoint = None  # never treat MoCo ckpt as resume
-            # Snapshot so VRAM probe reinit cannot wipe MoCo encoder weights.
-            moco_init_state = {
-                k: v.detach().clone() for k, v in model.state_dict().items()
-            }
+            moco_weight_init = True
         else:
             # Yield / classification resume: load matching keys including decoder
+            model_dict = model.state_dict()
             state_dict = {
                 k: v for k, v in pretrain_state.items() if k in model_dict.keys()
             }
@@ -1327,8 +1436,16 @@ def train(args):
             decoder_keys = [k for k in state_dict.keys() if "decoder" in k]
             if decoder_keys:
                 print(f"  ✓ Loaded decoder weights: {len(decoder_keys)} parameters")
-            else:
-                print("  ⚠️  Warning: No decoder weights found in checkpoint!")
+
+    if climate_ckpt:
+        _apply_moco_ckpt(Path(climate_ckpt), key_prefix="climate.")
+
+    if moco_weight_init:
+        # Snapshot so VRAM probe reinit cannot wipe MoCo encoder weights.
+        moco_init_state = {
+            k: v.detach().clone() for k, v in model.state_dict().items()
+        }
+        pretrained_checkpoint = None
     model.modelname = build_run_name(
         target=args.target,
         model_class_name=model.__class__.__name__,
@@ -1939,6 +2056,7 @@ def get_aggregated_dataloader(
     max_coverage_ratio=DEFAULT_MAX_COVERAGE_RATIO,
     min_images: int = 0,
     min_months: int = 0,
+    climate_sequencelength: int | None = None,
     train_mid_yield_keep_fraction=DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
     train_mid_yield_lo=DEFAULT_TRAIN_MID_YIELD_LO,
     train_mid_yield_hi=DEFAULT_TRAIN_MID_YIELD_HI,
@@ -1973,6 +2091,7 @@ def get_aggregated_dataloader(
         max_coverage_ratio=max_coverage_ratio,
         min_images=min_images,
         min_months=min_months,
+        climate_sequencelength=climate_sequencelength,
         train_mid_yield_keep_fraction=train_mid_yield_keep_fraction,
         train_mid_yield_lo=train_mid_yield_lo,
         train_mid_yield_hi=train_mid_yield_hi,

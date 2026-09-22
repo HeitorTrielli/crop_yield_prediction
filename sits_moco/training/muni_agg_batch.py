@@ -74,13 +74,8 @@ def _load_raw_npy(path: str) -> np.ndarray | None:
 
 
 def _stack_chunks(chunks: list[BatchChunk]) -> BatchChunk:
-    xs, masks, doys, weights = zip(*chunks)
-    return (
-        torch.cat(xs, dim=0),
-        torch.cat(masks, dim=0),
-        torch.cat(doys, dim=0),
-        torch.cat(weights, dim=0),
-    )
+    n_fields = len(chunks[0])
+    return tuple(torch.cat([c[i] for c in chunks], dim=0) for i in range(n_fields))
 
 
 def _transform_raw(
@@ -91,11 +86,22 @@ def _transform_raw(
     num_periods: int | None,
     reference_date: date | None,
     soil: np.ndarray | None = None,
+    climate: np.ndarray | None = None,
 ) -> BatchChunk | None:
     if getattr(dataset, "_soil_sidecar", False) and soil is None and path is not None:
         soil_path = Path(path).with_name(f"{Path(path).stem}_soil.npy")
         if soil_path.is_file():
             soil = np.load(soil_path, mmap_mode="r")
+    if climate is None and getattr(dataset, "_climate_sidecar", False) and path is not None:
+        from datasets.daily_climate import climate_sidecar_path
+
+        clim_path = climate_sidecar_path(path)
+        if clim_path.is_file():
+            climate = np.load(clim_path, mmap_mode="r")
+        else:
+            return None
+    if getattr(dataset, "_climate_sidecar", False) and climate is None:
+        return None
     if hasattr(dataset, "filter_municipality_pair"):
         arr, soil = dataset.filter_municipality_pair(arr, soil, cache_key=path)
     elif hasattr(dataset, "filter_municipality_data"):
@@ -111,10 +117,11 @@ def _transform_raw(
             reference_date=reference_date,
             cache_key=path,
             soil=soil,
+            climate=climate,
         ):
             return unpack_pixel_chunk(pixel_chunk)
         return None
-    return unpack_pixel_chunk(dataset._transform_chunk(arr, soil=soil))
+    return unpack_pixel_chunk(dataset._transform_chunk(arr, soil=soil, climate=climate))
 
 
 def ensure_muni_agg_ram_cache(dataset, *, workers: int = 8) -> dict | None:
@@ -186,8 +193,23 @@ def ensure_muni_agg_ram_cache(dataset, *, workers: int = 8) -> dict | None:
             if arr is None or len(arr) == 0:
                 continue
             arr = np.ascontiguousarray(arr, dtype=np.float32)
+            climate = None
+            if getattr(dataset, "_climate_sidecar", False) and path is not None:
+                from datasets.daily_climate import climate_sidecar_path
+
+                clim_path = climate_sidecar_path(path)
+                if clim_path.is_file():
+                    climate = np.ascontiguousarray(
+                        np.load(clim_path), dtype=np.float32
+                    )
+                    nbytes += int(climate.nbytes)
+                else:
+                    continue
             if soil is not None:
                 soil = np.ascontiguousarray(soil, dtype=np.float32)
+            if climate is not None:
+                cache[key] = (arr, soil, climate)
+            elif soil is not None:
                 cache[key] = (arr, soil)
             else:
                 cache[key] = arr
@@ -242,10 +264,21 @@ def load_stacked_muni_agg_batch(
                 entry = ram.get(_cache_key(code, None))
             if entry is None:
                 continue
-            if isinstance(entry, tuple) and len(entry) == 4 and all(
+            if isinstance(entry, tuple) and len(entry) in (4, 8) and all(
                 hasattr(t, "numel") for t in entry
             ):
                 unpacked = entry
+            elif isinstance(entry, tuple) and len(entry) == 3:
+                arr, soil, climate = entry
+                unpacked = _transform_raw(
+                    dataset,
+                    arr,
+                    path=None,
+                    num_periods=None,
+                    reference_date=None,
+                    soil=soil,
+                    climate=climate,
+                )
             elif isinstance(entry, tuple) and len(entry) == 2:
                 arr, soil = entry
                 unpacked = _transform_raw(
@@ -405,7 +438,7 @@ def process_train_muni_agg_batch(
         kept = kept[: int(max_municipalities)]
         if stacked is not None:
             n = len(kept)
-            stacked = (stacked[0][:n], stacked[1][:n], stacked[2][:n], stacked[3][:n])
+            stacked = tuple(t[:n] for t in stacked)
 
     if stacked is None or not kept:
         zero_grad(optimizer, args)

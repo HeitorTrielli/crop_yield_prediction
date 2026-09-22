@@ -1,7 +1,10 @@
-"""Map a MoCo encoder_q checkpoint onto STNetRegression.
+"""Map a MoCo encoder_q checkpoint onto STNet / DualSTNet trunks.
 
 When the yield MLP is wider than the MoCo stem (rain 12 → climate 16), copy the
 overlapping in_features and leave extra input columns at their current init.
+
+For DualSTNet, pass ``key_prefix='spectral.'`` or ``'climate.'`` so stripped
+``encoder_q.*`` keys land on the matching submodule.
 """
 
 from __future__ import annotations
@@ -29,13 +32,19 @@ def pad_linear_in_features(
 def remap_moco_encoder_state(
     pretrain_state: dict[str, Any],
     model_state: dict[str, torch.Tensor],
+    *,
+    key_prefix: str = "",
 ) -> tuple[dict[str, torch.Tensor], list[tuple], list[tuple]]:
     """
     Return (loadable_state, skipped_mismatches, padded_keys).
 
+    ``key_prefix`` is prepended to stripped ``encoder_q.*`` names (e.g. ``spectral.``
+    / ``climate.`` for DualSTNetRegression).
+
     ``padded_keys`` entries are ``(name, src_shape, dst_shape)`` for Linear
     weights that were copied along a prefix of in_features.
     """
+    prefix = str(key_prefix or "")
     state_dict: dict[str, torch.Tensor] = {}
     skipped_shape: list[tuple] = []
     padded_keys: list[tuple] = []
@@ -49,7 +58,7 @@ def remap_moco_encoder_state(
             or k.startswith("encoder_q.position_enc.pe")
         ):
             continue
-        new_k = k[len("encoder_q.") :]
+        new_k = prefix + k[len("encoder_q.") :]
         if new_k not in model_state:
             continue
         dst = model_state[new_k]

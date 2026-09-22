@@ -1,0 +1,214 @@
+# Wide DualSTNet mega-pixel search (follow-up to productivity_muni_mean_dual_stnet).
+#
+# First 5-trial smoke (list, lr=1e-5): only trial_002 learned
+#   (d_model=64, n_head=16 → val_r2≈0.28); others early-stopped at epoch 11
+#   with negative R². This study raises LR and sweeps architecture broadly.
+#
+# Grid (all d_model % n_head == 0):
+#   4 d_model × 3 n_head × 3 d_inner × 3 dropout × 4 LR × 2 n_layers
+#   = 864 trials, plus extras (n_head=16 corners, attention pooling).
+# Mega-pixel runs are ~12–80s each; full grid is overnight-friendly.
+#
+# Requires climate + soil sidecars under npy_muni_mean (already built).
+#
+# Preview / run:
+#   python run_tuning_study.py show tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide.yaml --list-trials
+#   python run_tuning_study.py run  tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide.yaml --skip-completed
+
+name: productivity_muni_mean_dual_stnet_wide
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: dual_spectral_daily_climate_soil
+  soil_fusion: late
+  climate_sequencelength: 183
+  temporal_pooling: ndvi
+  yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
+  no_coverage_filter: true
+  extra_scaler: files/train_input_scaler_dual_muni_mean.json
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  # Earlier LR drops than the smoke study — short mega-pixel runs rarely reach epoch 150.
+  schedule: [40, 120]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 15
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  suffix_prefix: dual_stnet_wide
+
+search:
+  strategy: grid
+
+  parameters:
+    model_d_model:
+      type: choice
+      values: [32, 64, 96, 128]
+
+    model_n_head:
+      type: choice
+      # Must divide every d_model above (skip 16 here; see extra_trials).
+      values: [2, 4, 8]
+
+    model_d_inner:
+      type: choice
+      values: [64, 128, 256]
+
+    model_dropout:
+      type: choice
+      values: [0.2, 0.3, 0.4]
+
+    learning_rate:
+      type: choice
+      # Smoke used 1e-5 and mostly failed to train; center the search higher.
+      values: [5.0e-5, 1.0e-4, 5.0e-4, 1.0e-3]
+
+    model_n_layers:
+      type: choice
+      values: [1, 2]
+
+  # Corners that are awkward in the full grid (n_head=16, attention pooling).
+  extra_trials:
+    # Replicate smoke winner × higher LRs
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      learning_rate: 5.0e-5
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      learning_rate: 1.0e-4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      learning_rate: 1.0e-3
+
+    - model_d_model: 128
+      model_n_head: 16
+      model_d_inner: 256
+      model_dropout: 0.3
+      model_n_layers: 1
+      learning_rate: 1.0e-4
+
+    - model_d_model: 128
+      model_n_head: 16
+      model_d_inner: 256
+      model_dropout: 0.3
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+
+    - model_d_model: 128
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      learning_rate: 5.0e-4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 64
+      model_dropout: 0.3
+      model_n_layers: 2
+      learning_rate: 5.0e-4
+
+    # Attention pooling (climate trunk follows when spectral uses attention)
+    - model_d_model: 64
+      model_n_head: 8
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+      temporal_pooling: attention
+      attn_pool_queries: 4
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+      temporal_pooling: attention
+      attn_pool_queries: 4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      learning_rate: 1.0e-4
+      temporal_pooling: attention
+      attn_pool_queries: 4
+
+    - model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.2
+      model_n_layers: 2
+      learning_rate: 5.0e-4
+      temporal_pooling: attention
+      attn_pool_queries: 8
+
+    # Weight-decay ablations around a strong arch corner
+    - model_d_model: 64
+      model_n_head: 8
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+      weight_decay: 1.0e-4
+
+    - model_d_model: 64
+      model_n_head: 8
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+      weight_decay: 1.0e-3
+
+    - model_d_model: 64
+      model_n_head: 16
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      learning_rate: 5.0e-4
+      weight_decay: 1.0e-4
+
+    - model_d_model: 96
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.2
+      model_n_layers: 1
+      learning_rate: 1.0e-3
+      weight_decay: 1.0e-4

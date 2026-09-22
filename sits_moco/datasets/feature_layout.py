@@ -49,6 +49,44 @@ _LAYOUT: dict[str, dict[str, Any]] = {
             "or only into the decoder after temporal pooling."
         ),
     },
+    "dual_spectral_daily_climate": {
+        "input_dim": 10,
+        "spectral_dim": 10,
+        "climate_input_dim": 5,
+        "climate_sidecar": True,
+        "extra_channels_slice": None,
+        "description": (
+            "Dual STNet: 10 S2 bands (available images only) through one encoder; "
+            "raw daily Xavier municipal averages (pr/ETo/Rs/Tmax/Tmin, Oct–Mar) "
+            "through a second encoder. Decoder concatenates both embeddings. "
+            "Requires {code}_climate_daily.npy sidecars."
+        ),
+    },
+    "dual_spectral_daily_climate_soil": {
+        "input_dim": 14,
+        "spectral_dim": 10,
+        "climate_input_dim": 5,
+        "climate_sidecar": True,
+        "soil_sidecar": True,
+        "extra_channels_slice": None,
+        "description": (
+            "dual_spectral_daily_climate + 4 MapBiomas Solo channels. "
+            "Soil is static: concatenated into the decoder with both STNet "
+            "embeddings (late fusion). Requires {code}_climate_daily.npy and "
+            "{code}_soil.npy."
+        ),
+    },
+    "daily_climate": {
+        "input_dim": 5,
+        "extra_channels_slice": None,
+        "climate_only": True,
+        "description": (
+            "MoCo-only layout: raw daily Xavier municipal averages "
+            "(pr/ETo/Rs/Tmax/Tmin) from {code}_climate_daily.npy. "
+            "Not a yield DualSTNet layout — pretrain the climate trunk, then "
+            "transfer into DualSTNetRegression.climate."
+        ),
+    },
 }
 
 
@@ -89,6 +127,12 @@ _ALIASES: dict[str, str] = {
     "s2_xavier_climate_soil": "spectral_xavier_climate_soil",
     "full_soil": "spectral_xavier_climate_soil",
     "spectral_xavier_full_soil": "spectral_xavier_climate_soil",
+    "dual_s2_daily_climate": "dual_spectral_daily_climate",
+    "dual_s2_daily_climate_soil": "dual_spectral_daily_climate_soil",
+    "dual_megapixel": "dual_spectral_daily_climate",
+    "dual_megapixel_soil": "dual_spectral_daily_climate_soil",
+    "climate_daily": "daily_climate",
+    "xavier_daily": "daily_climate",
 }
 
 
@@ -139,3 +183,31 @@ def feature_layout_extra_slice(name: str) -> tuple[int, int] | None:
 def feature_layout_needs_soil_sidecar(name: str) -> bool:
     """True when layout expects {code}_soil.npy joined at transform time."""
     return bool(resolve_feature_layout(name).get("soil_sidecar"))
+
+
+def feature_layout_needs_climate_sidecar(name: str) -> bool:
+    """True when layout expects {code}_climate_daily.npy next to the S2 cube."""
+    return bool(resolve_feature_layout(name).get("climate_sidecar"))
+
+
+def feature_layout_climate_input_dim(name: str) -> int:
+    return int(resolve_feature_layout(name).get("climate_input_dim") or 0)
+
+
+def feature_layout_spectral_dim(name: str) -> int:
+    lay = resolve_feature_layout(name)
+    if lay.get("spectral_dim") is not None:
+        return int(lay["spectral_dim"])
+    dim = int(lay["input_dim"])
+    if lay.get("soil_sidecar"):
+        return dim - 4
+    return dim
+
+
+def feature_layout_is_dual(name: str) -> bool:
+    return feature_layout_needs_climate_sidecar(name)
+
+
+def feature_layout_is_climate_only(name: str) -> bool:
+    """True for MoCo-only daily climate trunks (not DualSTNet yield layouts)."""
+    return bool(resolve_feature_layout(name).get("climate_only"))

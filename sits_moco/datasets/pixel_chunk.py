@@ -21,7 +21,7 @@ PeriodTaggedGpuChunk = tuple[int, int, BatchChunk]
 def is_batched_pixel_chunk(pixel_chunk) -> bool:
     return (
         isinstance(pixel_chunk, tuple)
-        and len(pixel_chunk) == 4
+        and len(pixel_chunk) in (4, 8)
         and torch.is_tensor(pixel_chunk[0])
         and pixel_chunk[0].dim() == 3
     )
@@ -35,22 +35,18 @@ def pixel_chunk_batch_size(pixel_chunk) -> int:
 
 def unpack_pixel_chunk(pixel_chunk):
     """
-    Return (chunk_x, chunk_mask, chunk_doy, chunk_weight) or None if too small.
-    Accepts batched 4-tuple or legacy list of 4-tuples.
+    Return a 4-tuple or dual 8-tuple of batched tensors, or None if too small.
     """
     if is_batched_pixel_chunk(pixel_chunk):
-        chunk_x, chunk_mask, chunk_doy, chunk_weight = pixel_chunk
-        if chunk_x.shape[0] < 1:
+        if pixel_chunk[0].shape[0] < 1:
             return None
-        return chunk_x, chunk_mask, chunk_doy, chunk_weight
+        return pixel_chunk
 
     if not pixel_chunk or len(pixel_chunk) < 2:
         return None
-    chunk_x = torch.stack([p[0] for p in pixel_chunk])
-    chunk_mask = torch.stack([p[1] for p in pixel_chunk])
-    chunk_doy = torch.stack([p[2] for p in pixel_chunk])
-    chunk_weight = torch.stack([p[3] for p in pixel_chunk])
-    return chunk_x, chunk_mask, chunk_doy, chunk_weight
+    n_fields = len(pixel_chunk[0])
+    stacked = tuple(torch.stack([p[i] for p in pixel_chunk]) for i in range(n_fields))
+    return stacked
 
 
 class PrefetchIterator:
@@ -260,6 +256,7 @@ def _iter_tagged_chunks_with_mmap_lookahead(
             year_resolved = dataset._resolve_load_year(muni_code, year)
             cache_key = dataset._resolve_npy_path(muni_code, year_resolved)
             soil = None
+            climate = None
             if getattr(dataset, "_soil_sidecar", False):
                 soil = dataset.mmap_soil(muni_code, year=year_resolved)
                 if soil is None:
@@ -276,6 +273,10 @@ def _iter_tagged_chunks_with_mmap_lookahead(
                 municipality_data = dataset.filter_municipality_data(
                     municipality_data, cache_key=cache_key
                 )
+            if getattr(dataset, "_climate_sidecar", False):
+                climate = dataset.mmap_climate(muni_code, year=year_resolved)
+                if climate is None:
+                    continue
             if municipality_data is None or len(municipality_data) == 0:
                 continue
             num_pixels = len(municipality_data)
@@ -284,7 +285,9 @@ def _iter_tagged_chunks_with_mmap_lookahead(
                 soil_chunk = None if soil is None else soil[start:end]
                 unpacked = unpack_pixel_chunk(
                     dataset._transform_chunk(
-                        municipality_data[start:end], soil=soil_chunk
+                        municipality_data[start:end],
+                        soil=soil_chunk,
+                        climate=climate,
                     )
                 )
                 if unpacked is not None:
@@ -321,9 +324,14 @@ def _iter_tagged_period_chunks_with_mmap_lookahead(
             year_resolved = dataset._resolve_load_year(muni_code, year)
             cache_key = dataset._resolve_npy_path(muni_code, year_resolved)
             soil = None
+            climate = None
             if getattr(dataset, "_soil_sidecar", False):
                 soil = dataset.mmap_soil(muni_code, year=year_resolved)
                 if soil is None:
+                    continue
+            if getattr(dataset, "_climate_sidecar", False):
+                climate = dataset.mmap_climate(muni_code, year=year_resolved)
+                if climate is None:
                     continue
             for pixel_chunk in dataset.iter_period_pixel_chunks_from_data(
                 municipality_data,
@@ -332,6 +340,7 @@ def _iter_tagged_period_chunks_with_mmap_lookahead(
                 reference_date=reference_date,
                 cache_key=cache_key,
                 soil=soil,
+                climate=climate,
             ):
                 unpacked = unpack_pixel_chunk(pixel_chunk)
                 if unpacked is not None:
@@ -543,9 +552,14 @@ def _iter_raw_batch_multiperiod_cpu_chunks(
         year_resolved = dataset._resolve_load_year(municipality_code, year)
         cache_key = dataset._resolve_npy_path(municipality_code, year_resolved)
         soil = None
+        climate = None
         if getattr(dataset, "_soil_sidecar", False):
             soil = dataset.mmap_soil(municipality_code, year=year_resolved)
             if soil is None:
+                return
+        if getattr(dataset, "_climate_sidecar", False):
+            climate = dataset.mmap_climate(municipality_code, year=year_resolved)
+            if climate is None:
                 return
         for num_periods, pixel_chunk in dataset.iter_multiperiod_pixel_chunks_from_data(
             municipality_data,
@@ -554,6 +568,7 @@ def _iter_raw_batch_multiperiod_cpu_chunks(
             reference_date=reference_date,
             cache_key=cache_key,
             soil=soil,
+            climate=climate,
         ):
             unpacked = unpack_pixel_chunk(pixel_chunk)
             if unpacked is not None:
@@ -754,48 +769,29 @@ def iter_municipality_pixel_chunks(
 
 
 def move_batched_chunk_to_device(
-    chunk_x: torch.Tensor,
-    chunk_mask: torch.Tensor,
-    chunk_doy: torch.Tensor,
-    chunk_weight: torch.Tensor,
+    *tensors: torch.Tensor,
     device: torch.device,
-    *,
     non_blocking: bool = True,
-) -> BatchChunk:
+) -> tuple[torch.Tensor, ...]:
     use_non_blocking = non_blocking and device.type == "cuda"
-    if use_non_blocking:
-        chunk_x = chunk_x.pin_memory()
-        chunk_mask = chunk_mask.pin_memory()
-        chunk_doy = chunk_doy.pin_memory()
-        chunk_weight = chunk_weight.pin_memory()
-        return (
-            chunk_x.to(device, non_blocking=True),
-            chunk_mask.to(device, non_blocking=True),
-            chunk_doy.to(device, non_blocking=True),
-            chunk_weight.to(device, non_blocking=True),
-        )
-    return (
-        chunk_x.to(device),
-        chunk_mask.to(device),
-        chunk_doy.to(device),
-        chunk_weight.to(device),
-    )
+    out = []
+    for t in tensors:
+        if use_non_blocking:
+            t = t.pin_memory()
+            out.append(t.to(device, non_blocking=True))
+        else:
+            out.append(t.to(device))
+    return tuple(out)
 
 
 def prepare_chunk_on_device(
     unpacked, device: torch.device, *, pin_host: bool = True
-) -> BatchChunk:
-    chunk_x, chunk_mask, chunk_doy, chunk_weight = unpacked
-    if chunk_x.dim() == 2:
-        chunk_x = chunk_x.unsqueeze(0)
-        chunk_mask = chunk_mask.unsqueeze(0)
-        chunk_doy = chunk_doy.unsqueeze(0)
-        chunk_weight = chunk_weight.unsqueeze(0)
+) -> tuple[torch.Tensor, ...]:
+    tensors = list(unpacked)
+    if tensors[0].dim() == 2:
+        tensors = [t.unsqueeze(0) for t in tensors]
     return move_batched_chunk_to_device(
-        chunk_x,
-        chunk_mask,
-        chunk_doy,
-        chunk_weight,
-        device,
+        *tensors,
+        device=device,
         non_blocking=pin_host and device.type == "cuda",
     )

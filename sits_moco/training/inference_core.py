@@ -7,9 +7,16 @@ from typing import Any
 
 import torch
 
-from datasets.feature_layout import feature_layout_input_dim, normalize_feature_layout
-from models import STNetRegression
+from datasets.daily_climate import CLIMATE_MAX_SEQ_LEN
+from datasets.feature_layout import (
+    feature_layout_climate_input_dim,
+    feature_layout_input_dim,
+    feature_layout_spectral_dim,
+    normalize_feature_layout,
+)
+from models import DualSTNetRegression, STNetRegression
 from yield_utils import (
+    is_dual_stnet_state_dict,
     resolve_head_output,
     resolve_inference_target,
     resolve_model_kwargs,
@@ -55,12 +62,59 @@ def build_stnet_from_checkpoint(
     )
     head_output = resolve_head_output(checkpoint, run_config)
     model_kw = resolve_model_kwargs(run_config or {}, checkpoint)
-    model = STNetRegression(
-        input_dim=input_dim,
-        num_outputs=1,
-        max_seq_len=sequencelength,
-        **model_kw,
-    ).to(device)
+    if is_dual_stnet_state_dict(state_dict):
+        spec_w = state_dict.get("spectral.mlp1.0.lin.weight")
+        clim_w = state_dict.get("climate.mlp1.0.lin.weight")
+        spectral_dim = int(spec_w.shape[1]) if spec_w is not None else 10
+        climate_dim = int(clim_w.shape[1]) if clim_w is not None else 5
+        if feature_layout is not None:
+            spectral_dim = feature_layout_spectral_dim(feature_layout)
+            climate_dim = feature_layout_climate_input_dim(feature_layout) or climate_dim
+        dual_kw = {
+            k: v
+            for k, v in model_kw.items()
+            if k
+            in {
+                "d_model",
+                "n_head",
+                "n_layers",
+                "d_inner",
+                "dropout",
+                "temporal_pooling",
+                "attn_pool_queries",
+                "soil_fusion",
+                "climate_pooling",
+                "climate_max_seq_len",
+            }
+        }
+        cli = (run_config or {}).get("cli") or {}
+        climate_seq = int(
+            dual_kw.pop("climate_max_seq_len", None)
+            or cli.get("climate_sequencelength")
+            or CLIMATE_MAX_SEQ_LEN
+        )
+        model = DualSTNetRegression(
+            spectral_dim=spectral_dim,
+            climate_dim=climate_dim,
+            input_dim=input_dim,
+            num_outputs=1,
+            max_seq_len=sequencelength,
+            climate_max_seq_len=climate_seq,
+            **dual_kw,
+        ).to(device)
+    else:
+        single_kw = {
+            k: v
+            for k, v in model_kw.items()
+            if k
+            not in {"climate_pooling", "climate_max_seq_len"}
+        }
+        model = STNetRegression(
+            input_dim=input_dim,
+            num_outputs=1,
+            max_seq_len=sequencelength,
+            **single_kw,
+        ).to(device)
     if hasattr(model, "_orig_mod"):
         model._orig_mod.load_state_dict(state_dict, strict=False)
     else:

@@ -283,12 +283,26 @@ def parse_args():
         default=0.2,
         help="Encoder dropout (default: 0.2)",
     )
+    parser.add_argument(
+        "--extra-scaler",
+        type=str,
+        default=None,
+        help=(
+            "Path to train_input_scaler JSON (spectral + daily_climate stats). "
+            "Defaults to files/train_input_scaler.json."
+        ),
+    )
 
     args = parser.parse_args()
 
     from datasets.feature_layout import normalize_feature_layout
 
     args.feature_layout = normalize_feature_layout(args.feature_layout)
+
+    if args.extra_scaler:
+        from run_paths import normalize_user_path
+
+        args.extra_scaler = str(normalize_user_path(args.extra_scaler))
 
     # Resolve datapath: CLI > local files/npy > .env > US-toy
     if args.datapath:
@@ -383,6 +397,7 @@ def train(args):
         max_samples=args.max_samples,
         rebuild_cache=args.rebuild_cache,
         feature_layout=args.feature_layout,
+        extra_scaler_path=args.extra_scaler,
     )
     print(f"  samples={meta.get('n_samples')} batches/train≈{len(traindataloader)}")
     print(
