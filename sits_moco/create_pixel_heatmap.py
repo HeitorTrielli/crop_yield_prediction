@@ -24,12 +24,14 @@ from datasets.extra_scaler import InputScaler, scale_soil_channels, scale_soil_c
 from datasets.feature_layout import (
     feature_layout_choices,
     feature_layout_input_dim,
+    feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
 )
 from datasets.pixel_transform import (
     DOY_CHANNEL,
     SPECTRAL_MEAN,
     SPECTRAL_STD,
+    PixelTransform,
     scale_xavier_climate_extras,
     scale_xavier_climate_extras_legacy,
     scale_xavier_rain_channels,
@@ -37,7 +39,10 @@ from datasets.pixel_transform import (
 )
 from datasets.uscrops_aggregated_npy_polars import (
     _indices_first_n_months,
+    _season_month_lut,
+    _season_months_from_doys,
 )
+from predict_yield_talhoes import resolve_keep_mask
 from models import STNetRegression
 from utils import recursive_todevice
 from municipality_labels import (
@@ -431,6 +436,119 @@ def compute_daily_ndvi_stats_from_npy_row(
     return mean_ndvi, peak_ndvi, per_month
 
 
+def compute_daily_ndvi_stats_batch(
+    X: np.ndarray,
+    *,
+    season_start: date | None = None,
+    harvest_year: int | None = None,
+    skip_season_months: int = 3,
+    red_idx: int = 2,
+    nir_idx: int = 6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized mean/peak NDVI for a batch of .npy rows ``[N, T, C]``.
+
+    Same semantics as ``compute_daily_ndvi_stats_from_npy_row`` (peak over all
+    valid days; mean optionally restricted to harvest year after skip months).
+    """
+    if X.ndim != 3 or X.shape[2] < 11:
+        n = int(X.shape[0]) if X.ndim >= 1 else 0
+        nan = np.full(n, np.nan, dtype=np.float64)
+        return nan, nan.copy()
+
+    bands = X[:, :, :10].astype(np.float32, copy=False)
+    doys = X[:, :, DOY_CHANNEL].astype(np.int32, copy=False)
+    missing = (bands == 0) | (bands == -9999)
+    red = bands[:, :, red_idx] * 1e-4
+    nir = bands[:, :, nir_idx] * 1e-4
+    miss_red = missing[:, :, red_idx]
+    miss_nir = missing[:, :, nir_idx]
+    denom = nir + red + 1e-8
+    valid = (
+        np.isfinite(red)
+        & np.isfinite(nir)
+        & ~miss_red
+        & ~miss_nir
+        & (np.abs(denom) > 1e-8)
+    )
+    ndvi = np.clip((nir - red) / denom, -1.0, 1.0)
+    ndvi_masked = np.where(valid, ndvi, np.nan)
+    with np.errstate(all="ignore"):
+        peak = np.nanmax(ndvi_masked, axis=1)
+
+    mean_mask = valid
+    if season_start is not None and harvest_year is not None:
+        season_m = _season_months_from_doys(doys, season_start)
+        # Calendar year of season_start + (doy - 1) days.
+        base = np.datetime64(season_start, "D")
+        ords = base + (doys.astype(np.int64) - 1).astype("timedelta64[D]")
+        years = ords.astype("datetime64[Y]").astype(np.int32) + 1970
+        mean_mask = (
+            valid
+            & (season_m > int(skip_season_months))
+            & (years == int(harvest_year))
+        )
+    elif season_start is not None and skip_season_months > 0:
+        season_m = _season_months_from_doys(doys, season_start)
+        mean_mask = valid & (season_m > int(skip_season_months))
+
+    ndvi_mean_masked = np.where(mean_mask, ndvi, np.nan)
+    with np.errstate(all="ignore"):
+        mean = np.nanmean(ndvi_mean_masked, axis=1)
+    return mean.astype(np.float64), peak.astype(np.float64)
+
+
+def _pack_sorted_in_season_chunk(
+    chunk_arr: np.ndarray,
+    reference_date: date,
+    *,
+    max_periods: int = 6,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Sort in-season days by DOY (same packing as USCropsAggregatedNPY)."""
+    if chunk_arr.size == 0:
+        return None
+    if chunk_arr.dtype != np.float32 or not chunk_arr.flags.c_contiguous:
+        chunk_arr = np.ascontiguousarray(chunk_arr, dtype=np.float32)
+    season_lut = _season_month_lut(reference_date)
+    doy_i = np.clip(
+        chunk_arr[:, :, DOY_CHANNEL].astype(np.int64, copy=False),
+        0,
+        season_lut.shape[0] - 1,
+    )
+    season_m = season_lut[doy_i]
+    in_season = (season_m >= 1) & (season_m <= int(max_periods))
+    if not np.any(in_season):
+        return None
+    sort_key = np.where(in_season, doy_i, np.iinfo(np.int64).max)
+    order = np.argsort(sort_key, axis=1, kind="stable")
+    gathered = np.take_along_axis(chunk_arr, order[:, :, None], axis=1)
+    season_sorted = np.take_along_axis(season_m, order, axis=1)
+    return gathered, season_sorted
+
+
+def _feature_layout_from_input_dim(input_dim: int) -> str:
+    return {
+        10: "spectral",
+        12: "spectral_xavier",
+        16: "spectral_xavier_climate",
+        20: "spectral_xavier_climate_soil",
+    }.get(int(input_dim), "spectral")
+
+
+def _forward_pixel_batch(model, batch, device) -> np.ndarray:
+    """Run model on a PixelTransform BatchChunk; returns float64 preds [N]."""
+    batch = recursive_todevice(batch, device)
+    ctx = (
+        autocast("cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else torch.no_grad()
+    )
+    with ctx:
+        preds = model(batch)
+    if preds.dim() == 1:
+        preds = preds.unsqueeze(0)
+    return preds.detach().float().cpu().numpy().astype(np.float64).ravel()
+
+
 def resolve_muni_npy(
     datapath: Path, municipality_code: str, year_range: str | None = None
 ) -> Path | None:
@@ -814,11 +932,16 @@ def reconstruct_spatial_predictions(
     target_mean=None,
     target_std=None,
     legacy_input_scaling: bool = False,
+    feature_layout: str | None = None,
+    extra_scaler: InputScaler | None = None,
+    use_mask_cache: bool = True,
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
     Uses TIFF files to get exact spatial structure and matches pixels to .npy data.
     Returns: prediction_map dict with (tile_x, tile_y, row, col) -> prediction, or None if mapping fails
+
+    Batches via PixelTransform (same as training/talhões) and caches the keep-mask next to the .npy.
     """
     if year_range is None:
         print("  ⚠️  Warning: --year-range is required (unless --tiffpath points directly to {muni}/{year-range})")
@@ -845,6 +968,8 @@ def reconstruct_spatial_predictions(
         season_start = season_start_from_year_range(year_range)
     else:
         season_start = reference_date
+    if isinstance(season_start, str):
+        season_start = datetime.strptime(season_start, "%Y-%m-%d").date()
     harvest_year = harvest_year_from_year_range(year_range)
 
     muni_npy_file = resolve_muni_npy(datapath, municipality_code, year_range)
@@ -861,9 +986,16 @@ def reconstruct_spatial_predictions(
         print(f"  ⚠️  Warning: Could not load {muni_npy_file}: {e}")
         return None, None, None, None, None, None, None
 
+    layout = normalize_feature_layout(
+        feature_layout
+        if feature_layout is not None
+        else _feature_layout_from_input_dim(input_dim)
+    )
+    needs_soil = feature_layout_needs_soil_sidecar(layout) or int(input_dim) >= 20
+
     soil_data = None
     soil_path = Path(muni_npy_file).with_name(f"{Path(muni_npy_file).stem}_soil.npy")
-    if input_dim == 20:
+    if needs_soil:
         if soil_path.is_file():
             try:
                 soil_data = np.load(soil_path, mmap_mode="r")
@@ -902,10 +1034,23 @@ def reconstruct_spatial_predictions(
             "Run data_download/xavier_rain_for_daily_npy.py on this season's .npy before heatmapping."
         )
 
-    # Recompute keep-mask in the exact same way as preprocess_daily_to_npy
-    keep_mask, height, width = compute_daily_valid_pixel_mask(daily_tiffs)
+    try:
+        keep_mask = resolve_keep_mask(
+            daily_tiffs,
+            muni_npy_file,
+            reproject=False,
+            use_cache=use_mask_cache,
+        )
+    except ValueError as e:
+        print(f"  ⚠️  Warning: keep_mask mismatch: {e}")
+        keep_mask = None
     if keep_mask is None:
-        return None, None, None, None, None, None, None
+        # Fallback to uncached recompute (legacy path).
+        keep_mask, height, width = compute_daily_valid_pixel_mask(daily_tiffs)
+        if keep_mask is None:
+            return None, None, None, None, None, None, None
+    else:
+        height, width = keep_mask.shape
 
     expected_valid = int(keep_mask.sum())
     if expected_valid != len(municipality_data):
@@ -914,103 +1059,146 @@ def reconstruct_spatial_predictions(
             "Heatmap will still be produced, but mapping may be off if inputs differ (nodata handling, reprojection, etc.)."
         )
 
+    keep_rows, keep_cols = np.where(keep_mask)
+    n_keep = int(keep_rows.shape[0])
+    n_use = min(n_keep, len(municipality_data))
+
+    pixel_transform = PixelTransform(
+        sequencelength,
+        layout,
+        randomchoice=bool(rc),
+        interp=bool(interp),
+        seed=27 if seed is None else int(seed),
+        extra_scaler=extra_scaler,
+        legacy_input_scaling=legacy_input_scaling,
+        deterministic_head=True,
+    )
+
     model.eval()
-    prediction_map = {}
-    ndvi_map = {}
-    ndvi_map_median = {}
-    ndvi_map_per_month = defaultdict(dict)
-    npy_pixel_idx = 0
+    prediction_map: dict = {}
+    ndvi_map: dict = {}
+    ndvi_map_median: dict = {}
+    ndvi_map_per_month: dict = {}
+    compute_ndvi = num_periods is None
+    # Ensure heatmap extent matches the TIFF grid even if edge pixels are empty.
+    prediction_map[("grid", height - 1, width - 1)] = np.nan
+    if compute_ndvi:
+        ndvi_map[("grid", height - 1, width - 1)] = np.nan
+        ndvi_map_median[("grid", height - 1, width - 1)] = np.nan
+
+    def _store_preds(local_idx: np.ndarray, preds: np.ndarray) -> None:
+        for j, pred in enumerate(preds):
+            i = int(local_idx[j])
+            key = ("grid", int(keep_rows[i]), int(keep_cols[i]))
+            prediction_map[key] = float(
+                denormalize_head_output(pred, target_mean, target_std, head_output)
+            )
+
+    def _run_transform_forward(
+        stacked: np.ndarray,
+        soil_chunk: np.ndarray | None,
+        local_idx: np.ndarray,
+    ) -> None:
+        if stacked.shape[0] == 0:
+            return
+        if needs_soil and soil_chunk is None:
+            soil_chunk = np.zeros((stacked.shape[0], 4), dtype=np.float32)
+        # STNet paths can be brittle on N=1; mirror talhão flush.
+        if stacked.shape[0] == 1:
+            stacked_run = np.concatenate([stacked, stacked], axis=0)
+            soil_run = (
+                None
+                if soil_chunk is None
+                else np.concatenate([soil_chunk, soil_chunk], axis=0)
+            )
+            batch = pixel_transform.transform_chunk(stacked_run, soil=soil_run)
+            preds = _forward_pixel_batch(model, batch, device)[:1]
+        else:
+            batch = pixel_transform.transform_chunk(stacked, soil=soil_chunk)
+            preds = _forward_pixel_batch(model, batch, device)
+        _store_preds(local_idx, preds)
+
+    chunk_size = max(2, int(chunk_size))
+    want_ndvi = compute_ndvi
 
     with torch.no_grad():
-        current_chunk = []
-        chunk_indices = []
+        for start in tqdm(
+            range(0, n_use, chunk_size),
+            desc="  Chunks",
+            unit="chunk",
+        ):
+            end = min(start + chunk_size, n_use)
+            raw = np.ascontiguousarray(
+                municipality_data[start:end], dtype=np.float32
+            )
+            soil_chunk = (
+                None
+                if soil_data is None
+                else np.ascontiguousarray(soil_data[start:end], dtype=np.float32)
+            )
+            local_base = np.arange(start, end, dtype=np.int64)
 
-        # Iterate pixels in row-major order (same as preprocess_daily_to_npy reshape)
-        for row in tqdm(range(height), desc="  Rows", unit="row"):
-            for col in range(width):
-                if keep_mask[row, col]:
-                    if npy_pixel_idx >= len(municipality_data):
-                        prediction_map[("grid", row, col)] = np.nan
-                        continue
-                    X = municipality_data[npy_pixel_idx]
-                    # Daily NDVI stats computed from raw (unnormalized) .npy row
-                    try:
-                        mean_ndvi, peak_ndvi, _ = compute_daily_ndvi_stats_from_npy_row(
-                            X,
-                            season_start=season_start,
-                            harvest_year=harvest_year,
-                        )
-                    except Exception:
-                        mean_ndvi, peak_ndvi = np.nan, np.nan
-                    ndvi_map[("grid", row, col)] = mean_ndvi
-                    # ndvi_map_median slot holds peak (max) NDVI over time.
-                    ndvi_map_median[("grid", row, col)] = peak_ndvi
+            if want_ndvi:
+                mean_ndvi, peak_ndvi = compute_daily_ndvi_stats_batch(
+                    raw,
+                    season_start=season_start,
+                    harvest_year=harvest_year,
+                )
+                for j in range(end - start):
+                    i = int(local_base[j])
+                    key = ("grid", int(keep_rows[i]), int(keep_cols[i]))
+                    ndvi_map[key] = float(mean_ndvi[j])
+                    ndvi_map_median[key] = float(peak_ndvi[j])
 
-                    X_filtered = filter_timeseries_for_periods(
-                        X, num_periods, season_start
-                    )
-                    if X_filtered is None:
-                        prediction_map[("grid", row, col)] = np.nan
-                        npy_pixel_idx += 1
-                        continue
+            if num_periods is None:
+                _run_transform_forward(raw, soil_chunk, local_base)
+                continue
 
-                    X_tuple = transform_pixel(
-                        X_filtered,
-                        sequencelength,
-                        rc,
-                        interp,
-                        seed=seed,
-                        input_dim=input_dim,
-                        deterministic_head=True,
-                        legacy_input_scaling=legacy_input_scaling,
-                        soil=(
-                            None
-                            if soil_data is None
-                            else soil_data[npy_pixel_idx]
-                        ),
-                    )
-                    current_chunk.append(X_tuple)
-                    chunk_indices.append(("grid", row, col))
-                    npy_pixel_idx += 1
-                else:
-                    prediction_map[("grid", row, col)] = np.nan
-                    ndvi_map[("grid", row, col)] = np.nan
-                    ndvi_map_median[("grid", row, col)] = np.nan
+            packed = _pack_sorted_in_season_chunk(
+                raw, season_start, max_periods=6
+            )
+            if packed is None:
+                for i in local_base:
+                    prediction_map[
+                        ("grid", int(keep_rows[i]), int(keep_cols[i]))
+                    ] = np.nan
+                continue
 
-                is_last = (row == height - 1 and col == width - 1)
-                if len(current_chunk) >= chunk_size or (len(current_chunk) >= 2 and is_last):
-                    chunk_x = torch.stack([p[0] for p in current_chunk])
-                    chunk_mask = torch.stack([p[1] for p in current_chunk])
-                    chunk_doy = torch.stack([p[2] for p in current_chunk])
-                    chunk_weight = torch.stack([p[3] for p in current_chunk])
+            gathered, season_sorted = packed
+            k = int(num_periods)
+            counts = ((season_sorted >= 1) & (season_sorted <= k)).sum(axis=1)
+            counts_eff = np.minimum(counts, int(sequencelength))
+            for length in np.unique(counts_eff):
+                length = int(length)
+                if length <= 0:
+                    idx_empty = np.flatnonzero(counts_eff == length)
+                    for j in idx_empty:
+                        i = int(local_base[j])
+                        prediction_map[
+                            ("grid", int(keep_rows[i]), int(keep_cols[i]))
+                        ] = np.nan
+                    continue
+                idx = np.flatnonzero(counts_eff == length)
+                if idx.size == 0:
+                    continue
+                stacked = np.ascontiguousarray(gathered[idx, :length])
+                soil_sub = (
+                    None
+                    if soil_chunk is None
+                    else np.ascontiguousarray(soil_chunk[idx])
+                )
+                _run_transform_forward(stacked, soil_sub, local_base[idx])
 
-                    municipality_X_chunk = (chunk_x, chunk_mask, chunk_doy, chunk_weight)
-                    municipality_X_chunk = recursive_todevice(municipality_X_chunk, device)
+    # Mark any keep pixels beyond n_use as NaN.
+    for i in range(n_use, n_keep):
+        key = ("grid", int(keep_rows[i]), int(keep_cols[i]))
+        prediction_map[key] = np.nan
+        if want_ndvi:
+            ndvi_map[key] = np.nan
+            ndvi_map_median[key] = np.nan
 
-                    with (
-                        autocast("cuda", dtype=torch.bfloat16)
-                        if device.type == "cuda"
-                        else torch.no_grad()
-                    ):
-                        chunk_predictions = model(municipality_X_chunk)
-                        if chunk_predictions.dim() == 1:
-                            chunk_predictions = chunk_predictions.unsqueeze(0)
-
-                    for i, key in enumerate(chunk_indices):
-                        prediction_map[key] = float(
-                            denormalize_head_output(
-                                chunk_predictions[i].item(),
-                                target_mean,
-                                target_std,
-                                head_output,
-                            )
-                        )
-
-                    current_chunk = []
-                    chunk_indices = []
-
-    # In daily mode: ndvi_map = mean NDVI; ndvi_map_median slot holds peak (max) NDVI over time.
     return prediction_map, ndvi_map, ndvi_map_median, dict(ndvi_map_per_month), None, height, width
+
 
 def create_heatmap_array(
     prediction_map,
@@ -1777,6 +1965,8 @@ def run_municipality_inference(
         head_output=head_output,
         target_mean=target_mean,
         target_std=target_std,
+        feature_layout=getattr(args, "feature_layout", None),
+        legacy_input_scaling=bool(getattr(args, "legacy_input_scaling", False)),
     )
     if prediction_map is None:
         return None
@@ -2290,10 +2480,14 @@ def main():
                 args.chunk_size,
                 device,
                 seed=args.seed,
-                        year_range=args.year_range,
+                year_range=args.year_range,
                 reference_date=args.reference_date,
                 input_dim=input_dim,
                 num_periods=num_periods,
+                feature_layout=getattr(args, "feature_layout", None),
+                legacy_input_scaling=bool(
+                    getattr(args, "legacy_input_scaling", False)
+                ),
                 **head_denorm,
             )
 

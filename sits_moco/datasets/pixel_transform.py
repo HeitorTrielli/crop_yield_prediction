@@ -89,6 +89,7 @@ class PixelTransform:
         extra_scaler: InputScaler | None = None,
         extra_scaler_path: str | Path | None = None,
         legacy_input_scaling: bool = False,
+        deterministic_head: bool = False,
     ):
         self.sequencelength = int(sequencelength)
         self.feature_layout = normalize_feature_layout(feature_layout)
@@ -99,6 +100,7 @@ class PixelTransform:
         self._recipe = lay.get("recipe")
         self.rc = bool(randomchoice)
         self.interp = bool(interp)
+        self.deterministic_head = bool(deterministic_head)
         self.getWeight_batch = getWeight_batch
         self.legacy_input_scaling = bool(legacy_input_scaling)
         self.mean = SPECTRAL_MEAN
@@ -304,6 +306,13 @@ class PixelTransform:
                 weight_pad[:, :t] = weight
                 wsum = weight_pad.sum(axis=1, keepdims=True)
                 weight_pad /= np.where(wsum > 0, wsum, 1.0)
+            elif self.deterministic_head:
+                # Keep earliest sequencelength timesteps (heatmap / incomplete-series).
+                x_pad = x[:, :seq_len, :]
+                doy_pad_broadcast = doy[:, :seq_len]
+                weight_pad = weight[:, :seq_len]
+                weight_pad /= weight_pad.sum(axis=1, keepdims=True)
+                mask = np.ones((n, seq_len), dtype=np.int32)
             else:
                 idxs = np.random.choice(t, seq_len, replace=False)
                 idxs.sort()

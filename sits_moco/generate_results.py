@@ -380,6 +380,31 @@ def _build_dataset(
     return dataset
 
 
+def _resolve_run_extra_scaler(ctx: ModelContext):
+    """Load the training InputScaler from the run config (or repo-local fallback)."""
+    if ctx.legacy_input_scaling:
+        return None
+    from datasets.extra_scaler import InputScaler, layout_needs_extra_scaler
+
+    if not layout_needs_extra_scaler(ctx.feature_layout):
+        return None
+
+    computed = ctx.run_config.get("computed") or {}
+    payload = computed.get("extra_scaler")
+    if isinstance(payload, dict) and payload.get("spectral") is not None:
+        return InputScaler.from_dict(payload)
+
+    path_raw = computed.get("extra_scaler_path")
+    if path_raw:
+        path = Path(str(path_raw))
+        local = Path("files/train_input_scaler.json")
+        if path.is_file():
+            return InputScaler.load(path)
+        if local.is_file():
+            return InputScaler.load(local)
+    return None
+
+
 def _apply_run_extra_scaler(ctx: ModelContext, dataset: USCropsAggregatedNPY) -> None:
     """Attach the training InputScaler (incl. soil z-score) from the run config.
 
@@ -390,7 +415,6 @@ def _apply_run_extra_scaler(ctx: ModelContext, dataset: USCropsAggregatedNPY) ->
     if ctx.legacy_input_scaling:
         return
     from datasets.extra_scaler import (
-        InputScaler,
         apply_extra_scaler_to_dataset,
         layout_needs_extra_scaler,
     )
@@ -399,32 +423,21 @@ def _apply_run_extra_scaler(ctx: ModelContext, dataset: USCropsAggregatedNPY) ->
     if not layout_needs_extra_scaler(ctx.feature_layout):
         return
 
-    computed = ctx.run_config.get("computed") or {}
-    payload = computed.get("extra_scaler")
-    scaler: InputScaler | None = None
-    source = None
-    if isinstance(payload, dict) and payload.get("spectral") is not None:
-        scaler = InputScaler.from_dict(payload)
-        source = "run_config.computed.extra_scaler"
-    else:
-        path_raw = computed.get("extra_scaler_path")
-        if path_raw:
-            path = Path(str(path_raw))
-            # Prefer repo-local scaler if the absolute training path is gone.
-            local = Path("files/train_input_scaler.json")
-            if path.is_file():
-                scaler = InputScaler.load(path)
-                source = str(path)
-            elif local.is_file():
-                scaler = InputScaler.load(local)
-                source = str(local.resolve())
-
+    scaler = _resolve_run_extra_scaler(ctx)
     if scaler is None:
         print(
             "WARNING: no train input scaler found in run config; "
             "PixelTransform will load files/train_input_scaler.json lazily."
         )
         return
+
+    computed = ctx.run_config.get("computed") or {}
+    payload = computed.get("extra_scaler")
+    if isinstance(payload, dict) and payload.get("spectral") is not None:
+        source = "run_config.computed.extra_scaler"
+    else:
+        path_raw = computed.get("extra_scaler_path")
+        source = str(path_raw) if path_raw else "files/train_input_scaler.json"
 
     apply_extra_scaler_to_dataset(dataset, scaler)
     needs_soil = feature_layout_needs_soil_sidecar(ctx.feature_layout)
@@ -682,6 +695,7 @@ def run_guarapuava_heatmaps(
 
     saved: dict[str, Path] = {}
     period_list = [None, *NUM_PERIODS_LIST]
+    extra_scaler = _resolve_run_extra_scaler(ctx)
 
     for num_periods in period_list:
         label = "full" if num_periods is None else f"k{num_periods}"
@@ -712,6 +726,8 @@ def run_guarapuava_heatmaps(
             target_mean=ctx.target_mean,
             target_std=ctx.target_std,
             legacy_input_scaling=ctx.legacy_input_scaling,
+            feature_layout=ctx.feature_layout,
+            extra_scaler=extra_scaler,
         )
         if bundle[0] is None:
             print(f"  Skipped {label}: inference failed")

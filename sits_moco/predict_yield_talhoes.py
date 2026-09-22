@@ -40,9 +40,10 @@ from tqdm import tqdm
 
 from datasets.feature_layout import (
     feature_layout_input_dim,
+    feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
 )
-from datasets.pixel_transform import PixelTransform
+from datasets.pixel_transform import N_SOIL, PixelTransform
 from models import STNetRegression
 from run_paths import (
     apply_run_config_to_args,
@@ -293,11 +294,45 @@ def resolve_daily_tiff_dir(
 def transform_pixel(
     x,
     pixel_transform: PixelTransform,
+    soil: np.ndarray | None = None,
 ):
     """Delegate to PixelTransform (same as training / predict_yield on .npy)."""
     raw = np.asarray(x, dtype=np.float32)
-    x, mask, doy, weight = pixel_transform.transform_chunk(raw[np.newaxis, :])
+    soil_batch = None
+    if soil is not None:
+        soil_arr = np.asarray(soil, dtype=np.float32).reshape(-1)[:N_SOIL]
+        soil_batch = soil_arr[np.newaxis, :]
+    x, mask, doy, weight = pixel_transform.transform_chunk(
+        raw[np.newaxis, :], soil=soil_batch
+    )
     return x[0], mask[0], doy[0], weight[0]
+
+
+def load_soil_sidecar(
+    npy_path: Path, n_pixels: int, *, required: bool = False
+) -> np.ndarray | None:
+    """Load ``{stem}_soil.npy`` aligned with municipal .npy rows, or zeros if missing."""
+    soil_path = npy_path.with_name(f"{npy_path.stem}_soil.npy")
+    if not soil_path.is_file():
+        if required:
+            print(f"  ⚠️  Warning: missing soil sidecar {soil_path}; using zeros")
+            return np.zeros((n_pixels, N_SOIL), dtype=np.float32)
+        return None
+    try:
+        soil = np.load(soil_path, mmap_mode="r")
+    except OSError as e:
+        if required:
+            print(f"  ⚠️  Warning: could not load {soil_path}: {e}; using zeros")
+            return np.zeros((n_pixels, N_SOIL), dtype=np.float32)
+        return None
+    if len(soil) != n_pixels:
+        print(
+            f"  ⚠️  Warning: soil sidecar N={len(soil)} != npy N={n_pixels}; using zeros"
+        )
+        return (
+            np.zeros((n_pixels, N_SOIL), dtype=np.float32) if required else None
+        )
+    return soil
 
 
 def parse_args() -> argparse.Namespace:
@@ -568,6 +603,11 @@ def predict_pixel_grid_daily(
     if len(municipality_data) == 0:
         return None
 
+    needs_soil = feature_layout_needs_soil_sidecar(pixel_transform.feature_layout)
+    soil_data = load_soil_sidecar(
+        npy_path, len(municipality_data), required=needs_soil
+    )
+
     transform = ref_transform
     crs = ref_crs
 
@@ -604,7 +644,8 @@ def predict_pixel_grid_daily(
                     break
                 if infer_mask[row, col]:
                     X = municipality_data[npy_pixel_idx]
-                    tup = transform_pixel(X, pixel_transform)
+                    soil_row = None if soil_data is None else soil_data[npy_pixel_idx]
+                    tup = transform_pixel(X, pixel_transform, soil=soil_row)
                     current_chunk.append(tup)
                     chunk_rc.append((row, col))
                     if len(current_chunk) >= chunk_size:
@@ -787,13 +828,34 @@ def run_talhao_predictions(
         )
         print("Mode: talhão-only (infer pixels inside plot polygons only)")
 
+    extra_scaler = None
+    if not legacy_input_scaling and run_config is not None:
+        from datasets.extra_scaler import InputScaler, layout_needs_extra_scaler
+
+        if layout_needs_extra_scaler(feature_layout):
+            computed = run_config.get("computed") or {}
+            payload = computed.get("extra_scaler")
+            if isinstance(payload, dict) and payload.get("spectral") is not None:
+                extra_scaler = InputScaler.from_dict(payload)
+            else:
+                path_raw = computed.get("extra_scaler_path")
+                if path_raw:
+                    path = Path(str(path_raw))
+                    local = Path("files/train_input_scaler.json")
+                    if path.is_file():
+                        extra_scaler = InputScaler.load(path)
+                    elif local.is_file():
+                        extra_scaler = InputScaler.load(local)
+
     pixel_transform = PixelTransform(
         sequencelength,
         feature_layout,
         randomchoice=rc,
         interp=interp,
         seed=seed,
+        extra_scaler=extra_scaler,
         legacy_input_scaling=legacy_input_scaling,
+        deterministic_head=True,
     )
 
     results: list[dict] = []
