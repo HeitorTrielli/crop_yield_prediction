@@ -2,25 +2,21 @@
 \label{sec:experiments}
 
 \subsection{Proposed model}
-The proposed downscaling model combines Sentinel-2 reflectance with the full Xavier climate layout (precipitation plus cumulative ETo, Rs, Tmax, and Tmin) and uses one Transformer layer with $d_{\mathrm{model}}=128$, four attention heads, $d_{\mathrm{inner}}=128$, and dropout $0.3$.
-Model selection maximizes validation $R^2$ of municipal aggregates; the best validation epoch is 12.
-After selection, pixel scores from the same checkpoint are retained for intramunicipal maps.
+The proposed model is MSTNet: one STNet trunk for Sentinel-2, one for daily Xavier climate (precipitation, ETo, Rs, Tmax, and Tmin), and late fusion of MapBiomas Solo properties in the decoder.
+Each trunk uses one Transformer layer with $d_{\mathrm{model}}=128$, two attention heads, $d_{\mathrm{inner}}=256$, and dropout $0.4$.
+Reported metrics apply the selected weights pixel by pixel and average the scores to municipalities (Section~\ref{sec:pixel-formulation}). We select the epoch with the highest validation $R^2$ of those municipal aggregates; that epoch is 12.
+The selected checkpoint is evaluated once on the held-out test municipalities.
 
-\subsection{Architecture search without climate}
-Separately, we grid-searched Transformer capacity and regularization using spectral inputs only:
+\subsection{Spectral-only reference}
+For context, we report results from a separate grid search using spectral inputs only:
 $d_{\mathrm{model}}\in\{64,96,128\}$, number of heads $\in\{4,8\}$, $d_{\mathrm{inner}}\in\{64,128\}$, and dropout $\in\{0.3,0.4\}$, with a single Transformer layer.
 Twenty-four configurations completed successfully.
-The best spectral-only model ($d_{\mathrm{model}}=96$, eight heads, $d_{\mathrm{inner}}=64$, dropout $0.3$) is used in the spectral-only ablation.
+The best spectral-only model ($d_{\mathrm{model}}=96$, eight heads, $d_{\mathrm{inner}}=64$, dropout $0.3$) is reported as a reference. It differs from MSTNet in both inputs and architecture, so this is not a controlled estimate of what climate or soil add on their own.
 
 \subsection{Evaluation protocol}
-Held-out evaluation scores municipal means of pixel predictions against PAM labels on the 2021 validation and test municipalities.
-We also report learning curves, predicted-versus-actual municipal scatters for harvest years 2020--2024, municipal error maps, and example intramunicipal pixel maps.
+Held-out evaluation compares municipal predictions with PAM labels on the 2021 validation and test municipalities.
+We also report learning curves, predicted-versus-observed municipal scatterplots for harvest years 2020--2024, and a municipal error map for the 2021 holdout.
 
 \subsection{Ablations}
-We compare two ablations against the proposed model: a spectral-only setting that uses reflectance alone with the best spectral-only architecture from the grid search, and a temporal-pooling comparison that, with that spectral-only architecture fixed, contrasts NDVI-weighted pooling against mean pooling over valid timesteps.
+We report two auxiliary comparisons: the spectral-only reference above, and a temporal-pooling comparison that swaps NDVI-weighted pooling for mean pooling over valid timesteps in the spectral-only architecture. These are descriptive checks, not controlled multimodal ablations.
 
-\subsection{Early-season evaluation}
-To assess whether downscaled estimates can be produced before the end of the season, we re-evaluate the proposed model using only the first $k$ months of imagery, $k=1,\ldots,6$.
-Season months are counted from 1~October (month 1 $=$ October, \ldots, month 6 $=$ March).
-For each $k$, observations in the retained window are truncated or padded to length $T=45$.
-Metrics are reported on municipal aggregates, pooled over municipalities and years, and separately for 2021.

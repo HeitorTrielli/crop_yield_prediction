@@ -1,32 +1,53 @@
 \section{Methods}
 \label{sec:methods}
 
-\subsection{Downscaling formulation}
-Let a municipality $m$ in harvest year $y$ contain $N_m$ valid soybean pixels with time series $\mathbf{x}_p$.
-A shared model $f_\theta$ maps each pixel to a scalar productivity contribution $\hat{y}_p = f_\theta(\mathbf{x}_p)$.
-These pixel scores are the downscaled product of interest: after training they form intramunicipal productivity maps.
-Municipal productivity, which is the only quantity for which labels exist, is recovered by mean aggregation,
+\subsection{Pixel scoring under municipal supervision}
+\label{sec:pixel-formulation}
+Let $\mathcal{P}_{m,y}$ denote the soybean pixels observed in municipality $m$ in harvest year $y$.
+MSTNet defines a productivity score $\hat{y}_p$ for each soy pixel $p$ from its Sentinel-2 sequence $\mathbf{x}_p$, the municipal daily climate series $\mathbf{c}_{m,y}$ (broadcast to all pixels in $m$), and soil covariates $\mathbf{s}_p$ (or a municipal soil vector when only polygon-level soil is available).
+Reported municipal predictions average those pixel scores,
 \begin{equation}
-  \hat{y}_{m,y} = \frac{1}{N_m}\sum_{p=1}^{N_m} \hat{y}_p ,
-  \label{eq:mean-agg}
+  \hat{y}_{m,y}
+  =
+  \frac{1}{|\mathcal{P}_{m,y}|}
+  \sum_{p \in \mathcal{P}_{m,y}}
+  \hat{y}_p ,
+  \qquad
+  \hat{y}_p = f_\theta(\mathbf{x}_p, \mathbf{c}_{m,y}, \mathbf{s}_p),
+  \label{eq:pixel-mean-agg}
 \end{equation}
-and is supervised against the official PAM label $y_{m,y}$.
-Thus learning proceeds from coarse labels to fine predictions: gradients update $f_\theta$ through the municipal mean, while inference retains the full pixel field $\{\hat{y}_p\}$.
+and are compared with the PAM label $y_{m,y}$.
+At inference the field $\{\hat{y}_p\}$ can also be kept as a map or averaged over any sub-municipal polygon.
+Appendix~\ref{app:pixel-pipeline} sketches this pipeline.
+
+Training uses a cheaper surrogate: soy-masked Sentinel-2 reflectance is averaged before encoding,
+\begin{equation}
+  \bar{\mathbf{x}}_{m,y,t}
+  =
+  \frac{1}{|\mathcal{P}_{m,y,t}|}
+  \sum_{p \in \mathcal{P}_{m,y,t}}\mathbf{x}_{p,t},
+  \label{eq:municipal-mean}
+\end{equation}
+so each municipality--year is one forward pass
+$\hat{y}_{m,y}^{\mathrm{train}}=f_\theta(\bar{\mathbf{x}}_{m,y},\mathbf{c}_{m,y},\mathbf{s}_m)$
+supervised by PAM.
+The holdout metrics in Sections~\ref{sec:experiments}--\ref{sec:results} are not from that surrogate: they apply the trained weights pixel by pixel and aggregate with~\eqref{eq:pixel-mean-agg}.
+Because $f_\theta$ is nonlinear, mean-then-encode and encode-then-mean need not coincide; the pixel-mean evaluation is the operational downscaling check.
 
 \subsection{Architecture}
-We use a regression adaptation of STNet~\citep{xu2024sitsmoco} as the pixel encoder.
-Given pixel sequences with sixteen channels (ten spectral bands and six Xavier climate covariates), padding masks, and day-of-year indices, the network projects each timestep with a shared multilayer perceptron from 16 inputs through widths $32 \rightarrow 64 \rightarrow d_{\mathrm{model}}$, adds sinusoidal positional encodings indexed by day of year, applies a Transformer encoder with padding masks to model temporal dependencies, collapses the sequence to a single vector per pixel by temporal pooling, and maps the pooled embedding to a continuous scalar with a multilayer-perceptron head.
-Temporal pooling uses NDVI-weighted averaging: temporal weights derived from NDVI are normalized and used as a soft collapse over time.
-An alternative that averages only over valid (unmasked) timesteps, without NDVI weights, is evaluated as an ablation.
-The spectral-only ablation uses the same architecture with ten-band inputs.
+MSTNet (\emph{Multi} STNet) places one STNet trunk on each time-varying stream so that modalities with different sampling rates need not share a common calendar~\citep{xu2024sitsmoco}.
+A spectral trunk encodes Sentinel-2 sequences (ten bands, length $T=45$) with day-of-year positional encodings and NDVI-weighted temporal pooling.
+A climate trunk encodes daily Xavier weather (five channels: precipitation, ETo, Rs, Tmax, Tmin) over the Oct--Mar window (length $183$), pooled by a mean over valid days.
+MapBiomas Solo properties are fixed once the harvest year is known. They are concatenated with the pooled trunk embeddings and passed through a multilayer-perceptron decoder that outputs a productivity estimate (per pixel or per municipal aggregate, depending on the input path).
+As an ablation on a spectral-only single-trunk STNet, we also try mean pooling over valid spectral timesteps instead of NDVI weights.
+That spectral-only model uses ten-band inputs and has no climate or soil branches.
 
-The proposed model uses one Transformer layer, $d_{\mathrm{model}}=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=128$, and dropout $0.3$.
+Each MSTNet trunk uses one Transformer layer, $d_{\mathrm{model}}=128$, two attention heads, feed-forward width $d_{\mathrm{inner}}=256$, and dropout $0.4$.
 
 \subsection{Loss and optimization}
-Training minimizes mean squared error between aggregated municipal predictions and PAM targets after standardization by the training-set mean and standard deviation.
-Reported metrics (RMSE, MAE, $R^2$, MAPE) are computed in original \si{t/ha} units on the municipal aggregates, which are the evaluable layer of the downscaling pipeline.
+Training minimizes mean squared error between predicted and observed municipal productivity after standardizing targets with the training-set mean and standard deviation.
+Reported metrics (RMSE, MAE, and $R^2$) are computed after transforming predictions back to \si{t/ha}.
 
-Optimization uses AdamW with learning rate $1\times10^{-4}$, weight decay $5\times10^{-4}$, and batches of 40 municipalities.
-The learning rate is reduced at epochs 15 and 75; training stops early after ten epochs without improvement in validation $R^2$.
-Because municipalities can contain many pixels, gradients within each municipal batch are accumulated over subsets of pixels.
+Optimization uses AdamW with learning rate $1\times10^{-3}$, weight decay $5\times10^{-4}$, and batches of 40 municipalities.
+The learning rate is scheduled to drop at epochs 40 and 120; training stops early after fifteen epochs without improvement in validation $R^2$.
 No self-supervised pretraining is used: the network is trained from scratch under municipal supervision.

@@ -1,0 +1,191 @@
+\appendix
+\section{Pixel-level MSTNet pipeline}
+\label{app:pixel-pipeline}
+
+Section~\ref{sec:pixel-formulation} defines the pixel-scoring evaluation~\eqref{eq:pixel-mean-agg}: soy-masked Sentinel-2 pixels are scored one by one, municipal climate is shared across pixels, soil enters by late fusion, and the mean of the pixel predictions is compared with PAM.
+Figure~\ref{fig:data-flow} shows the municipality-mean spectral path used for training.
+Figure~\ref{fig:data-flow-pixel} shows the pixel-by-pixel path used for the reported holdout metrics and for intramunicipal maps.
+At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged over any polygon. That map is not a training target.
+
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\footnotesize,
+  line join=round,
+  x=1cm, y=1cm,
+  >={Stealth[length=1.8mm, width=1.4mm]},
+  shorten >=2.2mm,
+  shorten <=0.4mm,
+  src/.style={
+    draw=black!40, fill=white, rounded corners=2pt,
+    align=center, inner xsep=5pt, inner ysep=5pt,
+    minimum width=2.35cm, minimum height=1.5cm, line width=0.45pt
+  },
+  mid/.style={
+    draw=black!40, fill=black!2, rounded corners=2pt,
+    align=center, inner xsep=5pt, inner ysep=5pt,
+    minimum width=2.45cm, minimum height=1.05cm, line width=0.45pt
+  },
+  enc/.style={
+    draw=#1!55!black, fill=white, rounded corners=2pt,
+    align=center, inner xsep=6pt, inner ysep=5pt,
+    minimum width=2.5cm, minimum height=0.95cm, line width=0.55pt
+  },
+  dec/.style={
+    draw=black!50, fill=black!4, rounded corners=2pt,
+    align=center, inner xsep=8pt, inner ysep=6pt,
+    minimum width=2.9cm, minimum height=0.95cm, line width=0.55pt
+  },
+  rowlab/.style={font=\scriptsize\color{black!50}, anchor=east},
+  arr/.style={->, line width=0.55pt, draw=black!45},
+  iconfields/.pic={
+    \fill[green!48!black!60] (-0.24,-0.13) -- (-0.02,-0.13) -- (0.00,0.00) -- (-0.22,0.03) -- cycle;
+    \fill[yellow!50!green!55] (0.00,-0.13) -- (0.24,-0.13) -- (0.24,0.00) -- (0.03,0.00) -- cycle;
+    \fill[green!32!black!40] (-0.22,0.04) -- (0.00,0.02) -- (0.04,0.15) -- (-0.24,0.15) -- cycle;
+    \fill[olive!50!black!35] (0.04,0.02) -- (0.24,0.02) -- (0.24,0.15) -- (0.06,0.15) -- cycle;
+    \draw[white, line width=0.3pt] (-0.24,-0.13) rectangle (0.24,0.15);
+  },
+  iconmask/.pic={
+    \fill[black!10] (-0.22,-0.13) rectangle (0.22,0.13);
+    \fill[green!55!black]
+      (-0.10,-0.06) .. controls (-0.12,0.04) and (0.00,0.13) .. (0.06,0.09)
+      .. controls (0.16,0.03) and (0.12,-0.08) .. (0.00,-0.09)
+      .. controls (-0.05,-0.10) and (-0.08,-0.08) .. cycle;
+  },
+  iconcloud/.pic={
+    \fill[black!12!cyan!28] (-0.05,0.03) circle [radius=0.08];
+    \fill[black!12!cyan!28] (0.05,0.05) circle [radius=0.10];
+    \fill[black!12!cyan!28] (0.00,0.10) circle [radius=0.09];
+    \fill[black!12!cyan!28] (-0.13,0.02) circle [radius=0.06];
+    \fill[black!12!cyan!28] (0.13,0.02) circle [radius=0.06];
+    \draw[cyan!35!black, line width=0.28pt] (-0.06,-0.03) -- (-0.08,-0.11);
+    \draw[cyan!35!black, line width=0.28pt] (0.00,-0.03) -- (0.00,-0.13);
+    \draw[cyan!35!black, line width=0.28pt] (0.06,-0.03) -- (0.08,-0.10);
+  },
+  iconsoil/.pic={
+    \fill[brown!70!black!55] (-0.20,-0.13) rectangle (0.20,-0.05);
+    \fill[brown!50!orange!40] (-0.20,-0.05) rectangle (0.20,0.02);
+    \fill[brown!28!yellow!40] (-0.20,0.02) rectangle (0.20,0.07);
+    \fill[green!38!black!28] (-0.20,0.07) rectangle (0.20,0.13);
+    \draw[black!30, line width=0.22pt] (-0.20,-0.13) rectangle (0.20,0.13);
+  },
+  iconpam/.pic={
+    \fill[white] (-0.13,-0.13) rectangle (0.15,0.13);
+    \draw[violet!40!black, line width=0.28pt] (-0.13,-0.13) rectangle (0.15,0.13);
+    \fill[violet!15] (-0.13,0.06) rectangle (0.15,0.13);
+    \fill[violet!45!black] (-0.05,-0.09) rectangle (-0.01,-0.04);
+    \fill[violet!55!black] (0.01,-0.09) rectangle (0.05,-0.01);
+    \fill[violet!65!black] (0.07,-0.09) rectangle (0.11,0.02);
+  },
+]
+
+  % ===== Sources =====
+  \node[rowlab] at (-8.0, 0) {Sources};
+
+  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]-6.3,0) {};
+  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]-6.3,0) {};
+  \node[src] (s2) at (-6.3, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconfields}}\\[2pt]
+      \scriptsize Sentinel-2\\[0pt]
+      \scriptsize via GEE
+    \end{tabular}};
+
+  \node[src] (soy) at (-3.15, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconmask}}\\[2pt]
+      \scriptsize MapBiomas\\[0pt]
+      \scriptsize soy mask
+    \end{tabular}};
+
+  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]0,0) {};
+  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]0,0) {};
+  \node[src] (xav) at (0, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconcloud}}\\[2pt]
+      \scriptsize Xavier\\[0pt]
+      \scriptsize weather
+    \end{tabular}};
+
+  \node[src] (soil) at (3.15, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconsoil}}\\[2pt]
+      \scriptsize MapBiomas\\[0pt]
+      \scriptsize Solo
+    \end{tabular}};
+
+  \node[src] (pam) at (6.3, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconpam}}\\[2pt]
+      \scriptsize IBGE PAM
+    \end{tabular}};
+
+  % ===== Pixel preparation =====
+  \node[rowlab] at (-8.0, -3.0) {Pixels};
+
+  % many soy pixels (stacked)
+  \node[mid, fill=black!7, draw=black!28] at ([shift={(4pt,-4pt)}]-4.725,-3.0) {};
+  \node[mid, fill=black!3, draw=black!32] at ([shift={(2pt,-2pt)}]-4.725,-3.0) {};
+  \node[mid] (p_s2) at (-4.725, -3.0) {\scriptsize Soy pixel series};
+
+  \node[mid] (p_cl) at (0, -3.0) {\scriptsize Climate\\[-1pt]\scriptsize (broadcast)};
+  \node[mid] (p_so) at (3.15, -3.0) {\scriptsize Soil\\[-1pt]\scriptsize (per pixel)};
+  \node[mid] (p_lb) at (6.3, -3.0) {\scriptsize Labels};
+
+  \draw[arr] (s2.south) -- ++(0,-0.55) -| (p_s2.north);
+  \draw[arr] (soy.south) -- ++(0,-0.55) -| (p_s2.north);
+  \draw[arr] (xav.south) -- (p_cl.north);
+  \draw[arr] (soil.south) -- (p_so.north);
+  \draw[arr] (pam.south) -- (p_lb.north);
+
+  % ===== Encoders =====
+  \node[rowlab] at (-8.0, -6.2) {Encoders};
+  \node[enc=blue!55!black] (e_s2) at (-4.725, -6.2) {\scriptsize Spectral encoder};
+  \node[enc=orange!65!black] (e_cl) at (0, -6.2) {\scriptsize Climate encoder};
+
+  \begin{scope}[on background layer]
+    \node[
+      fit=(e_s2)(e_cl),
+      fill=blue!4,
+      draw=blue!25!black!40,
+      rounded corners=3pt,
+      inner xsep=18pt,
+      inner ysep=16pt,
+      line width=0.5pt
+    ] (encbox) {};
+  \end{scope}
+  \node[font=\scriptsize\color{blue!40!black!60}, anchor=south]
+    at ([yshift=4pt]encbox.north) {MSTNet};
+
+  \draw[arr] (p_s2.south) -- (e_s2.north);
+  \draw[arr] (p_cl.south) -- (e_cl.north);
+
+  % ===== Decoder (pixel scores; single node, not stacked) =====
+  \node[rowlab] at (-8.0, -9.0) {Decoder};
+  \node[dec, minimum width=3.6cm, text width=3.4cm] (dec) at (-2.3625, -9.0)
+    {\scriptsize Late fusion + MLP $\Rightarrow\hat{y}_p$};
+
+  \draw[arr] (e_s2.south) -- ++(0,-0.7) -| (dec.150);
+  \draw[arr] (e_cl.south) -- ++(0,-0.7) -| (dec.30);
+  \draw[arr] (p_so.south) -- (p_so.south |- dec.east) -- (dec.east);
+
+  % ===== Municipal aggregation of predictions =====
+  \node[rowlab] at (-8.0, -11.2) {Aggregate};
+  \node[dec] (agg) at (-2.3625, -11.2) {\scriptsize Mean of pixel predictions};
+
+  \draw[arr] (dec.south) -- (agg.north);
+
+  % ===== Output =====
+  \node[rowlab] at (-8.0, -13.4) {Output};
+  \node[dec] (out) at (-2.3625, -13.4) {$\hat{y}_{m,y}$};
+
+  \draw[arr] (agg.south) -- (out.north);
+  \draw[arr] (p_lb.south) -- (p_lb.south |- out.east) -- (out.east);
+\end{tikzpicture}%
+}
+\caption{Pixel-by-pixel MSTNet pipeline.
+Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion.
+The mean of pixel predictions $\hat{y}_p$ yields $\hat{y}_{m,y}$, which is supervised by IBGE PAM.}
+\label{fig:data-flow-pixel}
+\end{figure*}

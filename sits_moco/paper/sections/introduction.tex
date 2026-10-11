@@ -1,12 +1,19 @@
 \section{Introduction}
 \label{sec:introduction}
 
-Soybean productivity maps at fine spatial resolution would support planning, insurance, and risk assessment, but field-level yield labels are rarely available at scale in Brazil.
-What is available instead are official municipal statistics from the Brazilian Institute of Geography and Statistics (IBGE) Municipal Agricultural Production survey (PAM), together with dense Sentinel-2 time series that resolve spectral variation \emph{within} municipalities.
-This paper treats that gap as a \emph{downscaling} task: learn pixel-level productivity contributions from municipal labels alone, then read out both municipal aggregates and intramunicipal maps.
+Reliable soybean productivity estimates matter for agricultural monitoring, insurance, and risk assessment.
+In Brazil, the Municipal Agricultural Production survey (PAM) from the Brazilian Institute of Geography and Statistics (IBGE) publishes official yields only at the municipality level. The same kind of coarse reporting is common elsewhere.
+Sentinel-2 imagery, gridded weather, and soil maps describe crop condition at much finer scales, but field-level yield labels are rarely available statewide.
+What we need is a model that can learn from municipal labels and still make predictions for smaller regions, at a scale that is cheap enough to run over large areas.
 
-Deep Transformers have been shown to extract informative representations from Sentinel-2 time series for crop mapping~\citep{xu2024sitsmoco}.
-We adapt the Spectral--Temporal Network (STNet) from that line of research to continuous productivity regression (tonnes per hectare).
-Each soybean pixel is scored by the network; municipal predictions are the mean of pixel scores and are supervised by PAM labels, using Sentinel-2 reflectance and Xavier climate covariates over Paran\'{a} for harvest years 2020--2024.
+MSTNet (\emph{Multi} STNet) is our answer to that requirement. It extends the Spectral--Temporal Network (STNet) of~\citet{xu2024sitsmoco} by giving each covariate stream its own trunk when the streams are sampled at different frequencies.
+Here, one trunk encodes soy-masked Sentinel-2 reflectance and another encodes daily climate. Annual MapBiomas Solo properties, which are static once the harvest year is fixed, are concatenated in the decoder.
+Predictions are defined per soy pixel.
+For speed, training fits the network on municipality-mean Sentinel-2 series supervised by PAM.
+At evaluation and inference we apply the same weights to every soy pixel and average the scores to municipalities (or to any other polygon) without retraining.
 
-Our contributions are a municipal-to-pixel downscaling scheme that trains per-pixel productivity predictors under mean aggregation to IBGE PAM labels; a spectral--temporal Transformer for Paran\'{a} soybean that combines reflectance with Xavier climate covariates, with ablations that remove climate inputs or change temporal pooling; and a held-out evaluation on the 2021 growing season, including early-season truncations and qualitative intramunicipal maps.
+We run the experiments on soybean municipalities in Paran\'{a} for harvest years 2020--2024 and hold out 2021 for validation and test.
+Because PAM is the only supervised target, the numbers we report are municipal: holdout $R^2$, RMSE, and related diagnostics on municipal aggregates.
+We are not aware of many yield studies that train a multi-frequency Transformer on municipal labels while still exposing pixel scores for downscaling. Matched baselines for that setup are scarce, so we present the municipal holdout as a reproducible benchmark rather than a direct comparison against the literature.
+
+Our contributions are MSTNet itself, the pixel-scoring setup that turns municipal supervision into sub-municipal maps, and a fixed 2021 municipality holdout for Paran\'{a} over 2020--2024.

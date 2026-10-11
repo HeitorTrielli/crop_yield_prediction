@@ -1,4 +1,4 @@
-"""Copy run figures and generate learning-curve / incomplete-series plots."""
+"""Copy run figures and generate learning-curve / scatter-panel plots."""
 from __future__ import annotations
 
 import csv
@@ -10,7 +10,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN = ROOT / (
-    "results/tuning/productivity_top5_spectral_xavier_full/trial_003"
+    "results/tuning/productivity_muni_mean_dual_stnet/trial_859"
 )
 OUT = Path(__file__).resolve().parent / "figures"
 OUT.mkdir(parents=True, exist_ok=True)
@@ -72,48 +72,28 @@ fig.savefig(OUT / "learning_curves.png", dpi=200, bbox_inches="tight")
 plt.close(fig)
 print("wrote learning_curves")
 
-# --- incomplete series ---
-inc = list(csv.DictReader((RUN / "predictions/incomplete_series_evaluation.csv").open()))
-k = [int(r["num_periods"]) for r in inc]
-inc_r2 = [float(r["r2"]) for r in inc]
-inc_rmse = [float(r["rmse"]) for r in inc]
-inc_mape = [float(r["mape"]) for r in inc]
-
-fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.2))
-axes[0].plot(k, inc_r2, marker="o", color="#1f4e79", lw=1.6)
-axes[0].axhline(0, color="0.5", lw=0.8)
-axes[0].set_xlabel("Season months available ($k$)")
-axes[0].set_ylabel(r"$R^2$")
-axes[0].set_xticks(k)
-axes[0].set_title(r"(a) $R^2$ vs season length")
-
-axes[1].plot(k, inc_rmse, marker="o", color="#1f4e79", lw=1.6)
-axes[1].set_xlabel("Season months available ($k$)")
-axes[1].set_ylabel("RMSE (t/ha)")
-axes[1].set_xticks(k)
-axes[1].set_title("(b) RMSE vs season length")
-
-axes[2].plot(k, inc_mape, marker="o", color="#1f4e79", lw=1.6)
-axes[2].set_xlabel("Season months available ($k$)")
-axes[2].set_ylabel("MAPE (%)")
-axes[2].set_xticks(k)
-axes[2].set_title("(c) MAPE vs season length")
-
-for ax in axes:
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-fig.tight_layout()
-fig.savefig(OUT / "incomplete_series.pdf", bbox_inches="tight")
-fig.savefig(OUT / "incomplete_series.png", dpi=200, bbox_inches="tight")
-plt.close(fig)
-print("wrote incomplete_series")
-
-# Combined multi-year scatter panel from CSVs (cleaner for paper than 5 separate)
+# Combined multi-year scatter panel: large 2021 on top, 2x2 for other years below
 cov_rows = list(csv.DictReader((ROOT / "files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv").open()))
 allowed = {(str(r["municipality_code"]), int(r["year"])) for r in cov_rows}
 sc = RUN / "figures/productivity_scatter"
-fig, axes = plt.subplots(1, 5, figsize=(12.5, 2.6), sharex=True, sharey=True)
-for ax, year in zip(axes, range(2020, 2025)):
+lims = [0.5, 5.5]
+split_style = [
+    ("train", "#1f4e79", "o"),
+    ("valid", "#c45c26", "s"),
+    ("test", "#2a7f62", "^"),
+    ("eval", "#2a7f62", "^"),
+]
+
+
+def plot_year(
+    ax,
+    year: int,
+    *,
+    markersize: float = 10,
+    title_size: float = 9,
+    label_size: float = 8,
+    tick_size: float = 7,
+) -> None:
     rows = [
         r
         for r in csv.DictReader((sc / f"productivity_{year}_direct.csv").open())
@@ -122,35 +102,67 @@ for ax, year in zip(axes, range(2020, 2025)):
     pred = np.array([float(r["predicted_productivity_t_ha"]) for r in rows])
     act = np.array([float(r["actual_productivity_t_ha"]) for r in rows])
     splits = [r["split"] for r in rows]
-    for split, color, marker in [
-        ("train", "#1f4e79", "o"),
-        ("valid", "#c45c26", "s"),
-        ("test", "#2a7f62", "^"),
-        ("eval", "#2a7f62", "^"),
-    ]:
+    for split, color, marker in split_style:
         m = np.array([s == split for s in splits])
         if m.any():
-            ax.scatter(act[m], pred[m], s=10, alpha=0.55, c=color, marker=marker, label=split, edgecolors="none")
-    lims = [0.5, 5.5]
-    ax.plot(lims, lims, color="0.4", lw=0.9, ls="--")
+            ax.scatter(
+                act[m],
+                pred[m],
+                s=markersize,
+                alpha=0.55,
+                c=color,
+                marker=marker,
+                label=split,
+                edgecolors="none",
+            )
+    ax.plot(lims, lims, color="0.4", lw=0.8, ls="--")
     ax.set_xlim(lims)
     ax.set_ylim(lims)
     ax.set_aspect("equal")
-    ax.set_title(str(year), fontsize=10)
+    ax.set_title(str(year), fontsize=title_size, pad=2)
+    ax.tick_params(labelsize=tick_size, length=2.5, pad=1)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    if year == 2020:
-        ax.set_ylabel("Predicted (t/ha)")
-    ax.set_xlabel("Actual (t/ha)")
-handles, labels = axes[1].get_legend_handles_labels()
-# unique
+    ax.set_xlabel("Actual (t/ha)", fontsize=label_size, labelpad=1)
+    ax.set_ylabel("Predicted (t/ha)", fontsize=label_size, labelpad=1)
+
+
+# Compact figure: wider than tall so it stays ~half a page at text width
+fig = plt.figure(figsize=(6.4, 4.15))
+gs = fig.add_gridspec(2, 1, height_ratios=[1.05, 1.15], hspace=0.18)
+ax2021 = fig.add_subplot(gs[0, 0])
+plot_year(ax2021, 2021, markersize=9, title_size=9)
+ax2021.set_title("2021 (holdout)", fontsize=9, pad=2)
+ax2021.set_box_aspect(1)
+
+gs_bot = gs[1].subgridspec(2, 2, wspace=0.22, hspace=0.28)
+other_years = [2020, 2022, 2023, 2024]
+for i, year in enumerate(other_years):
+    ax = fig.add_subplot(gs_bot[i // 2, i % 2])
+    plot_year(ax, year, markersize=5, title_size=8)
+    ax.set_box_aspect(1)
+    if i % 2 == 1:
+        ax.set_ylabel("")
+    if i < 2:
+        ax.set_xlabel("")
+
+handles, labels = ax2021.get_legend_handles_labels()
 seen = {}
-for h, l in zip(handles, labels):
-    seen[l] = h
-fig.legend(seen.values(), seen.keys(), loc="upper center", ncol=3, frameon=False, fontsize=8, bbox_to_anchor=(0.5, 1.08))
-fig.tight_layout()
-fig.savefig(OUT / "scatter_panel.pdf", bbox_inches="tight")
-fig.savefig(OUT / "scatter_panel.png", dpi=200, bbox_inches="tight")
+for h, lab in zip(handles, labels):
+    seen[lab] = h
+fig.legend(
+    seen.values(),
+    seen.keys(),
+    loc="upper center",
+    ncol=3,
+    frameon=False,
+    fontsize=7,
+    bbox_to_anchor=(0.5, 1.02),
+    handletextpad=0.3,
+    columnspacing=0.9,
+)
+fig.savefig(OUT / "scatter_panel.pdf", bbox_inches="tight", pad_inches=0.04)
+fig.savefig(OUT / "scatter_panel.png", dpi=200, bbox_inches="tight", pad_inches=0.04)
 plt.close(fig)
 print("wrote scatter_panel")
 print("done ->", OUT)

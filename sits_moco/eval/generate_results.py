@@ -273,7 +273,6 @@ def _metrics_row_from_forecasts(
             "rmse": np.nan,
             "mae": np.nan,
             "r2": np.nan,
-            "mape": np.nan,
         }
 
     pred = pd.to_numeric(year_df["forecast"], errors="coerce")
@@ -288,7 +287,6 @@ def _metrics_row_from_forecasts(
             "rmse": np.nan,
             "mae": np.nan,
             "r2": np.nan,
-            "mape": np.nan,
         }
 
     metrics = regression_metrics(y_pred, y_true, target_column=target_column)
@@ -298,7 +296,6 @@ def _metrics_row_from_forecasts(
         "rmse": metrics["rmse"],
         "mae": metrics["mae"],
         "r2": metrics["r2"],
-        "mape": metrics["mape"] if not np.isnan(metrics["mape"]) else None,
     }
 
 
@@ -587,7 +584,6 @@ def run_incomplete_series_evaluation(
                     "rmse": metrics["rmse"],
                     "mae": metrics["mae"],
                     "r2": metrics["r2"],
-                    "mape": metrics["mape"] if not np.isnan(metrics["mape"]) else None,
                 }
             )
         else:
@@ -598,7 +594,6 @@ def run_incomplete_series_evaluation(
                     "rmse": np.nan,
                     "mae": np.nan,
                     "r2": np.nan,
-                    "mape": np.nan,
                 }
             )
 

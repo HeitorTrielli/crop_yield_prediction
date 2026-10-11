@@ -1,120 +1,220 @@
 \section{Data}
 \label{sec:data}
 
-Downscaling requires fine-resolution predictors and coarse labels.
-Features are drawn from several sources (Table~\ref{tab:data-sources}): Sentinel-2 reflectance, Xavier climate covariates, and MapBiomas Solo soil properties at each soybean pixel, a MapBiomas soybean mask, and IBGE PAM productivity labels at the municipality level.
+The analysis uses municipal PAM productivity labels together with Sentinel-2, daily climate, and soil covariates (Table~\ref{tab:data-sources}).
+Soy-masked Sentinel-2 pixels provide the spectral signal. Climate is reduced to a municipal daily series. Soil can be attached per pixel or as a municipal vector.
+Figure~\ref{fig:data-flow} shows the municipality-mean spectral path used for training.
+Appendix~\ref{app:pixel-pipeline} shows the pixel-by-pixel path used for the reported holdout metrics and for sub-municipal maps.
 
 \begin{table}[t]
 \centering
 \caption{Summary of data sources used in the experiments.}
 \label{tab:data-sources}
 \footnotesize
-\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{@{}llp{2.35cm}ccp{2.35cm}@{}}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lp{7.0cm}p{4.1cm}@{}}
 \toprule
-Category & Variables & Unit & Related properties & Spatial res. & Source \\
+Category & Variables and processing & Source \\
 \midrule
-Satellite imagery
-  & \makecell[l]{B2, B3, B4, B5, B6,\\B7, B8, B8A, B11, B12}
-  & ---
-  & Vegetation reflectance
-  & 30\,m
-  & Sentinel-2 L2A \\
+Satellite & Ten Sentinel-2 L2A reflectance bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), soy-masked zonal means via Google Earth Engine & Copernicus Sentinel-2 L2A~\citep{esa2021sentinel2}; GEE~\citep{gorelick2017gee} \\
 \midrule
-\multirow{6}{*}{Climate}
-  & Cumulative precipitation
-  & mm
-  & Water availability
-  & \multirow{6}{*}{$0.1^\circ$}
-  & \multirow{6}{*}{\makecell[c]{Xavier\\(BR-DWGD)}} \\
-\cmidrule(lr){2-4}
-  & Max.\ dry-day streak
-  & days
-  & Drought stress
-  &
-  & \\
-\cmidrule(lr){2-4}
-  & Cumulative ETo
-  & mm
-  & Atmospheric demand
-  &
-  & \\
-\cmidrule(lr){2-4}
-  & Cumulative Rs
-  & MJ\,m$^{-2}$
-  & Solar radiation
-  &
-  & \\
-\cmidrule(lr){2-4}
-  & Cumulative Tmax
-  & $^\circ$C$\cdot$day
-  & Heat accumulation
-  &
-  & \\
-\cmidrule(lr){2-4}
-  & Cumulative Tmin
-  & $^\circ$C$\cdot$day
-  & Cold accumulation
-  &
-  & \\
+Climate & Daily precipitation, ETo, Rs, Tmax, and Tmin; averaged across Xavier cells within the municipality polygon & Xavier BR-DWGD~\citep{xavier2022} \\
 \midrule
-\multirow{4}{*}{Soil}
-  & Clay (0--30\,cm)
-  & \%
-  & Texture
-  & \multirow{4}{*}{30\,m}
-  & \multirow{4}{*}{\makecell[c]{MapBiomas Solo\\Col.\ 3}} \\
-\cmidrule(lr){2-4}
-  & Silt (0--30\,cm)
-  & \%
-  & Texture
-  &
-  & \\
-\cmidrule(lr){2-4}
-  & Sand (0--30\,cm)
-  & \%
-  & Texture
-  &
-  & \\
-\cmidrule(lr){2-4}
-  & SOC stock (0--30\,cm)
-  & \si{t/ha}
-  & Organic carbon
-  &
-  & \\
+Soil & Clay, silt, sand, and soil organic-carbon stock at 0--30\,cm; late-fused static covariates & MapBiomas Solo Collection~3~\citep{mapbiomassoil2025} \\
 \midrule
-Land cover
-  & Soybean mask (class 39)
-  & ---
-  & Crop mask
-  & 30\,m
-  & MapBiomas Col.\ 10 \\
+Crop mask & MapBiomas soybean class~39, used to select pixels before Sentinel-2 aggregation & MapBiomas Collection~10~\citep{mapbiomas2025} \\
 \midrule
-Labels
-  & Soybean productivity
-  & \si{t/ha}
-  & Municipal supervision
-  & Municipality
-  & IBGE PAM \\
+Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\footnotesize,
+  line join=round,
+  x=1cm, y=1cm,
+  >={Stealth[length=1.8mm, width=1.4mm]},
+  shorten >=2.2mm,
+  shorten <=0.4mm,
+  src/.style={
+    draw=black!40, fill=white, rounded corners=2pt,
+    align=center, inner xsep=5pt, inner ysep=5pt,
+    minimum width=2.35cm, minimum height=1.5cm, line width=0.45pt
+  },
+  mid/.style={
+    draw=black!40, fill=black!2, rounded corners=2pt,
+    align=center, inner xsep=5pt, inner ysep=5pt,
+    minimum width=2.35cm, minimum height=1.0cm, line width=0.45pt
+  },
+  enc/.style={
+    draw=#1!55!black, fill=white, rounded corners=2pt,
+    align=center, inner xsep=6pt, inner ysep=5pt,
+    minimum width=2.5cm, minimum height=0.95cm, line width=0.55pt
+  },
+  dec/.style={
+    draw=black!50, fill=black!4, rounded corners=2pt,
+    align=center, inner xsep=8pt, inner ysep=6pt,
+    minimum width=2.9cm, minimum height=0.95cm, line width=0.55pt
+  },
+  rowlab/.style={font=\scriptsize\color{black!50}, anchor=east},
+  arr/.style={->, line width=0.55pt, draw=black!45},
+  iconfields/.pic={
+    \fill[green!48!black!60] (-0.24,-0.13) -- (-0.02,-0.13) -- (0.00,0.00) -- (-0.22,0.03) -- cycle;
+    \fill[yellow!50!green!55] (0.00,-0.13) -- (0.24,-0.13) -- (0.24,0.00) -- (0.03,0.00) -- cycle;
+    \fill[green!32!black!40] (-0.22,0.04) -- (0.00,0.02) -- (0.04,0.15) -- (-0.24,0.15) -- cycle;
+    \fill[olive!50!black!35] (0.04,0.02) -- (0.24,0.02) -- (0.24,0.15) -- (0.06,0.15) -- cycle;
+    \draw[white, line width=0.3pt] (-0.24,-0.13) rectangle (0.24,0.15);
+  },
+  iconmask/.pic={
+    \fill[black!10] (-0.22,-0.13) rectangle (0.22,0.13);
+    \fill[green!55!black]
+      (-0.10,-0.06) .. controls (-0.12,0.04) and (0.00,0.13) .. (0.06,0.09)
+      .. controls (0.16,0.03) and (0.12,-0.08) .. (0.00,-0.09)
+      .. controls (-0.05,-0.10) and (-0.08,-0.08) .. cycle;
+  },
+  iconcloud/.pic={
+    \fill[black!12!cyan!28] (-0.05,0.03) circle [radius=0.08];
+    \fill[black!12!cyan!28] (0.05,0.05) circle [radius=0.10];
+    \fill[black!12!cyan!28] (0.00,0.10) circle [radius=0.09];
+    \fill[black!12!cyan!28] (-0.13,0.02) circle [radius=0.06];
+    \fill[black!12!cyan!28] (0.13,0.02) circle [radius=0.06];
+    \draw[cyan!35!black, line width=0.28pt] (-0.06,-0.03) -- (-0.08,-0.11);
+    \draw[cyan!35!black, line width=0.28pt] (0.00,-0.03) -- (0.00,-0.13);
+    \draw[cyan!35!black, line width=0.28pt] (0.06,-0.03) -- (0.08,-0.10);
+  },
+  iconsoil/.pic={
+    \fill[brown!70!black!55] (-0.20,-0.13) rectangle (0.20,-0.05);
+    \fill[brown!50!orange!40] (-0.20,-0.05) rectangle (0.20,0.02);
+    \fill[brown!28!yellow!40] (-0.20,0.02) rectangle (0.20,0.07);
+    \fill[green!38!black!28] (-0.20,0.07) rectangle (0.20,0.13);
+    \draw[black!30, line width=0.22pt] (-0.20,-0.13) rectangle (0.20,0.13);
+  },
+  iconpam/.pic={
+    \fill[white] (-0.13,-0.13) rectangle (0.15,0.13);
+    \draw[violet!40!black, line width=0.28pt] (-0.13,-0.13) rectangle (0.15,0.13);
+    \fill[violet!15] (-0.13,0.06) rectangle (0.15,0.13);
+    \fill[violet!45!black] (-0.05,-0.09) rectangle (-0.01,-0.04);
+    \fill[violet!55!black] (0.01,-0.09) rectangle (0.05,-0.01);
+    \fill[violet!65!black] (0.07,-0.09) rectangle (0.11,0.02);
+  },
+]
+
+  % column centers: 3.15cm spacing (> node width 2.35cm)
+  % Sources
+  \node[rowlab] at (-8.0, 0) {Sources};
+
+  % Sentinel-2: stacked cards = time series of dates
+  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]-6.3,0) {};
+  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]-6.3,0) {};
+  \node[src] (s2) at (-6.3, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconfields}}\\[2pt]
+      \scriptsize Sentinel-2\\[0pt]
+      \scriptsize via GEE
+    \end{tabular}};
+
+  \node[src] (soy) at (-3.15, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconmask}}\\[2pt]
+      \scriptsize MapBiomas\\[0pt]
+      \scriptsize soy mask
+    \end{tabular}};
+
+  % Xavier: stacked cards = daily time series
+  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]0,0) {};
+  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]0,0) {};
+  \node[src] (xav) at (0, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconcloud}}\\[2pt]
+      \scriptsize Xavier\\[0pt]
+      \scriptsize weather
+    \end{tabular}};
+
+  \node[src] (soil) at (3.15, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconsoil}}\\[2pt]
+      \scriptsize MapBiomas\\[0pt]
+      \scriptsize Solo
+    \end{tabular}};
+  \node[src] (pam) at (6.3, 0) {%
+    \begin{tabular}{@{}c@{}}
+      \tikz{\pic{iconpam}}\\[2pt]
+      \scriptsize IBGE PAM
+    \end{tabular}};
+
+  % Aggregation (y = -3.0)
+  \node[rowlab] at (-8.0, -3.0) {Aggregation};
+  \node[mid] (a_s2) at (-4.725, -3.0) {\scriptsize Soy-masked mean};
+  \node[mid] (a_cl) at (0, -3.0) {\scriptsize Climate mean};
+  \node[mid] (a_so) at (3.15, -3.0) {\scriptsize Soil mean};
+  \node[mid] (a_lb) at (6.3, -3.0) {\scriptsize Labels};
+
+  \draw[arr] (s2.south) -- ++(0,-0.55) -| (a_s2.north);
+  \draw[arr] (soy.south) -- ++(0,-0.55) -| (a_s2.north);
+  \draw[arr] (xav.south) -- (a_cl.north);
+  \draw[arr] (soil.south) -- (a_so.north);
+  \draw[arr] (pam.south) -- (a_lb.north);
+
+  % Encoders (y = -6.2)
+  \node[rowlab] at (-8.0, -6.2) {Encoders};
+  \node[enc=blue!55!black] (e_s2) at (-4.725, -6.2) {\scriptsize Spectral encoder};
+  \node[enc=orange!65!black] (e_cl) at (0, -6.2) {\scriptsize Climate encoder};
+
+  \begin{scope}[on background layer]
+    \node[
+      fit=(e_s2)(e_cl),
+      fill=blue!4,
+      draw=blue!25!black!40,
+      rounded corners=3pt,
+      inner xsep=18pt,
+      inner ysep=16pt,
+      line width=0.5pt
+    ] (encbox) {};
+  \end{scope}
+  \node[font=\scriptsize\color{blue!40!black!60}, anchor=south]
+    at ([yshift=4pt]encbox.north) {MSTNet};
+
+  \draw[arr] (a_s2.south) -- (e_s2.north);
+  \draw[arr] (a_cl.south) -- (e_cl.north);
+
+  % Decoder (y = -9.0)
+  \node[rowlab] at (-8.0, -9.0) {Decoder};
+  \node[dec] (dec) at (-2.3625, -9.0) {\scriptsize Late fusion + MLP};
+
+  \draw[arr] (e_s2.south) -- ++(0,-0.7) -| (dec.150);
+  \draw[arr] (e_cl.south) -- ++(0,-0.7) -| (dec.30);
+  \draw[arr] (a_so.south) -- (a_so.south |- dec.east) -- (dec.east);
+
+  % Output (y = -11.2)
+  \node[rowlab] at (-8.0, -11.2) {Output};
+  \node[dec] (out) at (-2.3625, -11.2) {$\hat{y}_{m,y}$};
+
+  \draw[arr] (dec.south) -- (out.north);
+  \draw[arr] (a_lb.south) -- (a_lb.south |- out.east) -- (out.east);
+\end{tikzpicture}%
+}
+\caption{Data pipeline for MSTNet training.
+Sentinel-2 is reduced to soy-masked municipal means; Xavier weather is encoded by a parallel trunk; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat{y}_{m,y}$ is supervised by IBGE PAM labels at the output.
+Reported evaluation instead scores individual soy pixels and averages them (Appendix~\ref{app:pixel-pipeline}).}
+\label{fig:data-flow}
+\end{figure*}
+
 \subsection{Study area and labels}
 The study covers soybean-producing municipalities in the state of Paran\'{a}, Brazil.
-Supervision uses municipal soybean productivity in tonnes per hectare (\si{t/ha}) from IBGE PAM, with municipality codes, harvest year, and a predefined validation and test partition within the holdout year.
+The target is municipal soybean productivity in tonnes per hectare (\si{t/ha}) from IBGE PAM~\citep{ibgepam}; municipality code and harvest year identify each observation.
 No field- or pixel-level yield labels are used.
 We retain municipality--year pairs whose Sentinel-2 coverage ratio relative to the reported planted area lies in $[0.8, 1.2]$, so that satellite coverage is roughly consistent with official area statistics.
 
-\subsection{Imagery and climate covariates}
-Predictors are per-pixel Sentinel-2 spectral time series, organized by municipality and growing season.
-Each pixel sequence comprises ten spectral bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12) and a day-of-year index used for positional encoding.
-Climate covariates come from the Xavier daily weather grid~\citep{xavier2022} and are temporally aligned to each Sentinel-2 observation date: cumulative precipitation from 1~October through the observation date; the maximum consecutive dry-day streak between successive Sentinel-2 dates (dry day: precipitation $<1$\,mm); and season-to-date cumulative reference evapotranspiration (ETo), solar radiation (Rs), maximum temperature (Tmax), and minimum temperature (Tmin).
-All climate channels are sampled at the Xavier cell containing each pixel centroid and scaled before concatenation with normalized reflectance.
-The proposed model uses all six Xavier climate channels together with the ten spectral bands (sixteen features per timestep).
-Sequences are truncated or padded to a fixed length of $T=45$ timesteps.
-Soybean pixels are selected with the MapBiomas Collection~10 land-cover product (class~39), which defines the intramunicipal support of the downscaled maps.
-An ablation omits all climate covariates and uses the ten spectral bands alone.
+\subsection{Covariates and municipal aggregation}
+Sentinel-2 L2A reflectance is processed in Google Earth Engine~\citep{gorelick2017gee}: for each municipality and acquisition date we compute soy-masked zonal means of ten bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), using MapBiomas Collection~10 class~39 as the soybean mask~\citep{mapbiomas2025}.
+Each municipal spectral sequence carries a day-of-year index for positional encoding and is truncated or padded to $T=45$ acquisitions.
+Climate covariates come from the Xavier daily weather grid~\citep{xavier2022} as a separate municipal daily series over the inclusive Oct~1--Mar~31 window (length $183$): precipitation, reference evapotranspiration (ETo), solar radiation (Rs), maximum temperature (Tmax), and minimum temperature (Tmin).
+Daily climate is averaged over Xavier cells whose centers fall in the municipality polygon and is scaled independently of reflectance; MSTNet encodes it in a dedicated trunk rather than concatenating climate onto Sentinel-2 timesteps.
+Static MapBiomas Solo properties (clay, silt, sand, and SOC stock at 0--30\,cm) are late-fused in the decoder~\citep{mapbiomassoil2025}.
+An ablation omits climate and soil inputs and uses the ten spectral bands alone.
 
 \subsection{Train / validation / test split}
 Splits follow a year-holdout design on municipalities.
@@ -122,4 +222,4 @@ All municipality--year observations outside the holdout year are used for traini
 The holdout year is \textbf{2021}.
 After restricting to harvest years $\{2020,2021,2022,2023,2024\}$, the training set contains 997 municipality--years, while validation and test contain 132 and 123 municipalities in 2021, respectively.
 Training target statistics used for loss normalization are mean $3.17$\,\si{t/ha} and standard deviation $0.93$\,\si{t/ha}.
-Quantitative evaluation uses municipal aggregates of the pixel predictions; intramunicipal structure is examined qualitatively through pixel maps.
+All reported metrics are municipal aggregates obtained by averaging pixel-level scores (Section~\ref{sec:pixel-formulation}). We do not validate pixel maps against field yields.

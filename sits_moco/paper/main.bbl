@@ -1,9 +1,40 @@
-\begin{thebibliography}{2}
+\begin{thebibliography}{7}
 \providecommand{\natexlab}[1]{#1}
 \providecommand{\url}[1]{\texttt{#1}}
 \expandafter\ifx\csname urlstyle\endcsname\relax
   \providecommand{\doi}[1]{doi: #1}\else
   \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[{Copernicus Sentinel-2, processed by ESA}(2021)]{esa2021sentinel2}
+{Copernicus Sentinel-2, processed by ESA}.
+\newblock {MSI Level-2A Bottom-of-Atmosphere Reflectance Product, Collection
+  1}, 2021.
+
+\bibitem[Gorelick et~al.(2017)Gorelick, Hancher, Dixon, Ilyushchenko, Thau, and
+  Moore]{gorelick2017gee}
+Noel Gorelick, Matt Hancher, Mike Dixon, Simon Ilyushchenko, David Thau, and
+  Rebecca Moore.
+\newblock Google {Earth} {Engine}: Planetary-scale geospatial analysis for
+  everyone.
+\newblock \emph{Remote Sensing of Environment}, 202:\penalty0 18--27, 2017.
+\newblock \doi{10.1016/j.rse.2017.06.031}.
+
+\bibitem[{Instituto Brasileiro de Geografia e Estat\'{\i}stica}(2026)]{ibgepam}
+{Instituto Brasileiro de Geografia e Estat\'{\i}stica}.
+\newblock Produ\c{c}\~{a}o agr\'{\i}cola municipal.
+\newblock SIDRA: Sistema IBGE de Recupera\c{c}\~{a}o Autom\'{a}tica, 2026.
+\newblock URL \url{https://sidra.ibge.gov.br/pesquisa/pam/documentos}.
+\newblock Accessed 2026-09-23.
+
+\bibitem[{MapBiomas}(2025{\natexlab{a}})]{mapbiomas2025}
+{MapBiomas}.
+\newblock Collection 10 of the annual land cover and land use maps of brazil
+  (1985--2024), 2025{\natexlab{a}}.
+
+\bibitem[{MapBiomas}(2025{\natexlab{b}})]{mapbiomassoil2025}
+{MapBiomas}.
+\newblock Soil particle size and texture maps for brazil 0--100 cm: Mapbiomas
+  soil collection 3 (beta), 2025{\natexlab{b}}.
 
 \bibitem[Xavier et~al.(2022)Xavier, Scanlon, King, and Alves]{xavier2022}
 Alexandre~C{\^a}ndido Xavier, Bridget~R. Scanlon, Carey~W. King, and Aline~I.
