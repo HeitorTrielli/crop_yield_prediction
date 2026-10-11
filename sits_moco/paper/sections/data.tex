@@ -2,9 +2,9 @@
 \label{sec:data}
 
 The analysis uses municipal PAM productivity labels together with Sentinel-2, daily climate, and soil covariates (Table~\ref{tab:data-sources}).
-Soy-masked Sentinel-2 pixels provide the spectral signal. Climate is reduced to a municipal daily series. Soil can be attached per pixel or as a municipal vector.
-Figure~\ref{fig:data-flow} shows the municipality-mean spectral path used for training.
-Appendix~\ref{app:pixel-pipeline} shows the pixel-by-pixel path used for the reported LOO metrics and for sub-municipal maps.
+All three covariate streams are gridded; for municipal aggregates we average them under the MapBiomas soybean mask.
+Figure~\ref{fig:data-flow} shows the municipality-mean path used for training.
+After training we switch to a pixel-wise forward pass and average the scores for the reported LOO metrics and for sub-municipal maps (Section~\ref{sec:pixel-formulation}); Appendix~\ref{app:pixel-pipeline} diagrams that pixel path.
 
 \begin{table}[t]
 \centering
@@ -18,11 +18,11 @@ Category & Variables and processing & Source \\
 \midrule
 Satellite & Ten Sentinel-2 L2A reflectance bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), soy-masked zonal means via Google Earth Engine & Copernicus Sentinel-2 L2A~\citep{esa2021sentinel2}; GEE~\citep{gorelick2017gee} \\
 \midrule
-Climate & Daily precipitation, ETo, Rs, Tmax, and Tmin; averaged across Xavier cells within the municipality polygon & Xavier BR-DWGD~\citep{xavier2022} \\
+Climate & Daily precipitation, ETo, Rs, Tmax, and Tmin; soy-masked averages of Xavier cells & Xavier BR-DWGD~\citep{xavier2022} \\
 \midrule
-Soil & Clay, silt, sand, and soil organic-carbon stock at 0--30\,cm; late-fused static covariates & MapBiomas Solo Collection~3~\citep{mapbiomassoil2025} \\
+Soil & Clay, silt, sand, and soil organic-carbon stock at 0--30\,cm; soy-masked averages, late-fused & MapBiomas Solo Collection~3~\citep{mapbiomassoil2025,mapbiomassoc2025} \\
 \midrule
-Crop mask & MapBiomas soybean class~39, used to select pixels before Sentinel-2 aggregation & MapBiomas Collection~10~\citep{mapbiomas2025} \\
+Crop mask & MapBiomas soybean class~39, used to select cells before aggregating Sentinel-2, climate, and soil & MapBiomas Collection~10~\citep{mapbiomas2025} \\
 \midrule
 Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \\
 \bottomrule
@@ -196,9 +196,9 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
   \draw[arr] (a_lb.south) -- (a_lb.south |- out.east) -- (out.east);
 \end{tikzpicture}%
 }
-\caption{Data pipeline for MSTNet training.
+\caption{Data pipeline for MSTNet training (municipal-mean path).
 Sentinel-2 is reduced to soy-masked municipal means; Xavier weather is encoded by a parallel trunk; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat{y}_{m,y}$ is supervised by IBGE PAM labels at the output.
-Reported evaluation instead scores individual soy pixels and averages them (Appendix~\ref{app:pixel-pipeline}).}
+The post-training pixel path is described in Section~\ref{sec:pixel-formulation} and diagrammed in Appendix~\ref{app:pixel-pipeline}.}
 \label{fig:data-flow}
 \end{figure*}
 
@@ -206,19 +206,20 @@ Reported evaluation instead scores individual soy pixels and averages them (Appe
 The study covers soybean-producing municipalities in the state of Paran\'{a}, Brazil.
 The target is municipal soybean productivity in tonnes per hectare (\si{t/ha}) from IBGE PAM~\citep{ibgepam}; municipality code and harvest year identify each observation.
 No field- or pixel-level yield labels are used.
-We retain municipality--year pairs whose Sentinel-2 coverage ratio relative to the reported planted area lies in $[0.5, 1.5]$, so that satellite coverage is roughly consistent with official area statistics.
+For each municipality--year we compare the MapBiomas soybean area with the PAM planted area and keep only pairs whose ratio lies in $[0.5, 1.5]$.
+This drops cases where the mask covers far less or far more soy than PAM reports, so the soy-masked covariates are not badly mismatched to the official area.
 
 \subsection{Covariates and municipal aggregation}
-Sentinel-2 L2A reflectance is processed in Google Earth Engine~\citep{gorelick2017gee}: for each municipality and acquisition date we compute soy-masked zonal means of ten bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), using MapBiomas Collection~10 class~39 as the soybean mask~\citep{mapbiomas2025}.
-Each municipal spectral sequence carries a day-of-year index for positional encoding and is truncated or padded to $T=45$ acquisitions.
-Climate covariates come from the Xavier daily weather grid~\citep{xavier2022} as a separate municipal daily series over the inclusive Oct~1--Mar~31 window (length $183$): precipitation, reference evapotranspiration (ETo), solar radiation (Rs), maximum temperature (Tmax), and minimum temperature (Tmin).
-Daily climate is averaged over Xavier cells whose centers fall in the municipality polygon and is scaled independently of reflectance; MSTNet encodes it in a dedicated trunk rather than concatenating climate onto Sentinel-2 timesteps.
-Static MapBiomas Solo properties (clay, silt, sand, and SOC stock at 0--30\,cm) are late-fused in the decoder~\citep{mapbiomassoil2025}.
-An ablation omits climate and soil inputs and uses the ten spectral bands alone.
+Both Sentinel-2 imagery and daily climate covariates cover the same inclusive Oct~1--Mar~31 window. We use this fixed window as an approximation of the soybean growing season in Paran\'{a}, assuming sowing begins around Oct~1 and harvest is completed by Mar~31.
+Sentinel-2 L2A reflectance is processed in Google Earth Engine~\citep{gorelick2017gee}: for each municipality and observation date we compute soy-masked zonal means of ten bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), using MapBiomas Collection~10 class~39 as the soybean mask~\citep{mapbiomas2025}.
+Each municipal spectral sequence retains a day-of-year index, and the longest observed sequence contains 45 observations.
+Climate covariates come from the Xavier daily weather grid~\citep{xavier2022}: precipitation, reference evapotranspiration (ETo), solar radiation (Rs), maximum temperature (Tmax), and minimum temperature (Tmin).
+The window contains 182 daily observations in ordinary seasons and 183 when February has 29 days.
+As with reflectance, daily climate is averaged under the MapBiomas soybean mask and scaled independently of Sentinel-2; MSTNet encodes it in a dedicated trunk rather than concatenating climate onto Sentinel-2 timesteps.
+For each municipality--season, we construct a four-value MapBiomas Solo soil vector comprising static clay, silt, and sand fractions~\citep{mapbiomassoil2025} and the annual SOC stock for the corresponding harvest year~\citep{mapbiomassoc2025}, all at 0--30\,cm. These properties are likewise soy-masked, and the resulting per-season vector is late-fused in the decoder.
 
 \subsection{Year leave-one-out splits}
 Evaluation follows year leave-one-out over harvest years 2020--2024 (Section~\ref{sec:loo}).
 In each fold, every municipality--year from the four training years is used for fitting; the left-out year is never seen in training and provides the only reported municipal scores for that fold.
-Target standardization is recomputed from each fold's training years.
 All main-text metrics are municipal aggregates obtained by averaging pixel-level scores on the LOO year only (Section~\ref{sec:pixel-formulation}).
-We do not validate pixel maps against field yields.
+We do not validate the pixel-level maps against field-level yields because no field-level ground-truth data are available.
