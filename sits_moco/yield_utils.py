@@ -288,6 +288,7 @@ _MODEL_KWARG_FIELDS = (
     ("climate_pooling", "climate_pooling", str),
     ("climate_max_seq_len", "climate_max_seq_len", int),
     ("climate_sequencelength", "climate_max_seq_len", int),
+    ("static_input", "static_input", bool),
 )
 
 
@@ -315,6 +316,7 @@ def resolve_model_kwargs(
             "temporal_pooling": str(mk.get("temporal_pooling", "ndvi")),
             "attn_pool_queries": int(mk.get("attn_pool_queries", 4)),
             "soil_fusion": str(mk.get("soil_fusion", "early")),
+            "static_input": bool(mk.get("static_input", False)),
         }
         if mk.get("climate_pooling") is not None:
             kwargs["climate_pooling"] = str(mk["climate_pooling"])
@@ -339,33 +341,37 @@ def resolve_model_kwargs(
 
 
 def is_dual_stnet_state_dict(state_dict: dict) -> bool:
-    return any(k.startswith("spectral.") for k in state_dict) and any(
-        k.startswith("climate.") for k in state_dict
-    )
+    """True when weights belong to DualSTNet (spectral and/or climate trunks)."""
+    has_spec = any(k.startswith("spectral.") for k in state_dict)
+    has_clim = any(k.startswith("climate.") for k in state_dict)
+    return has_spec or has_clim
 
 
 def soil_fusion_from_state_dict(state_dict: dict, *, soil_dim: int = 4) -> str:
     """Infer early vs late soil fusion from STNet / DualSTNet weight shapes."""
     if is_dual_stnet_state_dict(state_dict):
         dec_w = state_dict.get("decoder.0.weight")
-        d_model_w = state_dict.get("spectral.mlp1.2.lin.weight")
-        c_model_w = state_dict.get("climate.mlp1.2.lin.weight")
-        if dec_w is None or d_model_w is None or c_model_w is None:
+        if dec_w is None:
             return "none"
-        spec_d = int(d_model_w.shape[0])
-        clim_d = int(c_model_w.shape[0])
-        if "spectral.attn_pool.queries" in state_dict:
-            n_q = int(state_dict["spectral.attn_pool.queries"].shape[0])
-            spec_pooled = n_q * spec_d
-        else:
-            spec_pooled = spec_d
-        if "climate.attn_pool.queries" in state_dict:
-            n_qc = int(state_dict["climate.attn_pool.queries"].shape[0])
-            clim_pooled = n_qc * clim_d
-        else:
-            clim_pooled = clim_d
         decoder_in = int(dec_w.shape[1])
-        if decoder_in == spec_pooled + clim_pooled + int(soil_dim):
+        pooled = 0
+        d_model_w = state_dict.get("spectral.mlp1.2.lin.weight")
+        if d_model_w is not None:
+            spec_d = int(d_model_w.shape[0])
+            if "spectral.attn_pool.queries" in state_dict:
+                n_q = int(state_dict["spectral.attn_pool.queries"].shape[0])
+                pooled += n_q * spec_d
+            else:
+                pooled += spec_d
+        c_model_w = state_dict.get("climate.mlp1.2.lin.weight")
+        if c_model_w is not None:
+            clim_d = int(c_model_w.shape[0])
+            if "climate.attn_pool.queries" in state_dict:
+                n_qc = int(state_dict["climate.attn_pool.queries"].shape[0])
+                pooled += n_qc * clim_d
+            else:
+                pooled += clim_d
+        if decoder_in == pooled + int(soil_dim):
             return "late"
         return "none"
 
@@ -464,9 +470,11 @@ def stnet_regression_input_dim_from_state_dict(
     """
     if is_dual_stnet_state_dict(state_dict):
         w = state_dict.get("spectral.mlp1.0.lin.weight")
-        if w is None:
-            return 10
-        spec_in = int(w.shape[1])
+        if w is not None:
+            spec_in = int(w.shape[1])
+        else:
+            # Climate-only DualSTNet: spectral cube still has 10 S2 bands (± soil).
+            spec_in = 10
         if soil_fusion_from_state_dict(state_dict, soil_dim=soil_dim) == "late":
             return spec_in + int(soil_dim)
         return spec_in

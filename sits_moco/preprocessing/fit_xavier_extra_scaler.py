@@ -78,6 +78,15 @@ def main() -> None:
         action="store_true",
         help="Ignore coverage_ratio filters (same as training --no-coverage-filter).",
     )
+    parser.add_argument(
+        "--feature-layout",
+        type=str,
+        default="spectral_xavier_climate",
+        help=(
+            "Dataset layout while fitting (default: spectral_xavier_climate). "
+            "Use dual_spectral_daily_climate_soil for DualSTNet soy/climate sidecars."
+        ),
+    )
     args = parser.parse_args()
 
     harvest_years = {int(x.strip()) for x in args.harvest_years.split(",") if x.strip()}
@@ -91,7 +100,7 @@ def main() -> None:
         year=None,
         sequencelength=45,
         harvest_years=harvest_years,
-        feature_layout="spectral_xavier_climate",
+        feature_layout=args.feature_layout,
         min_coverage_ratio=min_cov,
         max_coverage_ratio=max_cov,
     )

@@ -175,6 +175,7 @@ sits_moco_data/
 heatmaps/
 *.csv
 */credentials.json
+*/credentials.json.bak*
 */token.json
 
 docs/*

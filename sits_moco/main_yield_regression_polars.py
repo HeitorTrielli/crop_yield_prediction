@@ -29,8 +29,11 @@ from datasets.daily_climate import CLIMATE_MAX_SEQ_LEN
 from datasets.feature_layout import (
     feature_layout_cli_choices,
     feature_layout_is_dual,
+    feature_layout_is_static,
     feature_layout_needs_soil_sidecar,
     feature_layout_spectral_dim,
+    feature_layout_uses_climate,
+    feature_layout_uses_spectral,
     normalize_feature_layout,
 )
 from datasets.uscrops_aggregated_npy_polars import (
@@ -446,6 +449,10 @@ def parse_args():
             "(use --soil-fusion early|late); "
             "'dual_spectral_daily_climate' = DualSTNet (S2 megapixel STNet + daily Xavier STNet); "
             "'dual_spectral_daily_climate_soil' = same + soil late-fused into the decoder; "
+            "'spectral_soil' = S2 + late soil (no climate); "
+            "'dual_daily_climate' / 'dual_daily_climate_soil' = climate(+soil) ablation "
+            "(no Sentinel encoder); "
+            "'soil' = MapBiomas Solo only; "
             "'ma_*' (alias 'mp_*') = derived index/climate recipes (see datasets/feature_recipes.py). "
             "See datasets/feature_layout.py."
         ),
@@ -1008,17 +1015,22 @@ def model_kwargs_from_args(args) -> dict:
         "attn_pool_queries": int(getattr(args, "attn_pool_queries", 4)),
         "soil_fusion": str(getattr(args, "soil_fusion", "early")),
     }
-    if feature_layout_is_dual(getattr(args, "feature_layout", "spectral")):
+    layout = getattr(args, "feature_layout", "spectral")
+    if feature_layout_is_dual(layout):
         if feature_layout_needs_soil_sidecar(args.feature_layout):
             kw["soil_fusion"] = "late"
         else:
             kw["soil_fusion"] = "none"
+        kw["use_spectral"] = feature_layout_uses_spectral(args.feature_layout)
+        kw["use_climate"] = feature_layout_uses_climate(args.feature_layout)
         kw["climate_pooling"] = "mean"
         if kw["temporal_pooling"] == "attention":
             kw["climate_pooling"] = "attention"
         kw["climate_max_seq_len"] = int(
             getattr(args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN)
         )
+    else:
+        kw["static_input"] = feature_layout_is_static(layout)
     return kw
 
 

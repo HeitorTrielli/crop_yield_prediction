@@ -1,16 +1,18 @@
-# DualSTNet mega-pixel yield + dual MoCo init (S2 trunk + daily climate trunk).
+# DualSTNet mega-pixel + dual MoCo, retargeted to the wide-study hotspot.
 #
-# Each unique (d_model, n_head, d_inner, n_layers) trains / reuses TWO MoCo runs:
-#   moco.spectral  → pixel S2 (feature_layout=spectral, input_dim=10)
-#   moco.climate   → municipal daily Xavier sidecars (daily_climate, C=5)
-# Yield then loads them into DualSTNetRegression.spectral / .climate.
+# Replaces the earlier moco grid (which still included d_model=96 / n_head=8/16).
+# From the wide analysis hotspot (LR≈1e-3, d_model∈{64,128}, dropout≈0.4):
+#   concentrate MoCo finetune there and add attention / weight_decay / LR=2e-3.
 #
-# Grid is smaller than dual_stnet_wide: MoCo is the expensive step (cached per arch).
-# Unique arches ≈ 3×2×2 = 12 → up to 24 MoCo trunks; yield grid = 72 + extras.
+# Each unique (d_model, n_head, d_inner, L) trains / reuses TWO MoCo trunks:
+#   moco.spectral  → pixel S2 (feature_layout=spectral)
+#   moco.climate   → municipal daily Xavier (daily_climate)
+#
+# Unique MoCo arches ≈ 2×2×2 = 8 → up to 16 MoCo trunks; yield ≈ 72 + extras.
 #
 # Requires:
 #   - ~/sits_moco_data/npy (pixel) for spectral MoCo
-#   - climate + soil sidecars under npy_muni_mean (already built)
+#   - climate + soil sidecars under npy_muni_mean
 #   - files/train_input_scaler_dual_muni_mean.json
 #
 # Preview / run:
@@ -38,7 +40,6 @@ moco:
   harvest_years: "2020,2021,2022,2023,2024"
   logdir: ./results
 
-  # Sentinel-2 trunk (matches DualSTNet.spectral input_dim=10)
   spectral:
     feature_layout: spectral
     datapath: ~/sits_moco_data/npy
@@ -46,7 +47,6 @@ moco:
     batchsize: 512
     max_samples: 500000
 
-  # Daily Xavier trunk (matches DualSTNet.climate input_dim=5, T≈183)
   climate:
     feature_layout: daily_climate
     datapath: ~/sits_moco_data/npy_muni_mean
@@ -63,6 +63,7 @@ base:
   soil_fusion: late
   climate_sequencelength: 183
   temporal_pooling: ndvi
+  attn_pool_queries: 4
   yield_csv: files/pam_soy_pr_2019_2025_coverage_0.8_1.2.csv
   no_coverage_filter: true
   extra_scaler: files/train_input_scaler_dual_muni_mean.json
@@ -76,10 +77,10 @@ base:
   sample_ratio: 1.0
   rc: false
   warmup_epochs: 0
-  schedule: [40, 120]
+  schedule: [20, 60]
   no_compile: true
   overwrite_run: true
-  early_stop_patience: 15
+  early_stop_patience: 12
   checkpoint_every: 0
   pixel_chunk_size: 8
   chunks_per_grad: 1
@@ -92,66 +93,71 @@ search:
   strategy: grid
 
   parameters:
+    learning_rate:
+      type: choice
+      values: [5.0e-4, 1.0e-3, 2.0e-3]
+
     model_d_model:
-      type: choice
-      values: [64, 96, 128]
-
-    model_n_head:
-      type: choice
-      values: [4, 8]
-
-    model_d_inner:
       type: choice
       values: [64, 128]
 
+    model_n_head:
+      type: choice
+      values: [2, 4]
+
+    model_d_inner:
+      type: choice
+      values: [128, 256]
+
     model_dropout:
       type: choice
-      values: [0.3, 0.4]
+      values: [0.4, 0.45]
 
-    learning_rate:
+    temporal_pooling:
       type: choice
-      # MoCo-init often wants a slightly higher finetune LR than from-scratch 1e-5.
-      values: [1.0e-4, 5.0e-4, 1.0e-3]
+      values: [ndvi, attention]
 
   extra_trials:
-    # Smoke winner corner (n_head=16) × higher LRs
-    - model_d_model: 64
-      model_n_head: 16
-      model_d_inner: 128
+    # Weight-decay around trial_859-like arch
+    - learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 256
       model_dropout: 0.4
-      learning_rate: 1.0e-4
+      temporal_pooling: ndvi
+      weight_decay: 1.0e-4
 
-    - model_d_model: 64
-      model_n_head: 16
-      model_d_inner: 128
+    - learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 256
       model_dropout: 0.4
-      learning_rate: 5.0e-4
+      temporal_pooling: ndvi
+      weight_decay: 1.0e-3
 
-    - model_d_model: 64
-      model_n_head: 16
-      model_d_inner: 128
+    - learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 256
       model_dropout: 0.4
-      learning_rate: 1.0e-3
-
-    - model_d_model: 128
-      model_n_head: 16
-      model_d_inner: 128
-      model_dropout: 0.3
-      learning_rate: 5.0e-4
-
-    # Attention pooling corners
-    - model_d_model: 64
-      model_n_head: 8
-      model_d_inner: 128
-      model_dropout: 0.3
-      learning_rate: 5.0e-4
       temporal_pooling: attention
-      attn_pool_queries: 4
+      attn_pool_queries: 8
+      weight_decay: 1.0e-4
 
-    - model_d_model: 64
-      model_n_head: 16
-      model_d_inner: 128
+    # L=2 ablation (extra MoCo trunk fingerprint)
+    - learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 256
       model_dropout: 0.4
-      learning_rate: 5.0e-4
+      model_n_layers: 2
+      temporal_pooling: ndvi
+
+    - learning_rate: 2.0e-3
+      model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 256
+      model_dropout: 0.45
+      model_n_layers: 2
       temporal_pooling: attention
       attn_pool_queries: 4

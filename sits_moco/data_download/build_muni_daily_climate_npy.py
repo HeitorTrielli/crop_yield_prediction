@@ -2,16 +2,18 @@
 """
 Build municipal daily Xavier climate sidecars for DualSTNet.
 
-For each municipality, average Xavier cells whose centers fall in the
-shapefile polygon (centroid cell if none). Writes raw daily values for the
-inclusive Oct 1–Mar 31 window:
+By default (--soy-mask), average Xavier cells weighted by MapBiomas soy pixel
+counts inside the municipality. With --no-soy-mask, average cells whose
+centers fall in the full shapefile polygon (centroid cell if none).
+
+Writes raw daily values for the inclusive Oct 1–Mar 31 window:
 
   {npy_root}/{year_range}/{code}/{code}_climate_daily.npy   shape [T, 5]
   channels: pr, ETo, Rs, Tmax, Tmin  (daily, not cumulative)
 
 Example:
   python data_download/build_muni_daily_climate_npy.py \\
-      --npy-root ~/sits_moco_data/npy_muni_mean \\
+      --npy-root ~/sits_moco_data/npy_muni_mean_soy \\
       --year-range 2020-2021 \\
       --xavier-pr-nc files/climate/pr_PR_daily_2020_2024.nc \\
       --xavier-eto-nc files/climate/ETo_PR_daily_2020_2024.nc \\
@@ -35,6 +37,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from data_download.append_xavier_rain_soy_mask import load_muni_geometry  # noqa: E402
+from data_download.bdc_zonal import mapbiomas_url, soy_pixel_lonlat  # noqa: E402
 from data_download.xavier_climate_for_daily_npy import (  # noqa: E402
     CLIMATE_VAR_ORDER,
     copy_nc_to_temp,
@@ -112,6 +115,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List municipalities without writing",
     )
+    p.add_argument(
+        "--soy-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Weight Xavier cells by MapBiomas soy pixel counts (default: on). "
+            "Use --no-soy-mask for full-polygon cell means (legacy)."
+        ),
+    )
+    p.add_argument(
+        "--mapbiomas-url-template",
+        type=str,
+        default=None,
+        help="Optional MapBiomas COG URL template with {year} (soy-mask mode)",
+    )
     return p.parse_args()
 
 
@@ -172,6 +190,7 @@ def _mean_daily_for_cells(
     days: list,
     ix: np.ndarray,
     iy: np.ndarray,
+    weights: np.ndarray | None = None,
 ) -> np.ndarray:
     out = np.full((len(days),), np.nan, dtype=np.float32)
     ny, nx = vals.shape[1], vals.shape[2]
@@ -181,8 +200,16 @@ def _mean_daily_for_cells(
     ix_k = ix[keep]
     iy_k = iy[keep]
     cells = vals[:, iy_k, ix_k]  # (ntime, n_cells)
-    with np.errstate(all="ignore"):
-        series = np.nanmean(cells, axis=1)
+    if weights is None:
+        with np.errstate(all="ignore"):
+            series = np.nanmean(cells, axis=1)
+    else:
+        w = np.asarray(weights, dtype=np.float64).ravel()[keep]
+        finite = np.isfinite(cells)
+        num = np.nansum(np.where(finite, cells * w, 0.0), axis=1)
+        den = np.sum(np.where(finite, w, 0.0), axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            series = np.where(den > 0, num / den, np.nan)
     for t, d in enumerate(days):
         ti = date_to_ti.get(d)
         if ti is None:
@@ -191,6 +218,46 @@ def _mean_daily_for_cells(
         if np.isfinite(v):
             out[t] = np.float32(v)
     return out
+
+
+def _cells_from_soy_lonlat(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    x_coord: np.ndarray,
+    y_coord: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Unique Xavier cells with soy-pixel counts as weights."""
+    lon = np.asarray(lon, dtype=np.float64).ravel()
+    lat = np.asarray(lat, dtype=np.float64).ravel()
+    if lon.size == 0:
+        return None
+    ny = int(y_coord.shape[0])
+    nx = int(x_coord.shape[0])
+    weights: dict[tuple[int, int], int] = {}
+    for i in range(lon.size):
+        try:
+            ix, iy = lonlat_to_pr_indices(
+                float(lon[i]), float(lat[i]), x_coord, y_coord
+            )
+        except Exception:
+            continue
+        if iy < 0 or iy >= ny or ix < 0 or ix >= nx:
+            continue
+        weights[(ix, iy)] = weights.get((ix, iy), 0) + 1
+    if not weights:
+        return None
+    items = list(weights.items())
+    ix = np.array([k[0] for k, _ in items], dtype=np.int64)
+    iy = np.array([k[1] for k, _ in items], dtype=np.int64)
+    w = np.array([v for _, v in items], dtype=np.float64)
+    return ix, iy, w
+
+
+def harvest_year_from_range(year_range: str) -> int:
+    parts = year_range.strip().split("-")
+    if len(parts) != 2:
+        raise ValueError(f"Expected YYYY-YYYY, got {year_range!r}")
+    return int(parts[1])
 
 
 def _densify_cum_tmin_from_npy(
@@ -284,15 +351,23 @@ def main() -> None:
         raise SystemExit(f"No {{code}}/{{code}}.npy under {npy_root / year_range}")
 
     tmin_from_npy = args.xavier_tmin_nc is None
+    soy_mask = bool(args.soy_mask)
     print(
         f"Daily climate sidecars for {len(jobs)} municipalities, "
-        f"{year_range} ({days[0]}–{days[-1]}, T={len(days)})"
+        f"{year_range} ({days[0]}–{days[-1]}, T={len(days)}) "
+        f"soy_mask={soy_mask}"
     )
     if tmin_from_npy:
         print(
             "  Tmin: densified from cumulative channel 16 in each .npy "
             "(no --xavier-tmin-nc)"
         )
+
+    mapbiomas_path = None
+    if soy_mask:
+        harvest = harvest_year_from_range(year_range)
+        mapbiomas_path = mapbiomas_url(harvest, args.mapbiomas_url_template)
+        print(f"  MapBiomas soy: {mapbiomas_path}")
 
     tmp_paths: list[Path] = []
     try:
@@ -331,18 +406,41 @@ def main() -> None:
             if args.dry_run:
                 counts["dry"] = counts.get("dry", 0) + 1
                 continue
-            ix, iy = _cells_in_geom(geom, x_coord, y_coord)
+
+            cell_weights: np.ndarray | None = None
+            used_soy = False
+            if soy_mask and mapbiomas_path is not None:
+                try:
+                    lon, lat = soy_pixel_lonlat(geom, mapbiomas_path)
+                    soy_cells = _cells_from_soy_lonlat(lon, lat, x_coord, y_coord)
+                except Exception as exc:
+                    print(f"[WARN] {code}: soy mask failed ({exc}); using polygon cells")
+                    soy_cells = None
+                if soy_cells is not None:
+                    ix, iy, cell_weights = soy_cells
+                    used_soy = True
+                else:
+                    print(f"[WARN] {code}: no soy pixels; falling back to polygon cells")
+                    counts["no_soy_fallback"] = counts.get("no_soy_fallback", 0) + 1
+                    ix, iy = _cells_in_geom(geom, x_coord, y_coord)
+            else:
+                ix, iy = _cells_in_geom(geom, x_coord, y_coord)
+
             block = np.full((len(days), N_DAILY_CLIMATE), NO_DATA_VALUE, dtype=np.float32)
             for ch, name in enumerate(CHANNEL_KEYS):
                 if name == "Tmin" and tmin_from_npy:
                     series = _densify_cum_tmin_from_npy(npy_path, days, season_start)
                 else:
                     vals, dmap = name_to_cube[name]
-                    series = _mean_daily_for_cells(vals, dmap, days, ix, iy)
+                    series = _mean_daily_for_cells(
+                        vals, dmap, days, ix, iy, weights=cell_weights
+                    )
                 block[:, ch] = np.where(np.isfinite(series), series, NO_DATA_VALUE)
             dest.parent.mkdir(parents=True, exist_ok=True)
             _save_npy_atomic(dest, block)
             counts["ok"] = counts.get("ok", 0) + 1
+            if used_soy:
+                counts["ok_soy"] = counts.get("ok_soy", 0) + 1
         print("Done:", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
         print(f"Channels {CHANNEL_KEYS} → [T={len(days)}, {N_DAILY_CLIMATE}]")
     finally:

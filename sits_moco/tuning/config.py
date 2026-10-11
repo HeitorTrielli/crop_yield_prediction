@@ -143,8 +143,10 @@ def load_study_config(path: Path | str) -> dict:
     )
     extra_scaler_template = search.get("extra_scaler_template")
     if year_loo is not None:
-        if strategy != "feature_sweep":
-            raise ValueError("search.year_loo is only valid with strategy: feature_sweep")
+        if strategy not in ("feature_sweep", "list"):
+            raise ValueError(
+                "search.year_loo is only valid with strategy: feature_sweep or list"
+            )
         if isinstance(year_loo, (int, str)):
             year_loo = [int(year_loo)]
         elif not isinstance(year_loo, list) or not year_loo:

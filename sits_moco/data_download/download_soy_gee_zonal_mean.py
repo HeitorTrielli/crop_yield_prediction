@@ -1118,34 +1118,68 @@ def ingest_from_drive(args: argparse.Namespace) -> None:
         return
     tmp_dir = Path(args.output_dir).expanduser().resolve() / "_drive_ingest"
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_root = Path(args.output_dir).expanduser().resolve()
     shapefiles = [Path(p).resolve() for p in (args.shapefiles or [])]
     skip = bool(args.skip_existing)
-    n_wrote = n_skip = 0
-    log(f"Ingest {len(files)} Drive CSVs from {args.drive_folder} (no GEE export)")
-    for meta in files:
-        name = meta["name"]
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
+    n_wrote = n_skip = n_fail = 0
+    lock = threading.Lock()
+    log(
+        f"Ingest {len(files)} Drive CSVs from {args.drive_folder} "
+        f"(no GEE export, workers={workers})"
+    )
+
+    def _one(meta: dict) -> tuple[int, int]:
+        name = str(meta["name"])
         dest = tmp_dir / name
+        svc = thread_drive_service(Path(args.credentials_dir))
         log(f"download {name}")
-        download_file_from_drive(drive_service, meta["id"], name, tmp_dir)
+        download_file_from_drive(svc, meta["id"], name, tmp_dir)
         w, s, _ = ingest_chunk_files(
             [dest],
-            Path(args.output_dir).expanduser().resolve(),
+            out_root,
             shapefiles,
             skip,
             harvest,
         )
-        n_wrote += w
-        n_skip += s
         try:
             dest.unlink(missing_ok=True)
         except OSError:
             pass
         if args.delete_drive_after:
             try:
-                delete_file_from_drive(drive_service, meta["id"])
+                delete_file_from_drive(svc, meta["id"])
             except Exception as exc:
                 log(f"{name}: Drive cleanup warning: {exc}")
-    log(f"Ingest done: {n_wrote} new municipality CSVs, {n_skip} already existed")
+        return w, s
+
+    if workers <= 1:
+        for meta in files:
+            try:
+                w, s = _one(meta)
+                n_wrote += w
+                n_skip += s
+            except Exception as exc:
+                n_fail += 1
+                log(f"ingest fail {meta.get('name')}: {exc}")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_one, meta): meta for meta in files}
+            for fut in as_completed(futs):
+                meta = futs[fut]
+                try:
+                    w, s = fut.result()
+                    with lock:
+                        n_wrote += w
+                        n_skip += s
+                except Exception as exc:
+                    with lock:
+                        n_fail += 1
+                    log(f"ingest fail {meta.get('name')}: {exc}")
+    log(
+        f"Ingest done: {n_wrote} new municipality CSVs, {n_skip} already existed"
+        + (f", {n_fail} failed" if n_fail else "")
+    )
 
 
 def ingest_from_dir(args: argparse.Namespace) -> None:

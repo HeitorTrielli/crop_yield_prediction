@@ -107,6 +107,7 @@ class PixelTransform:
         self._extra_channels_slice: tuple[int, int] | None = lay["extra_channels_slice"]
         self._soil_sidecar = bool(lay.get("soil_sidecar"))
         self._climate_sidecar = bool(lay.get("climate_sidecar"))
+        self._soil_only = bool(lay.get("soil_only"))
         self.climate_input_dim = int(lay.get("climate_input_dim") or 0)
         self.climate_sequencelength = int(
             climate_sequencelength
@@ -238,6 +239,40 @@ class PixelTransform:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Normalized features (N,T,F), reflectance weights (N,T), DOY (N,T)."""
         _n, _t, c = chunk_arr.shape
+        if self._soil_only:
+            if soil is None:
+                raise ValueError(
+                    f"Layout {self.feature_layout!r} requires a soil sidecar "
+                    f"[N,{N_SOIL}] passed to features_from_chunk/transform_chunk"
+                )
+            soil_arr = np.asarray(soil, dtype=np.float32)
+            if soil_arr.ndim != 2 or soil_arr.shape[0] != _n:
+                raise ValueError(
+                    f"soil must be [N,{N_SOIL}] with N={_n}, got shape {soil_arr.shape}"
+                )
+            if soil_arr.shape[1] < N_SOIL:
+                raise ValueError(
+                    f"soil must have >= {N_SOIL} channels, got {soil_arr.shape[1]}"
+                )
+            soil_arr = soil_arr[:, :N_SOIL]
+            soil_arr = np.where(
+                (soil_arr == NO_DATA_VALUE) | ~np.isfinite(soil_arr), 0.0, soil_arr
+            )
+            if self.legacy_input_scaling:
+                soil_s = scale_soil_channels_legacy(soil_arr)
+            else:
+                soil_s = scale_soil_channels(soil_arr, scaler=self.extra_scaler())
+            # A single neutral token makes this a genuinely static ablation.
+            # Do not expose Sentinel acquisition count, DOY, masks, or gaps.
+            x = np.ascontiguousarray(soil_s[:, None, :], dtype=np.float32)
+            weight = np.ones((_n, 1), dtype=np.float64)
+            doy = np.zeros((_n, 1), dtype=np.int32)
+            if x.shape[-1] != self.input_feature_dim:
+                raise ValueError(
+                    f"Layout {self.feature_layout!r} produced {x.shape[-1]} features, "
+                    f"expected input_dim={self.input_feature_dim}"
+                )
+            return x, weight, doy
         doy = chunk_arr[:, :, DOY_CHANNEL].astype(np.int32)
         x_spec = chunk_arr[:, :, :NUM_SPECTRAL_CHANNELS].astype(np.float32)
         # Treat preprocess nodata (-9999 / non-finite) like 0 before reflectance scale.
@@ -349,13 +384,16 @@ class PixelTransform:
         if self._climate_sidecar:
             chunk_arr = self._drop_empty_spectral_days(chunk_arr)
         n, t, _ = chunk_arr.shape
-        if t == 0:
+        if t == 0 and not self._soil_only:
             fdim = self.input_feature_dim
             x = np.zeros((n, 0, fdim), dtype=np.float32)
             weight = np.zeros((n, 0), dtype=np.float64)
             doy = np.zeros((n, 0), dtype=np.int32)
         else:
             x, weight, doy = self.features_from_chunk(chunk_arr, soil=soil)
+            # Static layouts intentionally return one token regardless of the
+            # source cube's Sentinel timeline.
+            t = int(x.shape[1])
         fdim = self.input_feature_dim
         seq_len = self.sequencelength
 
