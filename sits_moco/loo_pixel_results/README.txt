@@ -7,11 +7,11 @@ Layout:
         predictions/
         figures/          (scatter, heatmaps, …)
         params.json
-        training/
       muni_mean/          — municipal-mean (average-pixel) pipeline
         predictions/
         figures/productivity_scatter/
         figures/municipal_heatmaps/
+        params.json
 
 Trials:
   pr_rs_trial_063     — best PR+RS year-LOO DualSTNet (both pipelines)
