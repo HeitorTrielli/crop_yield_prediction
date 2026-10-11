@@ -2,7 +2,7 @@
 \label{sec:conclusion}
 
 We presented MSTNet, a multi-frequency Transformer that uses Sentinel-2 time series, daily Xavier climate, and MapBiomas Solo covariates to predict soybean productivity from municipal PAM labels while scoring soy pixels for sub-municipal maps.
-On the 2021 municipality holdout for Paran\'{a} (harvest years 2020--2024), municipal aggregates at the selected epoch reach $R^2=0.424$ and RMSE $=0.313$\,\si{t/ha} on validation, and $R^2=0.398$ and RMSE $=0.309$\,\si{t/ha} on test.
+Under year leave-one-out on Paran\'{a} harvest years 2020--2024, municipal aggregates of pixel scores reach mean $R^2=0.302$ and RMSE $=0.427$\,\si{t/ha} when the 2022 drought fold is excluded; that drought LOO fold fails ($R^2=-0.422$) because no similar season remains in training.
 
-These figures give a reproducible municipal benchmark for the setting we study.
-Calibrated intramunicipal maps and claims about the value of each covariate group still need field checks, matched ablations, and multi-year holdouts.
+These figures give a reproducible LOO benchmark for municipal-supervision, pixel-scoring yield models in Paran\'{a}.
+Calibrated intramunicipal maps, broader geographies, and claims about individual covariate groups still need field checks, matched ablations, and additional LOO seasons.

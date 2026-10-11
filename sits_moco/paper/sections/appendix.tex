@@ -4,7 +4,7 @@
 
 Section~\ref{sec:pixel-formulation} defines the pixel-scoring evaluation~\eqref{eq:pixel-mean-agg}: soy-masked Sentinel-2 pixels are scored one by one, municipal climate is shared across pixels, soil enters by late fusion, and the mean of the pixel predictions is compared with PAM.
 Figure~\ref{fig:data-flow} shows the municipality-mean spectral path used for training.
-Figure~\ref{fig:data-flow-pixel} shows the pixel-by-pixel path used for the reported holdout metrics and for intramunicipal maps.
+Figure~\ref{fig:data-flow-pixel} shows the pixel-by-pixel path used for the reported LOO metrics and for intramunicipal maps.
 At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged over any polygon. That map is not a training target.
 
 \begin{figure*}[t]
@@ -189,3 +189,34 @@ Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate 
 The mean of pixel predictions $\hat{y}_p$ yields $\hat{y}_{m,y}$, which is supervised by IBGE PAM.}
 \label{fig:data-flow-pixel}
 \end{figure*}
+
+\section{Municipal-mean evaluation on LOO years}
+\label{app:muni-mean-loo}
+
+Training encodes soy-masked municipal-mean Sentinel-2 series~\eqref{eq:municipal-mean}.
+Table~\ref{tab:loo-metrics} in the main text instead scores every soy pixel and averages the predictions~\eqref{eq:pixel-mean-agg}.
+Table~\ref{tab:loo-muni-mean} reports the same left-out years under the municipal-mean evaluation path, using the same fold checkpoints.
+The two paths are close on non-drought folds; the 2022 drought fold remains poor under either aggregation ($R^2=-0.300$ municipal-mean versus $-0.422$ pixel-mean).
+Excluding 2022, mean municipal-mean LOO $R^2$ is $0.275$.
+
+\begin{table}[ht]
+\centering
+\caption{Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode).
+Each row evaluates only the listed LOO year with the fold trained on the other four harvest years.
+RMSE and MAE are in \si{t/ha}.}
+\label{tab:loo-muni-mean}
+\begin{tabular}{lcccc}
+\toprule
+LOO year & $n$ & RMSE & MAE & $R^2$ \\
+\midrule
+2020 & 346 & 0.411 & 0.316 & 0.233 \\
+2021 & 343 & 0.320 & 0.239 & 0.410 \\
+2022 & 342 & 1.342 & 1.069 & $-0.300$ \\
+2023 & 339 & 0.433 & 0.345 & 0.199 \\
+2024 & 336 & 0.577 & 0.445 & 0.259 \\
+\midrule
+Mean & --- & 0.617 & 0.483 & 0.160 \\
+Mean excl.\ 2022 & --- & 0.435 & 0.336 & 0.275 \\
+\bottomrule
+\end{tabular}
+\end{table}

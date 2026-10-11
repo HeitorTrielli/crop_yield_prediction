@@ -4,7 +4,7 @@
 The analysis uses municipal PAM productivity labels together with Sentinel-2, daily climate, and soil covariates (Table~\ref{tab:data-sources}).
 Soy-masked Sentinel-2 pixels provide the spectral signal. Climate is reduced to a municipal daily series. Soil can be attached per pixel or as a municipal vector.
 Figure~\ref{fig:data-flow} shows the municipality-mean spectral path used for training.
-Appendix~\ref{app:pixel-pipeline} shows the pixel-by-pixel path used for the reported holdout metrics and for sub-municipal maps.
+Appendix~\ref{app:pixel-pipeline} shows the pixel-by-pixel path used for the reported LOO metrics and for sub-municipal maps.
 
 \begin{table}[t]
 \centering
@@ -206,7 +206,7 @@ Reported evaluation instead scores individual soy pixels and averages them (Appe
 The study covers soybean-producing municipalities in the state of Paran\'{a}, Brazil.
 The target is municipal soybean productivity in tonnes per hectare (\si{t/ha}) from IBGE PAM~\citep{ibgepam}; municipality code and harvest year identify each observation.
 No field- or pixel-level yield labels are used.
-We retain municipality--year pairs whose Sentinel-2 coverage ratio relative to the reported planted area lies in $[0.8, 1.2]$, so that satellite coverage is roughly consistent with official area statistics.
+We retain municipality--year pairs whose Sentinel-2 coverage ratio relative to the reported planted area lies in $[0.5, 1.5]$, so that satellite coverage is roughly consistent with official area statistics.
 
 \subsection{Covariates and municipal aggregation}
 Sentinel-2 L2A reflectance is processed in Google Earth Engine~\citep{gorelick2017gee}: for each municipality and acquisition date we compute soy-masked zonal means of ten bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), using MapBiomas Collection~10 class~39 as the soybean mask~\citep{mapbiomas2025}.
@@ -216,10 +216,9 @@ Daily climate is averaged over Xavier cells whose centers fall in the municipali
 Static MapBiomas Solo properties (clay, silt, sand, and SOC stock at 0--30\,cm) are late-fused in the decoder~\citep{mapbiomassoil2025}.
 An ablation omits climate and soil inputs and uses the ten spectral bands alone.
 
-\subsection{Train / validation / test split}
-Splits follow a year-holdout design on municipalities.
-All municipality--year observations outside the holdout year are used for training; municipalities in the holdout year are partitioned into validation and test sets.
-The holdout year is \textbf{2021}.
-After restricting to harvest years $\{2020,2021,2022,2023,2024\}$, the training set contains 997 municipality--years, while validation and test contain 132 and 123 municipalities in 2021, respectively.
-Training target statistics used for loss normalization are mean $3.17$\,\si{t/ha} and standard deviation $0.93$\,\si{t/ha}.
-All reported metrics are municipal aggregates obtained by averaging pixel-level scores (Section~\ref{sec:pixel-formulation}). We do not validate pixel maps against field yields.
+\subsection{Year leave-one-out splits}
+Evaluation follows year leave-one-out over harvest years $\{2020,2021,2022,2023,2024\}$ (Section~\ref{sec:loo}).
+In each fold, every municipality--year from the four training years is used for fitting; the left-out year is never seen in training and provides the only reported municipal scores for that fold.
+Target standardization is recomputed from each fold's training years.
+All main-text metrics are municipal aggregates obtained by averaging pixel-level scores on the LOO year only (Section~\ref{sec:pixel-formulation}).
+We do not validate pixel maps against field yields.

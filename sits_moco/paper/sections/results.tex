@@ -1,113 +1,74 @@
 \section{Results}
 \label{sec:results}
 
-\subsection{Municipal prediction accuracy}
-Table~\ref{tab:main-metrics} summarizes validation and test metrics for the proposed MSTNet municipal predictor.
-Validation $R^2$ peaks at epoch 12 ($0.424$), with RMSE $0.313$\,\si{t/ha}.
-The corresponding test metrics are $R^2=0.398$ and RMSE $0.309$\,\si{t/ha}.
-The validation and test results are similar, with errors near $0.31$\,\si{t/ha} on the fixed 2021 holdout split.
+\subsection{Year-LOO municipal accuracy}
+Table~\ref{tab:loo-metrics} reports pixel-mean municipal metrics on the left-out year of each fold.
+Across the five folds, mean $R^2$ is $0.157$ and mean RMSE is $0.623$\,\si{t/ha}.
+Excluding the 2022 drought fold, mean $R^2$ rises to $0.302$ and mean RMSE falls to $0.427$\,\si{t/ha}.
+The strongest non-drought fold is 2021 ($R^2=0.402$, RMSE $=0.323$\,\si{t/ha}).
 
 \begin{table}[t]
 \centering
-\caption{Validation and test metrics for the MSTNet municipal predictor at the validation-selected epoch (12). RMSE and MAE are in \si{t/ha}.}
-\label{tab:main-metrics}
-\begin{tabular}{lccc}
-\toprule
-Split & RMSE & MAE & $R^2$ \\
-\midrule
-Validation (2021) & 0.313 & 0.242 & 0.424 \\
-Test (2021)       & 0.309 & 0.237 & 0.398 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Figure~\ref{fig:learning} shows learning dynamics.
-Validation RMSE and $R^2$ improve through epoch 12. After that, validation fluctuates (no learning-rate drop falls in this window), and training stops early at epoch 27 after fifteen epochs without a new validation $R^2$ best.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\textwidth]{learning_curves.pdf}
-\caption{Training dynamics for MSTNet. The dashed line marks the validation-selected epoch (12).}
-\label{fig:learning}
-\end{figure}
-
-\subsection{Spectral-only reference}
-Table~\ref{tab:arch-top} lists the five strongest configurations in the separate spectral-only search. We include them to document the reference run, not to isolate climate or soil effects, since the architecture differs from MSTNet.
-
-\begin{table}[t]
-\centering
-\caption{Top five configurations from the separate spectral-only search (24 completed runs), ranked by validation $R^2$. This is not a matched ablation of MSTNet.}
-\label{tab:arch-top}
-\begin{tabular}{lcccccc}
-\toprule
-Rank & $d_{\mathrm{model}}$ & Heads & $d_{\mathrm{inner}}$ & Dropout & Val $R^2$ & Test $R^2$ \\
-\midrule
-1 & 96 & 8 & 64 & 0.3 & 0.165 & 0.117 \\
-2 & 96 & 4 & 128 & 0.4 & 0.084 & 0.134 \\
-3 & 64 & 4 & 64 & 0.4 & 0.076 & --- \\
-4 & 64 & 4 & 128 & 0.3 & 0.071 & 0.119 \\
-5 & 64 & 4 & 128 & 0.4 & 0.046 & 0.106 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Auxiliary comparisons}
-\label{sec:ablations}
-
-\paragraph{Spectral-only reference.}
-The top spectral-only configuration achieves validation $R^2=0.165$ (RMSE $0.376$\,\si{t/ha}) and test $R^2=0.117$ (RMSE $0.375$\,\si{t/ha}).
-MSTNet is stronger on this split, but the experiments also differ in architecture and optimization, not only in which covariates are available. Attributing the gap to climate or soil would need a controlled modality ablation with the same network and training protocol.
-
-\paragraph{Temporal pooling.}
-With the best spectral-only architecture fixed, replacing NDVI-weighted temporal pooling by mean pooling over valid timesteps reduces validation $R^2$ from $0.165$ to $0.049$ (best epoch 12), while test $R^2$ remains nearly unchanged ($0.117$).
-NDVI-weighted pooling improves validation fit in this spectral-only comparison, but this improvement does not translate into a clear test gain on the single holdout year.
-
-\subsection{Per-year municipal diagnostics}
-Figure~\ref{fig:scatter} shows predicted versus observed municipal productivity by harvest year.
-The 2021 value ($R^2=0.395$) agrees closely with the checkpoint's held-out test metric.
-In 2022, $R^2$ is $0.612$ but RMSE increases to $0.709$\,\si{t/ha}. This combination is possible because $R^2$ measures relative variation around that year's mean, while RMSE measures errors in the original productivity scale. Results for 2023--2024 are intermediate (Table~\ref{tab:per-year}).
-
-\begin{figure}[t]
-\centering
-\includegraphics[height=0.45\textheight,keepaspectratio]{scatter_panel.pdf}
-\caption{Predicted versus observed municipal soybean productivity (\si{t/ha}) for MSTNet.
-Top: holdout year 2021 (validation and test municipalities). Bottom: remaining harvest years in a $2\times 2$ panel.
-Points are colored by split. The dashed line is identity.}
-\label{fig:scatter}
-\end{figure}
-
-\begin{table}[t]
-\centering
-\caption{Per-year municipal prediction metrics for MSTNet.}
-\label{tab:per-year}
+\caption{Year leave-one-out metrics for MSTNet (pixel-by-pixel scores averaged to municipalities).
+Each row is a fold that trains on the other four harvest years and evaluates only the listed LOO year.
+RMSE and MAE are in \si{t/ha}.}
+\label{tab:loo-metrics}
 \begin{tabular}{lcccc}
 \toprule
-Year & $n$ & RMSE & MAE & $R^2$ \\
+LOO year & $n$ & RMSE & MAE & $R^2$ \\
 \midrule
-2020 & 249 & 0.384 & 0.313 & 0.101 \\
-2021 & 255 & 0.316 & 0.244 & 0.395 \\
-2022 & 240 & 0.709 & 0.568 & 0.612 \\
-2023 & 248 & 0.405 & 0.322 & 0.304 \\
-2024 & 260 & 0.531 & 0.409 & 0.374 \\
+2020 & 346 & 0.395 & 0.316 & 0.291 \\
+2021 & 343 & 0.323 & 0.244 & 0.402 \\
+2022 & 342 & 1.404 & 1.136 & $-0.422$ \\
+2023 & 339 & 0.424 & 0.337 & 0.231 \\
+2024 & 336 & 0.568 & 0.439 & 0.284 \\
+\midrule
+Mean & --- & 0.623 & 0.495 & 0.157 \\
+Mean excl.\ 2022 & --- & 0.427 & 0.334 & 0.302 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Figure~\ref{fig:map2021} maps municipal prediction error in the 2021 holdout year.
-Figure~\ref{fig:guara} shows an intramunicipal example: pixel-level productivity scores for Guarapuava under the same checkpoint.
+\subsection{Drought year 2022}
+Harvest 2022 is the only year in our 2020--2024 sample with a severe drought across Paran\'{a}.
+When 2022 is the LOO year, the training set contains no analogous drought season, so the model must extrapolate outside the climatic regimes seen in training.
+That fold collapses: $R^2=-0.422$ and RMSE $=1.404$\,\si{t/ha}, far worse than the other LOO years.
+Figure~\ref{fig:map2022} shows the corresponding municipal error map.
+The remaining folds, trained with 2022 available when another year is held out, do not face that missing-regime problem to the same degree.
+We therefore treat 2022 as a stress test of out-of-distribution seasons rather than as a typical LOO score, and we report means both with and without that fold.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\textwidth]{map_error_2022.png}
+\caption{Municipal aggregate prediction error map for LOO year 2022 (drought fold).}
+\label{fig:map2022}
+\end{figure}
+
+\subsection{Scatterplots and spatial examples}
+Figure~\ref{fig:scatter} shows predicted versus observed municipal productivity for every LOO year.
+Non-drought folds track the identity line with moderate scatter; the 2022 panel shows the systematic failure under drought.
+Figure~\ref{fig:map2021} maps municipal errors for the 2021 LOO fold.
+Figure~\ref{fig:guara} shows pixel-level scores for Guarapuava under the 2021 LOO checkpoint.
 That map is qualitative; we have no field yields to score it against, only the municipal PAM total when the pixels are averaged.
 
 \begin{figure}[t]
 \centering
+\includegraphics[width=\linewidth,height=0.42\textheight,keepaspectratio]{scatter_panel.pdf}
+\caption{Predicted versus observed municipal soybean productivity (\si{t/ha}) for each year-LOO fold of MSTNet.
+Every panel evaluates only the left-out year. The dashed line is identity.}
+\label{fig:scatter}
+\end{figure}
+
+\begin{figure}[t]
+\centering
 \includegraphics[width=0.72\textwidth]{map_error_2021.png}
-\caption{Municipal aggregate prediction error map for harvest year 2021 (holdout).}
+\caption{Municipal aggregate prediction error map for LOO year 2021.}
 \label{fig:map2021}
 \end{figure}
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.72\textwidth]{guarapuava_heatmap.png}
-\caption{Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (holdout year 2021).}
+\caption{Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (LOO year 2021).}
 \label{fig:guara}
 \end{figure}
-

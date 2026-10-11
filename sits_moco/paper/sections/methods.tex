@@ -31,8 +31,9 @@ Training uses a cheaper surrogate: soy-masked Sentinel-2 reflectance is averaged
 so each municipality--year is one forward pass
 $\hat{y}_{m,y}^{\mathrm{train}}=f_\theta(\bar{\mathbf{x}}_{m,y},\mathbf{c}_{m,y},\mathbf{s}_m)$
 supervised by PAM.
-The holdout metrics in Sections~\ref{sec:experiments}--\ref{sec:results} are not from that surrogate: they apply the trained weights pixel by pixel and aggregate with~\eqref{eq:pixel-mean-agg}.
+The LOO metrics in Sections~\ref{sec:experiments}--\ref{sec:results} are not from that surrogate: they apply the trained weights pixel by pixel and aggregate with~\eqref{eq:pixel-mean-agg}.
 Because $f_\theta$ is nonlinear, mean-then-encode and encode-then-mean need not coincide; the pixel-mean evaluation is the operational downscaling check.
+Appendix~\ref{app:muni-mean-loo} reports the same LOO years under the municipal-mean evaluation path for reference.
 
 \subsection{Architecture}
 MSTNet (\emph{Multi} STNet) places one STNet trunk on each time-varying stream so that modalities with different sampling rates need not share a common calendar~\citep{xu2024sitsmoco}.
@@ -42,7 +43,7 @@ MapBiomas Solo properties are fixed once the harvest year is known. They are con
 As an ablation on a spectral-only single-trunk STNet, we also try mean pooling over valid spectral timesteps instead of NDVI weights.
 That spectral-only model uses ten-band inputs and has no climate or soil branches.
 
-Each MSTNet trunk uses one Transformer layer, $d_{\mathrm{model}}=128$, two attention heads, feed-forward width $d_{\mathrm{inner}}=256$, and dropout $0.4$.
+Each MSTNet trunk uses one Transformer layer, $d_{\mathrm{model}}=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=64$, and dropout $0.4$.
 
 \subsection{Loss and optimization}
 Training minimizes mean squared error between predicted and observed municipal productivity after standardizing targets with the training-set mean and standard deviation.

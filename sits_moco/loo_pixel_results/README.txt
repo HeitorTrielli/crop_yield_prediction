@@ -7,7 +7,6 @@ Layout:
         predictions/
         figures/          (scatter, heatmaps, …)
         params.json
-        training/
       muni_mean/          — municipal-mean (average-pixel) pipeline
         predictions/
         figures/productivity_scatter/

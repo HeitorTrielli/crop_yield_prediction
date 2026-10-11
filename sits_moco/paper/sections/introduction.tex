@@ -12,8 +12,8 @@ Predictions are defined per soy pixel.
 For speed, training fits the network on municipality-mean Sentinel-2 series supervised by PAM.
 At evaluation and inference we apply the same weights to every soy pixel and average the scores to municipalities (or to any other polygon) without retraining.
 
-We run the experiments on soybean municipalities in Paran\'{a} for harvest years 2020--2024 and hold out 2021 for validation and test.
-Because PAM is the only supervised target, the numbers we report are municipal: holdout $R^2$, RMSE, and related diagnostics on municipal aggregates.
-We are not aware of many yield studies that train a multi-frequency Transformer on municipal labels while still exposing pixel scores for downscaling. Matched baselines for that setup are scarce, so we present the municipal holdout as a reproducible benchmark rather than a direct comparison against the literature.
+We run the experiments on soybean municipalities in Paran\'{a} for harvest years 2020--2024 under year leave-one-out: each fold trains on four years and scores only the left-out year.
+Because PAM is the only supervised target, the numbers we report are municipal aggregates of pixel scores on those LOO years.
+We are not aware of many yield studies that train a multi-frequency Transformer on municipal labels while still exposing pixel scores for downscaling. Matched baselines for that setup are scarce, so we present the LOO benchmark rather than a direct comparison against the literature.
 
-Our contributions are MSTNet itself, the pixel-scoring setup that turns municipal supervision into sub-municipal maps, and a fixed 2021 municipality holdout for Paran\'{a} over 2020--2024.
+Our contributions are MSTNet itself, the pixel-scoring setup that turns municipal supervision into sub-municipal maps, and a five-fold year-LOO evaluation for Paran\'{a} over 2020--2024.

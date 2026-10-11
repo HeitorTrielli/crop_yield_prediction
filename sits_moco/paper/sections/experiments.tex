@@ -3,20 +3,24 @@
 
 \subsection{Proposed model}
 The proposed model is MSTNet: one STNet trunk for Sentinel-2, one for daily Xavier climate (precipitation, ETo, Rs, Tmax, and Tmin), and late fusion of MapBiomas Solo properties in the decoder.
-Each trunk uses one Transformer layer with $d_{\mathrm{model}}=128$, two attention heads, $d_{\mathrm{inner}}=256$, and dropout $0.4$.
-Reported metrics apply the selected weights pixel by pixel and average the scores to municipalities (Section~\ref{sec:pixel-formulation}). We select the epoch with the highest validation $R^2$ of those municipal aggregates; that epoch is 12.
-The selected checkpoint is evaluated once on the held-out test municipalities.
+Each trunk uses one Transformer layer with $d_{\mathrm{model}}=128$, four attention heads, $d_{\mathrm{inner}}=64$, and dropout $0.4$.
+Training fits municipality-mean Sentinel-2 series; reported metrics apply the selected weights pixel by pixel and average the scores to municipalities (Section~\ref{sec:pixel-formulation}).
 
-\subsection{Spectral-only reference}
-For context, we report results from a separate grid search using spectral inputs only:
-$d_{\mathrm{model}}\in\{64,96,128\}$, number of heads $\in\{4,8\}$, $d_{\mathrm{inner}}\in\{64,128\}$, and dropout $\in\{0.3,0.4\}$, with a single Transformer layer.
-Twenty-four configurations completed successfully.
-The best spectral-only model ($d_{\mathrm{model}}=96$, eight heads, $d_{\mathrm{inner}}=64$, dropout $0.3$) is reported as a reference. It differs from MSTNet in both inputs and architecture, so this is not a controlled estimate of what climate or soil add on their own.
+\subsection{Year leave-one-out design}
+\label{sec:loo}
+We evaluate temporal generalization with year leave-one-out (LOO) over harvest years $\{2020,2021,2022,2023,2024\}$.
+For each fold with holdout year $Y$:
+\begin{itemize}
+  \item all municipality--years with harvest year $\neq Y$ are used for training;
+  \item year $Y$ is held out entirely (no municipality from $Y$ enters training);
+  \item model selection within the fold uses validation $R^2$ on year $Y$;
+  \item the reported fold score is the pixel-mean municipal evaluation on year $Y$ only.
+\end{itemize}
+Input standardization is refit on each fold's training years.
+This yields five independently trained checkpoints, one per left-out year.
+Main-text tables and figures report only those LOO-year scores.
+Appendix~\ref{app:muni-mean-loo} records the municipal-mean evaluation path on the same LOO years.
 
 \subsection{Evaluation protocol}
-Held-out evaluation compares municipal predictions with PAM labels on the 2021 validation and test municipalities.
-We also report learning curves, predicted-versus-observed municipal scatterplots for harvest years 2020--2024, and a municipal error map for the 2021 holdout.
-
-\subsection{Ablations}
-We report two auxiliary comparisons: the spectral-only reference above, and a temporal-pooling comparison that swaps NDVI-weighted pooling for mean pooling over valid timesteps in the spectral-only architecture. These are descriptive checks, not controlled multimodal ablations.
-
+For each LOO fold we compare municipal aggregates of pixel predictions with PAM labels on the held-out year.
+We report per-fold RMSE, MAE, and $R^2$, predicted-versus-observed scatterplots for every LOO year, a municipal error map for a non-drought fold (2021), and a qualitative intramunicipal map for Guarapuava.

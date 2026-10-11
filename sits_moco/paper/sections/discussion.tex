@@ -1,18 +1,18 @@
 \section{Discussion}
 \label{sec:discussion}
 
-On the 2021 municipality holdout, validation and test stay close: RMSE is about $0.31$\,\si{t/ha}, with $R^2=0.424$ on validation and $R^2=0.398$ on test. That agreement suggests the selected epoch did not overfit the validation partition hard, but it says little about other years.
+Year leave-one-out gives a clearer picture of temporal risk than a single fixed holdout.
+On non-drought folds, municipal aggregates of pixel scores reach $R^2$ between $0.23$ and $0.40$, with RMSE about $0.32$--$0.57$\,\si{t/ha}.
+The pooled mean excluding 2022 is $R^2=0.302$ and RMSE $=0.427$\,\si{t/ha}.
 
-MSTNet beats the separately tuned spectral-only reference on this split. The gap is interesting, yet we cannot pin it on climate or soil alone: the two experiments also differ in architecture and optimization. A fairer ablation would freeze those choices and add climate and soil one at a time.
+The 2022 fold is the exception that matters for operations.
+It is the only drought year in the sample, so leaving it out removes every training example from that regime.
+The resulting negative $R^2$ and RMSE above $1.4$\,\si{t/ha} show that the present covariates and capacity do not invent drought behaviour from wetter years alone.
+When 2022 remains in training and another year is held out, LOO skill is much more stable.
+Any operational deployment should therefore monitor season type explicitly and avoid treating a single mild year as representative.
 
-The spectral-only search preferred a small Transformer, while MSTNet uses a larger two-trunk design. Together with the validation swings after epoch 12, that points to capacity and optimization as first-order factors. Repeated seeds or a nested selection protocol would make that sensitivity clearer.
-
-The 2022 numbers show why $R^2$ alone is not enough. Cross-municipality $R^2$ reaches $0.612$, but RMSE climbs to $0.709$\,\si{t/ha}, well above the 2021 level. Operational reports should keep both absolute error and explained variance, and they should call out drought years explicitly.
-
-In the spectral-only architecture, NDVI-weighted temporal pooling raised validation $R^2$ relative to mean pooling, while test $R^2$ barely moved. That looks more like a model-selection effect than a reliable generalization gain.
-
-Because scores are defined per pixel, municipal PAM labels can in principle support downscaling to arbitrary sub-municipal shapes (Figure~\ref{fig:guara}).
-The numbers in this paper evaluate municipal aggregates of those pixel scores; they do not check intramunicipal maps against field yields.
-Training itself used municipality-mean Sentinel-2 series for speed, so the reported skill is a transfer check of those weights under encode-then-mean evaluation.
-We also have only one holdout year, no repeated runs, few matched external baselines for this training setup, and clear sensitivity to unusual seasons.
-Next steps are multi-year and geographic holdouts, controlled ablations, stronger baselines, and independent yield data when the goal is spatially resolved accuracy.
+Because scores are defined per pixel, municipal PAM labels can still support downscaling to arbitrary sub-municipal shapes (Figure~\ref{fig:guara}).
+The numbers here evaluate municipal aggregates of those pixel scores; they do not check intramunicipal maps against field yields.
+Training used municipality-mean Sentinel-2 series for speed, so LOO skill is a transfer check under encode-then-mean evaluation.
+Other limitations are the single-state geography, no repeated seeds, and scarce matched external baselines.
+Next steps are multi-state LOO, controlled modality ablations, stronger baselines, and independent yield data when spatially resolved accuracy is required.
