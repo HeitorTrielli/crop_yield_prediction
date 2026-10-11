@@ -32,15 +32,7 @@
 \begin{document}
 \maketitle
 
-\begin{abstract}
-Official crop productivity is often available only for coarse administrative units, such as municipalities in Brazil and similar units in many other countries. Monitoring and insurance, however, frequently need estimates at the field scale or for other sub-municipal regions.
-We propose MSTNet (\emph{Multi} STNet), a Transformer model that combines data sampled at different temporal frequencies. Separate STNet trunks encode soy-masked Sentinel-2 time series and a daily gridded climate series, while annual soil properties enter the decoder by late fusion.
-The model predicts one value per soy pixel. Training uses municipality-mean Sentinel-2 series under PAM supervision; at evaluation the same weights score every soy pixel and average to municipalities, so arbitrary polygons can be formed at inference without retraining.
-We evaluate in Paran\'{a}, Brazil, with year leave-one-out over harvest years 2020--2024, reporting only the left-out year in each fold.
-Excluding the 2022 drought fold, mean LOO $R^2$ is $0.302$; when 2022 itself is left out, performance collapses because no comparable drought year remains in training.
-Direct comparison with earlier work is limited for this municipal-supervision, pixel-scoring setting; we report the LOO benchmark and leave field-referenced checks for future work.
-\end{abstract}
-
+\input{sections/abstract}
 \input{sections/introduction}
 \input{sections/data}
 \input{sections/methods}
@@ -48,13 +40,7 @@ Direct comparison with earlier work is limited for this municipal-supervision, p
 \input{sections/results}
 \input{sections/discussion}
 \input{sections/conclusion}
-
-\section*{Data availability}
-Municipal productivity labels are from IBGE PAM and provide the only supervised signal.
-Sentinel-2 L2A reflectance was processed in Google Earth Engine with MapBiomas soybean masking; daily Xavier climate and MapBiomas Solo enter as described in Section~\ref{sec:data}.
-Training uses municipality-mean Sentinel-2 series; reported evaluation scores soy pixels and averages to municipalities (Sections~\ref{sec:methods} and~\ref{app:pixel-pipeline}).
-Further details are available from the authors upon reasonable request.
-
+\input{sections/data_availability}
 \input{sections/appendix}
 
 \bibliographystyle{plainnat}

@@ -4,28 +4,22 @@ Journal-style manuscript on MSTNet: multi-frequency STNet trunks for Sentinel-2 
 
 ## Build
 
-From this directory:
+From the repo root (PowerShell recommended on Windows):
 
-```bash
-pdflatex main.tex
-bibtex main
-pdflatex main.tex
-pdflatex main.tex
+```powershell
+.\paper\build.ps1           # text / bibliography only
+.\paper\build.ps1 -Figures  # also regenerate figures first
 ```
 
-Or:
+Or with Git Bash:
 
 ```bash
-latexmk -pdf main.tex
+bash paper/build.sh
+bash paper/build.sh --figures
 ```
+
+Uses `latexmk` when available, otherwise `pdflatex` + `bibtex` + two more `pdflatex` passes.
 
 Requires a TeX distribution with `natbib`, `booktabs`, `siunitx`, `graphicx`, `hyperref`, `multirow`, `makecell`, and `tikz`.
 
-## Regenerate figures
-
-```bash
-python generate_figures.py
-```
-
-Rebuilds learning-curve and scatter-panel figures from
-`results/tuning/productivity_muni_mean_dual_stnet/trial_859` (configured in that script).
+Figures are pulled from `loo_pixel_results/pr_only_trial_005` via `generate_figures.py`.
