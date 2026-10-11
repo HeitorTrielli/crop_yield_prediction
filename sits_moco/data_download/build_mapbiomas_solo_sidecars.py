@@ -7,15 +7,15 @@ Does not modify the time-series .npy.
 Modes:
   pixel      — sample clay/silt/sand + SOC at soy-pixel centroids (needs --tiff-root
                daily TIFFs matching preprocess geometry).
-  muni_mean  — municipal zonal means from shapefiles, broadcast to [N,4]
-               (no daily TIFFs; use when files/daily_tiff is not ready yet).
+  muni_mean  — municipal means from shapefiles, broadcast to [N,4]
+               (default: MapBiomas soy-masked; use --no-soy-mask for full polygon).
 
 Output: {npy_root}/{year_range}/{code}/{code}_soil.npy
   channels: clay_pct, silt_pct, sand_pct, soc_t_ha
 
 Examples:
   python data_download/build_mapbiomas_solo_sidecars.py \\
-    --mode muni_mean --npy-root ~/sits_moco_data/npy \\
+    --mode muni_mean --npy-root ~/sits_moco_data/npy_muni_mean_soy \\
     --solo-dir files/mapbiomas_solo --year-range 2020-2021 -j 4
 
   python data_download/build_mapbiomas_solo_sidecars.py \\
@@ -46,6 +46,7 @@ if str(_REPO) not in sys.path:
 from data_download.append_xavier_climate_to_npy import (  # noqa: E402
     _pixel_geometry_from_tiffs,
 )
+from data_download.bdc_zonal import mapbiomas_url, soy_pixel_lonlat  # noqa: E402
 from data_download.xavier_rain_for_daily_npy import pixel_centroids_lonlat  # noqa: E402
 from preprocessing.preprocess_daily_to_npy import (  # noqa: E402
     NO_DATA_VALUE,
@@ -130,6 +131,21 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional comma-separated municipality codes",
+    )
+    p.add_argument(
+        "--soy-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For --mode muni_mean: average Solo over MapBiomas soy pixels "
+            "(default: on). Use --no-soy-mask for full-polygon zonal means."
+        ),
+    )
+    p.add_argument(
+        "--mapbiomas-url-template",
+        type=str,
+        default=None,
+        help="Optional MapBiomas COG URL template with {year} (soy-mask mode)",
     )
     return p.parse_args()
 
@@ -302,6 +318,8 @@ def compute_muni_soil_means(
     soc_path: Path,
     *,
     codes_filter: set[str] | None,
+    soy_mask: bool = True,
+    mapbiomas_path: str | None = None,
 ) -> dict[str, np.ndarray]:
     """code -> [4] clay/silt/sand/soc municipal means."""
     shps: list[Path] = []
@@ -318,7 +336,13 @@ def compute_muni_soil_means(
         raise SystemExit(f"No shapefiles under {shapefile_dir}")
 
     clay_src, silt_src, sand_src, separate = _open_texture_bands(texture_paths)
+    soil_cache: _SoilRasterCache | None = None
+    if soy_mask:
+        if not mapbiomas_path:
+            raise SystemExit("soy_mask requires mapbiomas_path")
+        soil_cache = _SoilRasterCache(texture_paths, soc_path)
     means: dict[str, np.ndarray] = {}
+    n_soy = n_fallback = 0
     try:
         with rasterio.open(soc_path) as soc:
             for shp in tqdm(shps, desc="Zonal means", unit="shp"):
@@ -334,16 +358,44 @@ def compute_muni_soil_means(
                 if codes_filter is not None and code not in codes_filter:
                     continue
                 geoms = list(gdf.to_crs(SOIL_CRS).geometry)
-                if separate:
-                    clay = _mean_masked(clay_src, geoms, 1)
-                    silt = _mean_masked(silt_src, geoms, 1)
-                    sand = _mean_masked(sand_src, geoms, 1)
-                else:
-                    clay = _mean_masked(clay_src, geoms, 1)
-                    silt = _mean_masked(clay_src, geoms, 2)
-                    sand = _mean_masked(clay_src, geoms, 3)
-                soc_v = _mean_masked(soc, geoms, 1)
-                row = np.array([clay, silt, sand, soc_v], dtype=np.float32)
+                geom_wgs = gdf.to_crs("EPSG:4326").geometry.iloc[0]
+
+                row: np.ndarray | None = None
+                if soy_mask and soil_cache is not None and mapbiomas_path is not None:
+                    try:
+                        lon, lat = soy_pixel_lonlat(geom_wgs, mapbiomas_path)
+                    except Exception as exc:
+                        print(f"[WARN] {code}: soy mask failed ({exc}); polygon mean")
+                        lon = lat = np.array([], dtype=np.float64)
+                    if lon.size > 0:
+                        samples = soil_cache.sample(lon, lat)
+                        with np.errstate(all="ignore"):
+                            valid = samples != SOIL_NODATA
+                            col_means = []
+                            for c in range(N_SOIL):
+                                vals = samples[:, c]
+                                m = valid[:, c] & np.isfinite(vals)
+                                col_means.append(
+                                    float(np.nanmean(vals[m])) if np.any(m) else float("nan")
+                                )
+                            row = np.asarray(col_means, dtype=np.float32)
+                            n_soy += 1
+                    else:
+                        print(f"[WARN] {code}: no soy pixels; falling back to polygon mean")
+                        n_fallback += 1
+
+                if row is None:
+                    if separate:
+                        clay = _mean_masked(clay_src, geoms, 1)
+                        silt = _mean_masked(silt_src, geoms, 1)
+                        sand = _mean_masked(sand_src, geoms, 1)
+                    else:
+                        clay = _mean_masked(clay_src, geoms, 1)
+                        silt = _mean_masked(clay_src, geoms, 2)
+                        sand = _mean_masked(clay_src, geoms, 3)
+                    soc_v = _mean_masked(soc, geoms, 1)
+                    row = np.array([clay, silt, sand, soc_v], dtype=np.float32)
+
                 row = np.where(np.isfinite(row), row, SOIL_NODATA).astype(np.float32)
                 means[code] = row
     finally:
@@ -351,6 +403,10 @@ def compute_muni_soil_means(
         if separate:
             silt_src.close()
             sand_src.close()
+        if soil_cache is not None:
+            del soil_cache
+    if soy_mask:
+        print(f"  soy-masked means={n_soy}, polygon fallback={n_fallback}")
     return means
 
 
@@ -535,7 +591,8 @@ def main() -> None:
 
     print(
         f"Build soil sidecars mode={args.mode} for {len(jobs)} municipalities, "
-        f"year-range={year_range} harvest={harvest}, dry_run={args.dry_run}"
+        f"year-range={year_range} harvest={harvest}, dry_run={args.dry_run}, "
+        f"soy_mask={bool(args.soy_mask) if args.mode == 'muni_mean' else 'n/a'}"
     )
     print(f"  texture: {texture_paths}")
     print(f"  soc:     {soc_path}")
@@ -549,11 +606,17 @@ def main() -> None:
         if not shp_dir.is_dir():
             raise SystemExit(f"Not a directory: {shp_dir}")
         print(f"  shapefiles: {shp_dir}")
+        mapbiomas_path = None
+        if args.soy_mask:
+            mapbiomas_path = mapbiomas_url(harvest, args.mapbiomas_url_template)
+            print(f"  MapBiomas soy: {mapbiomas_path}")
         means = compute_muni_soil_means(
             shp_dir,
             texture_paths,
             soc_path,
             codes_filter={c for c, _, _ in jobs},
+            soy_mask=bool(args.soy_mask),
+            mapbiomas_path=mapbiomas_path,
         )
         print(f"  zonal means for {len(means)} municipalities")
         for code, npy_path, soil_path in tqdm(jobs, desc="Write sidecars", unit="muni"):

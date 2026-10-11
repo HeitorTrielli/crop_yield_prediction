@@ -3,6 +3,10 @@
 Soil is static, so it is never sent through either transformer. When the
 spectral cube includes MapBiomas Solo sidecars, they are stripped before the
 spectral encoder and concatenated with both pooled embeddings (late fusion).
+
+Modality ablations may omit either trunk via ``use_spectral`` / ``use_climate``
+(climate-only or spectral-only DualSTNet). At least one of spectral, climate,
+or late soil must remain.
 """
 
 from __future__ import annotations
@@ -47,6 +51,8 @@ class DualSTNetRegression(nn.Module):
         soil_fusion: str = "late",
         soil_dim: int = 4,
         input_dim: int | None = None,
+        use_spectral: bool = True,
+        use_climate: bool = True,
     ):
         super().__init__()
         self.modelname = "DualSTNetRegression"
@@ -59,6 +65,12 @@ class DualSTNetRegression(nn.Module):
         self.soil_dim = int(soil_dim)
         self.spectral_dim = int(spectral_dim)
         self.climate_dim = int(climate_dim)
+        self.use_spectral = bool(use_spectral)
+        self.use_climate = bool(use_climate)
+        if not self.use_spectral and not self.use_climate and self.soil_fusion != "late":
+            raise ValueError(
+                "DualSTNet needs use_spectral, use_climate, and/or late soil fusion"
+            )
         # Cube width seen by the dataloader (spectral ± soil). Used by inference helpers.
         if input_dim is None:
             extra = self.soil_dim if self.soil_fusion == "late" else 0
@@ -80,25 +92,35 @@ class DualSTNetRegression(nn.Module):
             max_temporal_shift=max_temporal_shift,
             attn_pool_queries=attn_pool_queries,
         )
-        self.spectral = STNetEncoder(
-            input_dim=self.spectral_dim,
-            max_seq_len=max_seq_len,
-            temporal_pooling=temporal_pooling,
-            **enc_kw,
-        )
-        clim_pool = climate_pooling
-        if clim_pool == "ndvi":
-            clim_pool = "mean"
-        self.climate = STNetEncoder(
-            input_dim=self.climate_dim,
-            max_seq_len=climate_max_seq_len,
-            temporal_pooling=clim_pool,
-            **enc_kw,
-        )
+        self.spectral: STNetEncoder | None = None
+        self.climate: STNetEncoder | None = None
+        if self.use_spectral:
+            self.spectral = STNetEncoder(
+                input_dim=self.spectral_dim,
+                max_seq_len=max_seq_len,
+                temporal_pooling=temporal_pooling,
+                **enc_kw,
+            )
+        if self.use_climate:
+            clim_pool = climate_pooling
+            if clim_pool == "ndvi":
+                clim_pool = "mean"
+            self.climate = STNetEncoder(
+                input_dim=self.climate_dim,
+                max_seq_len=climate_max_seq_len,
+                temporal_pooling=clim_pool,
+                **enc_kw,
+            )
 
-        decoder_in = self.spectral.out_dim + self.climate.out_dim
+        decoder_in = 0
+        if self.spectral is not None:
+            decoder_in += self.spectral.out_dim
+        if self.climate is not None:
+            decoder_in += self.climate.out_dim
         if self.soil_fusion == "late":
             decoder_in = decoder_in + self.soil_dim
+        if decoder_in <= 0:
+            raise ValueError("DualSTNet decoder has empty input")
 
         layers = []
         decoder = [decoder_in, 64, 32, num_outputs]
@@ -136,19 +158,22 @@ class DualSTNetRegression(nn.Module):
                 "(x_s2, mask_s2, doy_s2, weight_s2, x_clim, mask_clim, doy_clim, weight_clim)"
             )
         x_s2, mask_s2, doy_s2, w_s2, x_c, mask_c, doy_c, w_c = x
-        x_s2, soil = self._split_soil(x_s2, mask_s2)
-        if x_s2.size(-1) != self.spectral_dim:
-            raise ValueError(
-                f"Spectral cube has C={x_s2.size(-1)}, encoder expects {self.spectral_dim}"
-            )
-        if x_c.size(-1) != self.climate_dim:
-            raise ValueError(
-                f"Climate cube has C={x_c.size(-1)}, encoder expects {self.climate_dim}"
-            )
-
-        emb_s2 = self.spectral(x_s2, mask_s2, doy_s2, w_s2)
-        emb_c = self.climate(x_c, mask_c, doy_c, w_c)
-        parts = [emb_s2, emb_c]
+        x_spec, soil = self._split_soil(x_s2, mask_s2)
+        parts: list[torch.Tensor] = []
+        if self.spectral is not None:
+            if x_spec.size(-1) != self.spectral_dim:
+                raise ValueError(
+                    f"Spectral cube has C={x_spec.size(-1)}, encoder expects {self.spectral_dim}"
+                )
+            parts.append(self.spectral(x_spec, mask_s2, doy_s2, w_s2))
+        if self.climate is not None:
+            if x_c.size(-1) != self.climate_dim:
+                raise ValueError(
+                    f"Climate cube has C={x_c.size(-1)}, encoder expects {self.climate_dim}"
+                )
+            parts.append(self.climate(x_c, mask_c, doy_c, w_c))
         if soil is not None:
             parts.append(soil)
+        if not parts:
+            raise ValueError("DualSTNet forward produced no modality embeddings")
         return self.decoder(torch.cat(parts, dim=-1))

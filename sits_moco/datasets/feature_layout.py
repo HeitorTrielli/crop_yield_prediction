@@ -76,6 +76,54 @@ _LAYOUT: dict[str, dict[str, Any]] = {
             "{code}_soil.npy."
         ),
     },
+    "spectral_soil": {
+        "input_dim": 14,
+        "spectral_dim": 10,
+        "extra_channels_slice": None,
+        "soil_sidecar": True,
+        "description": (
+            "10 S2 bands + 4 MapBiomas Solo late-fused into the STNet decoder "
+            "(no daily climate trunk). Requires {code}_soil.npy."
+        ),
+    },
+    "dual_daily_climate": {
+        "input_dim": 10,
+        "spectral_dim": 10,
+        "climate_input_dim": 5,
+        "climate_sidecar": True,
+        "use_spectral": False,
+        "extra_channels_slice": None,
+        "description": (
+            "Climate-only DualSTNet ablation: daily Xavier trunk only "
+            "(spectral cube loaded for batching but not encoded). "
+            "Requires {code}_climate_daily.npy."
+        ),
+    },
+    "dual_daily_climate_soil": {
+        "input_dim": 14,
+        "spectral_dim": 10,
+        "climate_input_dim": 5,
+        "climate_sidecar": True,
+        "soil_sidecar": True,
+        "use_spectral": False,
+        "extra_channels_slice": None,
+        "description": (
+            "Climate + soil DualSTNet ablation: daily Xavier trunk + late soil "
+            "(no Sentinel encoder). Requires climate + soil sidecars."
+        ),
+    },
+    "soil": {
+        "input_dim": 4,
+        "extra_channels_slice": None,
+        "soil_sidecar": True,
+        "soil_only": True,
+        "static_input": True,
+        "description": (
+            "MapBiomas Solo only (4 static channels through an MLP regression "
+            "head; no Sentinel values, dates, masks, or temporal encoder). "
+            "Requires {code}_soil.npy."
+        ),
+    },
     "daily_climate": {
         "input_dim": 5,
         "extra_channels_slice": None,
@@ -131,6 +179,14 @@ _ALIASES: dict[str, str] = {
     "dual_s2_daily_climate_soil": "dual_spectral_daily_climate_soil",
     "dual_megapixel": "dual_spectral_daily_climate",
     "dual_megapixel_soil": "dual_spectral_daily_climate_soil",
+    "s2_soil": "spectral_soil",
+    "spectral_solo": "spectral_soil",
+    "dual_climate": "dual_daily_climate",
+    "dual_climate_soil": "dual_daily_climate_soil",
+    "climate_only_yield": "dual_daily_climate",
+    "climate_soil_yield": "dual_daily_climate_soil",
+    "soil_only": "soil",
+    "solo": "soil",
     "climate_daily": "daily_climate",
     "xavier_daily": "daily_climate",
 }
@@ -206,6 +262,35 @@ def feature_layout_spectral_dim(name: str) -> int:
 
 def feature_layout_is_dual(name: str) -> bool:
     return feature_layout_needs_climate_sidecar(name)
+
+
+def feature_layout_uses_spectral(name: str) -> bool:
+    """False for climate-only / soil-only DualSTNet ablations (and MoCo climate)."""
+    lay = resolve_feature_layout(name)
+    if lay.get("soil_only") or lay.get("climate_only"):
+        return False
+    if lay.get("use_spectral") is False:
+        return False
+    return True
+
+
+def feature_layout_uses_climate(name: str) -> bool:
+    """True when a DualSTNet climate trunk should be built."""
+    lay = resolve_feature_layout(name)
+    if not feature_layout_needs_climate_sidecar(name):
+        return False
+    if lay.get("use_climate") is False:
+        return False
+    return True
+
+
+def feature_layout_is_soil_only(name: str) -> bool:
+    return bool(resolve_feature_layout(name).get("soil_only"))
+
+
+def feature_layout_is_static(name: str) -> bool:
+    """True when inputs bypass temporal encoding (for example soil-only)."""
+    return bool(resolve_feature_layout(name).get("static_input"))
 
 
 def feature_layout_is_climate_only(name: str) -> bool:

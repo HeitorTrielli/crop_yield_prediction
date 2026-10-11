@@ -113,6 +113,9 @@ def generate_trials(search: dict) -> list[dict[str, Any]]:
     ``extra_trials`` (optional list of dicts) is appended after the strategy's
     main trials — useful for adding a few late-fusion / ablation points onto a
     grid without doubling the whole search space.
+
+    For ``strategy: list``, optional ``year_loo`` nests holdout-year folds on
+    each trial (same as feature_sweep), using ``extra_scaler_template``.
     """
     strategy = search["strategy"]
     parameters: dict = search.get("parameters") or {}
@@ -121,6 +124,16 @@ def generate_trials(search: dict) -> list[dict[str, Any]]:
         trials = [dict(t) for t in (search.get("trials") or [])]
         if not trials:
             raise ValueError("list search requires a non-empty search.trials list")
+        years = _as_year_list(search.get("year_loo"))
+        if years:
+            for trial in trials:
+                if "year_loo_folds" in trial:
+                    continue
+                trial["year_loo_folds"] = _year_loo_folds_for_layout(
+                    search,
+                    # DualSTNet / soy sidecars do not use baked C=17 climate extras.
+                    needs_climate=False,
+                )
     elif strategy == "feature_sweep":
         trials = _feature_sweep_trials(search)
     elif not parameters:

@@ -93,6 +93,7 @@ class STNetRegression(nn.Module):
         attn_pool_queries=4,
         soil_fusion="early",
         soil_dim=4,
+        static_input=False,
     ):
         super(STNetRegression, self).__init__()
         self.modelname = "STNetRegression"
@@ -109,6 +110,9 @@ class STNetRegression(nn.Module):
         self.soil_fusion = soil_fusion
         self.soil_dim = int(soil_dim)
         self.input_dim = int(input_dim)
+        self.static_input = bool(static_input)
+        if self.static_input and self.soil_fusion != "early":
+            raise ValueError("static_input requires soil_fusion='early'")
 
         if self.soil_fusion == "late":
             if self.input_dim <= self.soil_dim:
@@ -141,7 +145,20 @@ class STNetRegression(nn.Module):
             encoder_layer, n_layers, encoder_norm
         )
 
-        if self.temporal_pooling == "attention":
+        if self.static_input:
+            # Static features go directly to the regression MLP. Temporal
+            # modules remain registered for checkpoint compatibility but are
+            # intentionally bypassed in forward().
+            for module in (
+                self.mlp1,
+                self.inlayernorm,
+                self.position_enc,
+                self.transformerencoder,
+            ):
+                module.requires_grad_(False)
+            self.attn_pool = None
+            decoder_in = self.input_dim
+        elif self.temporal_pooling == "attention":
             self.attn_pool = AttentionPooling(
                 d_model, num_queries=attn_pool_queries, dropout=dropout
             )
@@ -171,6 +188,11 @@ class STNetRegression(nn.Module):
 
     def forward(self, x, is_bert=False):
         x, mask, doy, weight = x
+
+        if self.static_input:
+            # PixelTransform guarantees one neutral token for static layouts.
+            # This path consumes no DOY, mask, or temporal availability signal.
+            return self.decoder(x[:, 0, :])
 
         soil = None
         if self.soil_fusion == "late":

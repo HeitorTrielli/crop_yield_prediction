@@ -12,6 +12,8 @@ from datasets.feature_layout import (
     feature_layout_climate_input_dim,
     feature_layout_input_dim,
     feature_layout_spectral_dim,
+    feature_layout_uses_climate,
+    feature_layout_uses_spectral,
     normalize_feature_layout,
 )
 from models import DualSTNetRegression, STNetRegression
@@ -85,9 +87,13 @@ def build_stnet_from_checkpoint(
         clim_w = state_dict.get("climate.mlp1.0.lin.weight")
         spectral_dim = int(spec_w.shape[1]) if spec_w is not None else 10
         climate_dim = int(clim_w.shape[1]) if clim_w is not None else 5
+        use_spectral = spec_w is not None
+        use_climate = clim_w is not None
         if feature_layout is not None:
             spectral_dim = feature_layout_spectral_dim(feature_layout)
             climate_dim = feature_layout_climate_input_dim(feature_layout) or climate_dim
+            use_spectral = feature_layout_uses_spectral(feature_layout)
+            use_climate = feature_layout_uses_climate(feature_layout)
         dual_kw = {
             k: v
             for k, v in model_kw.items()
@@ -103,9 +109,13 @@ def build_stnet_from_checkpoint(
                 "soil_fusion",
                 "climate_pooling",
                 "climate_max_seq_len",
+                "use_spectral",
+                "use_climate",
             }
         }
         dual_kw.pop("climate_max_seq_len", None)
+        dual_kw.setdefault("use_spectral", use_spectral)
+        dual_kw.setdefault("use_climate", use_climate)
         model = DualSTNetRegression(
             spectral_dim=spectral_dim,
             climate_dim=climate_dim,

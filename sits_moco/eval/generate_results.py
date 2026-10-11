@@ -1050,6 +1050,20 @@ def generate_results(
             min_coverage_ratio=min_coverage_ratio,
             max_coverage_ratio=max_coverage_ratio,
         )
+    else:
+        # Resume path: reuse k=6 municipal forecasts already on disk.
+        pred_dir = predictions_dir(ctx.run_dir)
+        for year in years:
+            candidate = pred_dir / f"yield_forecasts_{year}.csv"
+            if candidate.is_file():
+                output.yield_forecasts_by_year[year] = candidate
+        summary = pred_dir / "incomplete_series_evaluation.csv"
+        if summary.is_file():
+            output.incomplete_series_summary = summary
+        for year in leave_out_years:
+            lo = pred_dir / f"incomplete_series_evaluation_{year}.csv"
+            if lo.is_file():
+                output.incomplete_series_by_leave_out_year[year] = lo
 
     holdout_csv = output.yield_forecasts_by_year.get(holdout_year)
     if holdout_csv is None and not skip_municipal_map:
@@ -1083,12 +1097,19 @@ def generate_results(
                 "Run incomplete-series step first or place "
                 f"predictions/yield_forecasts_{holdout_year}.csv in the run folder."
             )
-        output.municipal_error_map = run_municipal_error_heatmap(
-            ctx,
-            forecasts_csv=Path(holdout_csv),
-            holdout_year=holdout_year,
-            dpi=map_dpi,
-        )
+        try:
+            output.municipal_error_map = run_municipal_error_heatmap(
+                ctx,
+                forecasts_csv=Path(holdout_csv),
+                holdout_year=holdout_year,
+                dpi=map_dpi,
+            )
+        except Exception as exc:
+            # geobr metadata download is flaky offline / behind flaky APIs;
+            # forecasts and other artifacts should still be kept.
+            print(
+                f"WARNING: municipal error map skipped ({type(exc).__name__}: {exc})"
+            )
 
     if not skip_productivity_scatter and output.yield_forecasts_by_year:
         output.productivity_scatter_plots = run_productivity_scatter_plots(

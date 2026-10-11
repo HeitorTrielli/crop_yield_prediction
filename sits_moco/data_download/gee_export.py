@@ -54,16 +54,39 @@ def _gee_auth_message(project: str, account: str | None) -> str:
 
 
 def _gee_token_email() -> str | None:
+    """Resolve the Google account email for the active EE credentials.
+
+    EE OAuth tokens often omit openid/email, so tokeninfo may not return an
+    email. When drive scope is present, fall back to Drive about.get.
+    """
     try:
         creds = ee.data.get_persistent_credentials()
         creds.refresh(GoogleAuthRequest())
+        token = creds.token
+    except Exception:
+        return None
+
+    try:
         url = (
             "https://oauth2.googleapis.com/tokeninfo?access_token="
-            + urllib.parse.quote(creds.token)
+            + urllib.parse.quote(token)
         )
         with urllib.request.urlopen(url, timeout=10) as resp:
             info = json.loads(resp.read().decode())
         email = info.get("email")
+        if email:
+            return str(email)
+    except Exception:
+        pass
+
+    try:
+        req = urllib.request.Request(
+            "https://www.googleapis.com/drive/v3/about?fields=user",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            info = json.loads(resp.read().decode())
+        email = (info.get("user") or {}).get("emailAddress")
         return str(email) if email else None
     except Exception:
         return None
@@ -102,11 +125,22 @@ def initialize_gee(
     if not account:
         return
     email = _gee_token_email()
-    if email and email.lower() != account.lower():
+    if not email:
+        sys.exit(
+            "Could not resolve the authenticated GEE Google account email "
+            f"(expected {account}).\n" + _gee_auth_message(project, account)
+        )
+    if email.lower() != account.lower():
         sys.exit(
             f"GEE is authenticated as {email}, expected {account}.\n"
             + _gee_auth_message(project, account)
         )
+    if email.lower() == "heitortrielli@gmail.com":
+        sys.exit(
+            f"Refusing GEE account {email}; use heigthtrielli@gmail.com.\n"
+            + _gee_auth_message(project, account)
+        )
+    print(f"GEE account confirmed: {email}")
     user_ids = _gee_legacy_user_ids()
     expected_local = account.split("@", 1)[0].lower()
     if user_ids and expected_local not in user_ids:
