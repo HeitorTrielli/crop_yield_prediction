@@ -23,62 +23,58 @@
 \newlabel{sec:data}{{2}{2}{Data}{section.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Study area and labels}{2}{subsection.2.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Covariates and municipal aggregation}{2}{subsection.2.2}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Data pipeline for MSTNet. Sentinel-2 (soy-masked) and Xavier weather are encoded by parallel trunks; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat  {y}_{m,y}$ is supervised by IBGE PAM labels at the output.}}{3}{figure.caption.2}\protected@file@percent }
-\newlabel{fig:data-flow}{{1}{3}{Data pipeline for MSTNet. Sentinel-2 (soy-masked) and Xavier weather are encoded by parallel trunks; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat {y}_{m,y}$ is supervised by IBGE PAM labels at the output}{figure.caption.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Train / validation / test split}{3}{subsection.2.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Data pipeline for MSTNet training. Sentinel-2 is reduced to soy-masked municipal means; Xavier weather is encoded by a parallel trunk; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat  {y}_{m,y}$ is supervised by IBGE PAM labels at the output. Reported evaluation instead scores individual soy pixels and averages them (Appendix~\ref {app:pixel-pipeline}).}}{3}{figure.caption.2}\protected@file@percent }
+\newlabel{fig:data-flow}{{1}{3}{Data pipeline for MSTNet training. Sentinel-2 is reduced to soy-masked municipal means; Xavier weather is encoded by a parallel trunk; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat {y}_{m,y}$ is supervised by IBGE PAM labels at the output. Reported evaluation instead scores individual soy pixels and averages them (Appendix~\ref {app:pixel-pipeline})}{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Year leave-one-out splits}{3}{subsection.2.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {3}Methods}{3}{section.3}\protected@file@percent }
 \newlabel{sec:methods}{{3}{3}{Methods}{section.3}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Pixel scoring under municipal supervision}{3}{subsection.3.1}\protected@file@percent }
 \newlabel{sec:pixel-formulation}{{3.1}{3}{Pixel scoring under municipal supervision}{subsection.3.1}{}}
-\newlabel{eq:pixel-mean-agg}{{1}{3}{Pixel scoring under municipal supervision}{equation.1}{}}
 \citation{xu2024sitsmoco}
+\newlabel{eq:pixel-mean-agg}{{1}{4}{Pixel scoring under municipal supervision}{equation.1}{}}
 \newlabel{eq:municipal-mean}{{2}{4}{Pixel scoring under municipal supervision}{equation.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Architecture}{4}{subsection.3.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Loss and optimization}{4}{subsection.3.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {4}Experiments}{4}{section.4}\protected@file@percent }
 \newlabel{sec:experiments}{{4}{4}{Experiments}{section.4}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Proposed model}{4}{subsection.4.1}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Validation and test metrics for the MSTNet municipal predictor at the validation-selected epoch (12). RMSE and MAE are in \si {t/ha}.}}{5}{table.caption.3}\protected@file@percent }
-\newlabel{tab:main-metrics}{{2}{5}{Validation and test metrics for the MSTNet municipal predictor at the validation-selected epoch (12). RMSE and MAE are in \si {t/ha}}{table.caption.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Spectral-only reference}{5}{subsection.4.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Year leave-one-out metrics for MSTNet (pixel-by-pixel scores averaged to municipalities). Each row is a fold that trains on the other four harvest years and evaluates only the listed LOO year. RMSE and MAE are in \si {t/ha}.}}{5}{table.caption.3}\protected@file@percent }
+\newlabel{tab:loo-metrics}{{2}{5}{Year leave-one-out metrics for MSTNet (pixel-by-pixel scores averaged to municipalities). Each row is a fold that trains on the other four harvest years and evaluates only the listed LOO year. RMSE and MAE are in \si {t/ha}}{table.caption.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Year leave-one-out design}{5}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:loo}{{4.2}{5}{Year leave-one-out design}{subsection.4.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Evaluation protocol}{5}{subsection.4.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Ablations}{5}{subsection.4.4}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {5}Results}{5}{section.5}\protected@file@percent }
 \newlabel{sec:results}{{5}{5}{Results}{section.5}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Municipal prediction accuracy}{5}{subsection.5.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Spectral-only reference}{5}{subsection.5.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Auxiliary comparisons}{5}{subsection.5.3}\protected@file@percent }
-\newlabel{sec:ablations}{{5.3}{5}{Auxiliary comparisons}{subsection.5.3}{}}
-\@writefile{toc}{\contentsline {paragraph}{Spectral-only reference.}{5}{section*.6}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Training dynamics for MSTNet. The dashed line marks the validation-selected epoch (12).}}{6}{figure.caption.4}\protected@file@percent }
-\newlabel{fig:learning}{{2}{6}{Training dynamics for MSTNet. The dashed line marks the validation-selected epoch (12)}{figure.caption.4}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Top five configurations from the separate spectral-only search (24 completed runs), ranked by validation $R^2$. This is not a matched ablation of MSTNet.}}{6}{table.caption.5}\protected@file@percent }
-\newlabel{tab:arch-top}{{3}{6}{Top five configurations from the separate spectral-only search (24 completed runs), ranked by validation $R^2$. This is not a matched ablation of MSTNet}{table.caption.5}{}}
-\@writefile{toc}{\contentsline {paragraph}{Temporal pooling.}{6}{section*.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Per-year municipal diagnostics}{6}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Year-LOO municipal accuracy}{5}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Drought year 2022}{5}{subsection.5.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Municipal aggregate prediction error map for LOO year 2022 (drought fold).}}{6}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:map2022}{{2}{6}{Municipal aggregate prediction error map for LOO year 2022 (drought fold)}{figure.caption.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Scatterplots and spatial examples}{6}{subsection.5.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {6}Discussion}{6}{section.6}\protected@file@percent }
 \newlabel{sec:discussion}{{6}{6}{Discussion}{section.6}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Predicted versus observed municipal soybean productivity (\si {t/ha}) for MSTNet. Top: holdout year 2021 (validation and test municipalities). Bottom: remaining harvest years in a $2\times 2$ panel. Points are colored by split. The dashed line is identity.}}{7}{figure.caption.8}\protected@file@percent }
-\newlabel{fig:scatter}{{3}{7}{Predicted versus observed municipal soybean productivity (\si {t/ha}) for MSTNet. Top: holdout year 2021 (validation and test municipalities). Bottom: remaining harvest years in a $2\times 2$ panel. Points are colored by split. The dashed line is identity}{figure.caption.8}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Predicted versus observed municipal soybean productivity (\si {t/ha}) for each year-LOO fold of MSTNet. Every panel evaluates only the left-out year. The dashed line is identity.}}{7}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:scatter}{{3}{7}{Predicted versus observed municipal soybean productivity (\si {t/ha}) for each year-LOO fold of MSTNet. Every panel evaluates only the left-out year. The dashed line is identity}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Conclusion}{7}{section.7}\protected@file@percent }
+\newlabel{sec:conclusion}{{7}{7}{Conclusion}{section.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Municipal aggregate prediction error map for LOO year 2021.}}{8}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:map2021}{{4}{8}{Municipal aggregate prediction error map for LOO year 2021}{figure.caption.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Pixel-level MSTNet pipeline}{8}{appendix.A}\protected@file@percent }
+\newlabel{app:pixel-pipeline}{{A}{8}{Pixel-level MSTNet pipeline}{appendix.A}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Municipal-mean evaluation on LOO years}{8}{appendix.B}\protected@file@percent }
+\newlabel{app:muni-mean-loo}{{B}{8}{Municipal-mean evaluation on LOO years}{appendix.B}{}}
 \bibstyle{plainnat}
 \bibdata{refs}
 \bibcite{esa2021sentinel2}{{1}{2021}{{Copernicus Sentinel-2, processed by ESA}}{{}}}
 \bibcite{gorelick2017gee}{{2}{2017}{{Gorelick et~al.}}{{Gorelick, Hancher, Dixon, Ilyushchenko, Thau, and Moore}}}
 \bibcite{ibgepam}{{3}{2026}{{Instituto Brasileiro de Geografia e Estat\'{\i }stica}}{{}}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (LOO year 2021).}}{9}{figure.caption.7}\protected@file@percent }
+\newlabel{fig:guara}{{5}{9}{Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (LOO year 2021)}{figure.caption.7}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode). Each row evaluates only the listed LOO year with the fold trained on the other four harvest years. RMSE and MAE are in \si {t/ha}.}}{9}{table.caption.10}\protected@file@percent }
+\newlabel{tab:loo-muni-mean}{{3}{9}{Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode). Each row evaluates only the listed LOO year with the fold trained on the other four harvest years. RMSE and MAE are in \si {t/ha}}{table.caption.10}{}}
 \bibcite{mapbiomas2025}{{4}{2025{a}}{{MapBiomas}}{{}}}
-\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Per-year municipal prediction metrics for MSTNet.}}{8}{table.caption.9}\protected@file@percent }
-\newlabel{tab:per-year}{{4}{8}{Per-year municipal prediction metrics for MSTNet}{table.caption.9}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {7}Conclusion}{8}{section.7}\protected@file@percent }
-\newlabel{sec:conclusion}{{7}{8}{Conclusion}{section.7}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {A}Pixel-level MSTNet pipeline}{8}{appendix.A}\protected@file@percent }
-\newlabel{app:pixel-pipeline}{{A}{8}{Pixel-level MSTNet pipeline}{appendix.A}{}}
 \bibcite{mapbiomassoil2025}{{5}{2025{b}}{{MapBiomas}}{{}}}
 \bibcite{xavier2022}{{6}{2022}{{Xavier et~al.}}{{Xavier, Scanlon, King, and Alves}}}
 \bibcite{xu2024sitsmoco}{{7}{2024}{{Xu et~al.}}{{Xu, Ma, and Zhang}}}
-\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Municipal aggregate prediction error map for harvest year 2021 (holdout).}}{9}{figure.caption.10}\protected@file@percent }
-\newlabel{fig:map2021}{{4}{9}{Municipal aggregate prediction error map for harvest year 2021 (holdout)}{figure.caption.10}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (holdout year 2021).}}{10}{figure.caption.11}\protected@file@percent }
-\newlabel{fig:guara}{{5}{10}{Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (holdout year 2021)}{figure.caption.11}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Pixel-by-pixel MSTNet pipeline. Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion. The mean of pixel predictions $\hat  {y}_p$ yields $\hat  {y}_{m,y}$, which is supervised by IBGE PAM.}}{11}{figure.caption.13}\protected@file@percent }
-\newlabel{fig:data-flow-pixel}{{6}{11}{Pixel-by-pixel MSTNet pipeline. Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion. The mean of pixel predictions $\hat {y}_p$ yields $\hat {y}_{m,y}$, which is supervised by IBGE PAM}{figure.caption.13}{}}
-\gdef \@abspage@last{11}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Pixel-by-pixel MSTNet pipeline. Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion. The mean of pixel predictions $\hat  {y}_p$ yields $\hat  {y}_{m,y}$, which is supervised by IBGE PAM.}}{10}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:data-flow-pixel}{{6}{10}{Pixel-by-pixel MSTNet pipeline. Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion. The mean of pixel predictions $\hat {y}_p$ yields $\hat {y}_{m,y}$, which is supervised by IBGE PAM}{figure.caption.9}{}}
+\gdef \@abspage@last{10}

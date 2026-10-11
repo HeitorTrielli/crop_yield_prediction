@@ -217,7 +217,7 @@ Static MapBiomas Solo properties (clay, silt, sand, and SOC stock at 0--30\,cm) 
 An ablation omits climate and soil inputs and uses the ten spectral bands alone.
 
 \subsection{Year leave-one-out splits}
-Evaluation follows year leave-one-out over harvest years $\{2020,2021,2022,2023,2024\}$ (Section~\ref{sec:loo}).
+Evaluation follows year leave-one-out over harvest years 2020--2024 (Section~\ref{sec:loo}).
 In each fold, every municipality--year from the four training years is used for fitting; the left-out year is never seen in training and provides the only reported municipal scores for that fold.
 Target standardization is recomputed from each fold's training years.
 All main-text metrics are municipal aggregates obtained by averaging pixel-level scores on the LOO year only (Section~\ref{sec:pixel-formulation}).

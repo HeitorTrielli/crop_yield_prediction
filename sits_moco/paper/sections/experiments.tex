@@ -8,8 +8,8 @@ Training fits municipality-mean Sentinel-2 series; reported metrics apply the se
 
 \subsection{Year leave-one-out design}
 \label{sec:loo}
-We evaluate temporal generalization with year leave-one-out (LOO) over harvest years $\{2020,2021,2022,2023,2024\}$.
-For each fold with holdout year $Y$:
+We evaluate temporal generalization with year leave-one-out (LOO) over harvest years 2020--2024.
+For each fold with left-out year $Y$:
 \begin{itemize}
   \item all municipality--years with harvest year $\neq Y$ are used for training;
   \item year $Y$ is held out entirely (no municipality from $Y$ enters training);
