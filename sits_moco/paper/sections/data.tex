@@ -4,7 +4,7 @@
 The analysis uses municipal PAM productivity labels together with Sentinel-2, daily climate, and soil covariates (Table~\ref{tab:data-sources}).
 All three covariate streams are gridded; for municipal aggregates we average them under the MapBiomas soybean mask.
 Figure~\ref{fig:data-flow} shows the municipality-mean path used for training and for the municipal-mean LOO metrics in Section~\ref{sec:experiments}.
-After training we also run a pixel-wise forward pass and average the scores for the pixel-path LOO metrics and sub-municipal maps in Section~\ref{sec:results}; Figure~\ref{fig:data-flow-pixel} diagrams that pixel path.
+After training we also run a pixel-wise forward pass and average the scores for the pixel-path LOO metrics and sub-municipal maps in Section~\ref{sec:results}; Appendix~\ref{app:pixel-pipeline} diagrams that pixel path.
 
 \begin{table}[t]
 \centering
@@ -181,7 +181,7 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
 }
 \caption{Data pipeline for MSTNet training (municipal-mean path).
 The MapBiomas soybean mask selects cells before municipal averaging of Sentinel-2, Xavier weather, and MapBiomas Solo; the spectral and climate means feed parallel STNet trunks, and soil enters the decoder by late fusion. The decoder prediction $\hat{y}_{m,y}$ is supervised by IBGE PAM labels at the output.
-The post-training pixel path is described in Section~\ref{sec:pixel-formulation} and shown in Figure~\ref{fig:data-flow-pixel}.}
+The post-training pixel path is described in Section~\ref{sec:pixel-formulation} and diagrammed in Appendix~\ref{app:pixel-pipeline}.}
 \label{fig:data-flow}
 \end{figure*}
 
