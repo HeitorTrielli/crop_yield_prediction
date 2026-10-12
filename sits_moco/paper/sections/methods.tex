@@ -10,6 +10,16 @@ The single-trunk STNet material and notation below follow~\citet{xu2024sitsmoco}
 We add trunk indices $s$ and $c$ for the dual-stream case and replace the classification head by a regression decoder with late soil fusion.
 Figure~\ref{fig:mstnet-arch} summarizes the network.
 
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{mstnet_arch.pdf}
+\caption{MSTNet architecture.
+Each STNet trunk $i\in\{s,c\}$ maps a SITS $\mathbf{X}_i$ of length $T_i$ through a shared per-timestep MLP to $\mathbf{E}_i$, adds DoY encodings to form $\mathbf{E}_i'$, applies a Transformer encoder to obtain $\mathbf{O}_i$, and pools with Seq2Vec to $\mathbf{o}_s$ with NDVI weights or $\mathbf{o}_c$ as a mean over valid days.
+The output head concatenates $\mathbf{o}_s$, $\mathbf{o}_c$, and MapBiomas Solo features~$\mathbf{s}$, then $MLP_2$ predicts productivity~$\hat{y}$.
+Adapted from Fig.~2 of~\citet{xu2024sitsmoco}.}
+\label{fig:mstnet-arch}
+\end{figure}
+
 \paragraph{Sequential encoding.}
 Write a satellite imagery time series (SITS) as $\mathbf{X}=[\mathbf{x}_1,\ldots,\mathbf{x}_T]$ with $\mathbf{x}_t\in\mathbb{R}^{C}$.
 In MSTNet the spectral trunk takes $\mathbf{X}_s$ with $C_s=10$ Sentinel-2 bands and length $T_s=45$, the number of clear observations in the municipality with the densest Sentinel-2 series over the Oct--Mar window.
@@ -80,16 +90,6 @@ MSTNet concatenates the trunk embeddings with soil and decodes a scalar producti
   \label{eq:output-head}
 \end{equation}
 with $\hat{y}$ interpreted per pixel or per municipal aggregate according to the input path in Section~\ref{sec:pixel-formulation}.
-
-\begin{figure*}[t]
-\centering
-\includegraphics[width=\textwidth]{mstnet_arch.pdf}
-\caption{MSTNet architecture.
-Each STNet trunk $i\in\{s,c\}$ maps a SITS $\mathbf{X}_i$ of length $T_i$ through a shared per-timestep MLP to $\mathbf{E}_i$, adds DoY encodings to form $\mathbf{E}_i'$, applies a Transformer encoder to obtain $\mathbf{O}_i$, and pools with Seq2Vec to $\mathbf{o}_s$ with NDVI weights or $\mathbf{o}_c$ as a mean over valid days.
-The output head concatenates $\mathbf{o}_s$, $\mathbf{o}_c$, and MapBiomas Solo features~$\mathbf{s}$, then $MLP_2$ predicts productivity~$\hat{y}$.
-Adapted from Fig.~2 of~\citet{xu2024sitsmoco}.}
-\label{fig:mstnet-arch}
-\end{figure*}
 
 \subsection{Municipal-mean training and post-training pixel scoring}
 \label{sec:pixel-formulation}
