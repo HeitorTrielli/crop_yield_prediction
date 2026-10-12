@@ -5,10 +5,10 @@ Reliable soybean productivity estimates matter for agricultural monitoring, insu
 In Brazil, the Municipal Agricultural Production survey (PAM) from the Brazilian Institute of Geography and Statistics (IBGE) publishes official yields only at the municipality level.
 Similar reliance on aggregated statistics is found in other countries, including the United States (county-level) and India (district-level), where official yield estimates are commonly reported for administrative regions rather than individual fields.
 Sentinel-2 imagery, gridded weather, and soil maps describe crop condition at much finer scales, but field-level yield labels are rarely available statewide.
-What we need is a model that can learn from municipal labels and still make predictions for smaller regions, at a scale that is cheap enough to run over large areas.
+We want a model that learns from municipal labels, predicts at smaller regions, and remains cheap enough to run over large areas.
 
-MSTNet (\emph{Multi} STNet) is our answer to that requirement.
-It extends the Spectral--Temporal Network (STNet) of~\citet{xu2024sitsmoco}, whose Transformer encoder follows the self-attention architecture for satellite time series of~\citet{russwurm2020selfattention}, by giving each covariate stream its own trunk when the streams are sampled at different frequencies.
+MSTNet (\emph{Multi} STNet) extends the Spectral--Temporal Network (STNet) of~\citet{xu2024sitsmoco}.
+Its Transformer encoder follows the self-attention architecture for satellite time series of~\citet{russwurm2020selfattention}, and each covariate stream gets its own trunk when the streams are sampled at different frequencies.
 Here, one trunk encodes soy-masked Sentinel-2 reflectance and another encodes daily climate.
 Annual MapBiomas Solo properties, which are static once the harvest year is fixed, are concatenated in the decoder.
 Predictions are defined per soy pixel.
@@ -19,8 +19,13 @@ After training, we score every soy pixel of a given municipality with the fitted
 We run the experiments on soybean municipalities in Paran\'{a} for harvest years 2020--2024 under year leave-one-out: each fold trains on four years and scores only the left-out year.
 Because PAM is the only supervised target, every reported number is a municipal comparison with PAM, but under one of two input paths that we keep distinct throughout:
 the municipal-mean path used in training and model selection, and the post-training pixel path in which every soy pixel is scored and then averaged.
-Main-text results emphasize the pixel path; the municipal-mean LOO numbers appear in Appendix~\ref{app:muni-mean-loo}.
+Section~\ref{sec:experiments} reports municipal-mean LOO metrics; Section~\ref{sec:results} reports the pixel-path LOO metrics, maps, and scatterplots.
 We are not aware of many yield studies that train a multi-frequency Transformer on municipal labels while still exposing pixel scores for downscaling.
 Matched baselines for that setup are scarce, so we present the LOO benchmark rather than a direct comparison against the literature.
 
 Our contributions are MSTNet itself, the pixel-scoring setup that turns municipal supervision into sub-municipal maps, and a five-fold year-LOO evaluation for Paran\'{a} over 2020--2024.
+
+Section~\ref{sec:data} describes the study area, PAM labels, and soy-masked covariates.
+Section~\ref{sec:methodology} presents the MSTNet architecture, municipal-mean training and post-training pixel scoring, and the loss.
+Section~\ref{sec:experiments} details the year-LOO protocol and municipal-mean LOO metrics, Section~\ref{sec:results} reports the pixel-path results, and Section~\ref{sec:discussion} covers the drought year and limitations.
+Section~\ref{sec:conclusion} concludes.

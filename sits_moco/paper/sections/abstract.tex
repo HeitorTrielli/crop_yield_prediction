@@ -4,9 +4,9 @@ However, precision agriculture, insurance, and localized risk assessment require
 We propose MSTNet (\emph{Multi} STNet), a Transformer model that combines data sampled at different temporal frequencies.
 Separate STNet trunks encode soy-masked Sentinel-2 time series and a daily gridded climate series, while annual soil properties enter the decoder by late fusion.
 Since the model is able to predict a yield value per soy pixel, we can use it to predict yield for arbitrary polygons by averaging the pixel-wise predictions.
-Training uses the soy-masked municipality-mean Sentinel-2 and climate series, as well as the annual soil features under PAM supervision;
-we also evaluate the prediction of every soy pixel of a given municipality and average it, to evaluate how well the model can generalize to arbitrary polygons.
+Training uses the soy-masked municipality-mean Sentinel-2, climate, and soil features under PAM supervision.
+We also score every soy pixel after training and average those scores to municipalities, which tests how well the same weights transfer to arbitrary polygons.
 We evaluate in Paran\'{a}, Brazil, with year leave-one-out over harvest years 2020--2024, reporting only the left-out year in each fold.
-Excluding the 2022 drought fold, the pixel-wise average LOO $R^2$ is $0.302$; when 2022 itself is the left out year, performance collapses because no comparable drought year remains in training dataset.
+Excluding the 2022 drought fold, municipal-mean LOO $R^2$ is $0.275$ and the pixel-path LOO $R^2$ is $0.302$; when 2022 itself is left out, performance collapses because no comparable drought year remains in the training set.
 Direct comparison with earlier work is limited for this municipal-supervision, pixel-scoring setting; we report the LOO benchmark and leave field-referenced checks for future work.
 \end{abstract}

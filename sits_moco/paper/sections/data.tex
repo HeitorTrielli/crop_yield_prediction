@@ -3,8 +3,8 @@
 
 The analysis uses municipal PAM productivity labels together with Sentinel-2, daily climate, and soil covariates (Table~\ref{tab:data-sources}).
 All three covariate streams are gridded; for municipal aggregates we average them under the MapBiomas soybean mask.
-Figure~\ref{fig:data-flow} shows the municipality-mean path used for training.
-After training we switch to a pixel-wise forward pass and average the scores for the reported LOO metrics and for sub-municipal maps (Section~\ref{sec:pixel-formulation}); Appendix~\ref{app:pixel-pipeline} diagrams that pixel path.
+Figure~\ref{fig:data-flow} shows the municipality-mean path used for training and for the municipal-mean LOO metrics in Section~\ref{sec:experiments}.
+After training we also run a pixel-wise forward pass and average the scores for the pixel-path LOO metrics and sub-municipal maps in Section~\ref{sec:results}; Figure~\ref{fig:data-flow-pixel} diagrams that pixel path.
 
 \begin{table}[t]
 \centering
@@ -42,7 +42,7 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
   src/.style={
     draw=black!40, fill=white, rounded corners=2pt,
     align=center, inner xsep=5pt, inner ysep=5pt,
-    minimum width=2.35cm, minimum height=1.5cm, line width=0.45pt
+    minimum width=2.35cm, minimum height=1.15cm, line width=0.45pt
   },
   mid/.style={
     draw=black!40, fill=black!2, rounded corners=2pt,
@@ -61,107 +61,90 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
   },
   rowlab/.style={font=\scriptsize\color{black!50}, anchor=east},
   arr/.style={->, line width=0.55pt, draw=black!45},
-  iconfields/.pic={
-    \fill[green!48!black!60] (-0.24,-0.13) -- (-0.02,-0.13) -- (0.00,0.00) -- (-0.22,0.03) -- cycle;
-    \fill[yellow!50!green!55] (0.00,-0.13) -- (0.24,-0.13) -- (0.24,0.00) -- (0.03,0.00) -- cycle;
-    \fill[green!32!black!40] (-0.22,0.04) -- (0.00,0.02) -- (0.04,0.15) -- (-0.24,0.15) -- cycle;
-    \fill[olive!50!black!35] (0.04,0.02) -- (0.24,0.02) -- (0.24,0.15) -- (0.06,0.15) -- cycle;
-    \draw[white, line width=0.3pt] (-0.24,-0.13) rectangle (0.24,0.15);
-  },
-  iconmask/.pic={
-    \fill[black!10] (-0.22,-0.13) rectangle (0.22,0.13);
-    \fill[green!55!black]
-      (-0.10,-0.06) .. controls (-0.12,0.04) and (0.00,0.13) .. (0.06,0.09)
-      .. controls (0.16,0.03) and (0.12,-0.08) .. (0.00,-0.09)
-      .. controls (-0.05,-0.10) and (-0.08,-0.08) .. cycle;
-  },
-  iconcloud/.pic={
-    \fill[black!12!cyan!28] (-0.05,0.03) circle [radius=0.08];
-    \fill[black!12!cyan!28] (0.05,0.05) circle [radius=0.10];
-    \fill[black!12!cyan!28] (0.00,0.10) circle [radius=0.09];
-    \fill[black!12!cyan!28] (-0.13,0.02) circle [radius=0.06];
-    \fill[black!12!cyan!28] (0.13,0.02) circle [radius=0.06];
-    \draw[cyan!35!black, line width=0.28pt] (-0.06,-0.03) -- (-0.08,-0.11);
-    \draw[cyan!35!black, line width=0.28pt] (0.00,-0.03) -- (0.00,-0.13);
-    \draw[cyan!35!black, line width=0.28pt] (0.06,-0.03) -- (0.08,-0.10);
-  },
-  iconsoil/.pic={
-    \fill[brown!70!black!55] (-0.20,-0.13) rectangle (0.20,-0.05);
-    \fill[brown!50!orange!40] (-0.20,-0.05) rectangle (0.20,0.02);
-    \fill[brown!28!yellow!40] (-0.20,0.02) rectangle (0.20,0.07);
-    \fill[green!38!black!28] (-0.20,0.07) rectangle (0.20,0.13);
-    \draw[black!30, line width=0.22pt] (-0.20,-0.13) rectangle (0.20,0.13);
-  },
-  iconpam/.pic={
-    \fill[white] (-0.13,-0.13) rectangle (0.15,0.13);
-    \draw[violet!40!black, line width=0.28pt] (-0.13,-0.13) rectangle (0.15,0.13);
-    \fill[violet!15] (-0.13,0.06) rectangle (0.15,0.13);
-    \fill[violet!45!black] (-0.05,-0.09) rectangle (-0.01,-0.04);
-    \fill[violet!55!black] (0.01,-0.09) rectangle (0.05,-0.01);
-    \fill[violet!65!black] (0.07,-0.09) rectangle (0.11,0.02);
-  },
 ]
 
-  % column centers: 3.15cm spacing (> node width 2.35cm)
-  % Sources
-  \node[rowlab] at (-8.0, 0) {Sources};
+  % Even 3.0cm columns; row labels sit close to the first column
+  \def\xs{-4.5}
+  \def\xc{-1.5}
+  \def\xso{1.5}
+  \def\xlb{5.05} % tiny extra gap after MapBiomas Solo
+  \def\xmid{-3.0} % midpoint of spectral + climate (= MSTNet / decoder)
+  \def\xlab{-6.55}
+  \def\yagg{-2.55}
+  \def\yenc{-5.2}
+  \def\ydec{-7.55}
+  \def\yout{-9.4}
 
-  % Sentinel-2: stacked cards = time series of dates
-  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]-6.3,0) {};
-  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]-6.3,0) {};
-  \node[src] (s2) at (-6.3, 0) {%
-    \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconfields}}\\[2pt]
-      \scriptsize Sentinel-2\\[0pt]
-      \scriptsize via GEE
-    \end{tabular}};
+  \node[rowlab] at (\xlab, 0) {Sources};
 
-  \node[src] (soy) at (-3.15, 0) {%
-    \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconmask}}\\[2pt]
-      \scriptsize MapBiomas\\[0pt]
-      \scriptsize soy mask
-    \end{tabular}};
+  \node[src] (s2) at (\xs, 0) {\scriptsize Sentinel-2};
+  % Equal-size 3-stack: clone front box geometry (empty backs were shrinking)
+  \begin{scope}[on background layer]
+    \node[src, fill=black!7, draw=black!26, line width=0.4pt,
+          inner sep=0pt, fit=(s2), xshift=4pt, yshift=-4pt] {};
+    \node[src, fill=black!3, draw=black!30, line width=0.4pt,
+          inner sep=0pt, fit=(s2), xshift=2pt, yshift=-2pt] {};
+  \end{scope}
 
-  % Xavier: stacked cards = daily time series
-  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]0,0) {};
-  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]0,0) {};
-  \node[src] (xav) at (0, 0) {%
+  \node[src] (xav) at (\xc, 0) {%
     \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconcloud}}\\[2pt]
       \scriptsize Xavier\\[0pt]
       \scriptsize weather
     \end{tabular}};
+  \begin{scope}[on background layer]
+    \node[src, fill=black!7, draw=black!26, line width=0.4pt,
+          inner sep=0pt, fit=(xav), xshift=4pt, yshift=-4pt] {};
+    \node[src, fill=black!3, draw=black!30, line width=0.4pt,
+          inner sep=0pt, fit=(xav), xshift=2pt, yshift=-2pt] {};
+  \end{scope}
 
-  \node[src] (soil) at (3.15, 0) {%
+  \node[src] (soil) at (\xso, 0) {%
     \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconsoil}}\\[2pt]
       \scriptsize MapBiomas\\[0pt]
       \scriptsize Solo
     \end{tabular}};
-  \node[src] (pam) at (6.3, 0) {%
-    \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconpam}}\\[2pt]
-      \scriptsize IBGE PAM
-    \end{tabular}};
+  \node[src] (pam) at (\xlb, 0) {%
+    \scriptsize IBGE PAM};
 
-  % Aggregation (y = -3.0)
-  \node[rowlab] at (-8.0, -3.0) {Aggregation};
-  \node[mid] (a_s2) at (-4.725, -3.0) {\scriptsize Soy-masked mean};
-  \node[mid] (a_cl) at (0, -3.0) {\scriptsize Climate mean};
-  \node[mid] (a_so) at (3.15, -3.0) {\scriptsize Soil mean};
-  \node[mid] (a_lb) at (6.3, -3.0) {\scriptsize Labels};
+  % Aggregation: soy-mask panel spans spectral+climate+soil; left edge matches MSTNet
+  \node[rowlab] at (\xlab, \yagg) {Aggregation};
+  \node[mid, minimum width=2.5cm] (a_s2) at (\xs, \yagg) {\scriptsize Spectral mean};
+  \node[mid, minimum width=2.5cm] (a_cl) at (\xc, \yagg) {\scriptsize Climate mean};
+  \node[mid, minimum width=2.5cm] (a_so) at (\xso, \yagg) {\scriptsize Soil mean};
+  \node[mid] (a_lb) at (\xlb, \yagg) {\scriptsize Labels};
 
-  \draw[arr] (s2.south) -- ++(0,-0.55) -| (a_s2.north);
-  \draw[arr] (soy.south) -- ++(0,-0.55) -| (a_s2.north);
+  \def\panelxsep{18pt}
+  \def\panelasep{14pt}
+  \begin{scope}[on background layer]
+    \node[
+      fit=(a_s2)(a_cl)(a_so),
+      fill=green!6,
+      draw=green!45!black!45,
+      rounded corners=3pt,
+      inner xsep=\panelxsep,
+      inner ysep=\panelasep,
+      line width=0.5pt
+    ] (maskbox) {};
+  \end{scope}
+  % Two-line label on the green panel edge (like MSTNet), between spectral/climate arrows
+  \node[
+    font=\scriptsize\color{green!40!black!65},
+    align=center,
+    anchor=south,
+    inner sep=0pt
+  ] at ([yshift=-8pt]\xmid,0 |- maskbox.north) {%
+    MapBiomas\\[-1pt]
+    soy-masked};
+
+  \draw[arr] (s2.south) -- (a_s2.north);
   \draw[arr] (xav.south) -- (a_cl.north);
   \draw[arr] (soil.south) -- (a_so.north);
   \draw[arr] (pam.south) -- (a_lb.north);
 
-  % Encoders (y = -6.2)
-  \node[rowlab] at (-8.0, -6.2) {Encoders};
-  \node[enc=blue!55!black] (e_s2) at (-4.725, -6.2) {\scriptsize Spectral encoder};
-  \node[enc=orange!65!black] (e_cl) at (0, -6.2) {\scriptsize Climate encoder};
+  % Encoders: same left padding as the soy-mask panel above
+  \node[rowlab] at (\xlab, \yenc) {Encoders};
+  \node[enc=blue!55!black] (e_s2) at (\xs, \yenc) {\scriptsize Spectral encoder};
+  \node[enc=orange!65!black] (e_cl) at (\xc, \yenc) {\scriptsize Climate encoder};
 
   \begin{scope}[on background layer]
     \node[
@@ -169,8 +152,8 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
       fill=blue!4,
       draw=blue!25!black!40,
       rounded corners=3pt,
-      inner xsep=18pt,
-      inner ysep=16pt,
+      inner xsep=\panelxsep,
+      inner ysep=\panelasep,
       line width=0.5pt
     ] (encbox) {};
   \end{scope}
@@ -180,25 +163,25 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
   \draw[arr] (a_s2.south) -- (e_s2.north);
   \draw[arr] (a_cl.south) -- (e_cl.north);
 
-  % Decoder (y = -9.0)
-  \node[rowlab] at (-8.0, -9.0) {Decoder};
-  \node[dec] (dec) at (-2.3625, -9.0) {\scriptsize Late fusion + MLP};
+  % Decoder
+  \node[rowlab] at (\xlab, \ydec) {Decoder};
+  \node[dec] (dec) at (\xmid, \ydec) {\scriptsize Late fusion + MLP};
 
-  \draw[arr] (e_s2.south) -- ++(0,-0.7) -| (dec.150);
-  \draw[arr] (e_cl.south) -- ++(0,-0.7) -| (dec.30);
+  \draw[arr] (e_s2.south) -- ++(0,-0.55) -| (dec.150);
+  \draw[arr] (e_cl.south) -- ++(0,-0.55) -| (dec.30);
   \draw[arr] (a_so.south) -- (a_so.south |- dec.east) -- (dec.east);
 
-  % Output (y = -11.2)
-  \node[rowlab] at (-8.0, -11.2) {Output};
-  \node[dec] (out) at (-2.3625, -11.2) {$\hat{y}_{m,y}$};
+  % Output
+  \node[rowlab] at (\xlab, \yout) {Output};
+  \node[dec] (out) at (\xmid, \yout) {$\hat{y}_{m,y}$};
 
   \draw[arr] (dec.south) -- (out.north);
   \draw[arr] (a_lb.south) -- (a_lb.south |- out.east) -- (out.east);
 \end{tikzpicture}%
 }
 \caption{Data pipeline for MSTNet training (municipal-mean path).
-Sentinel-2 is reduced to soy-masked municipal means; Xavier weather is encoded by a parallel trunk; MapBiomas Solo enters the decoder by late fusion. The decoder prediction $\hat{y}_{m,y}$ is supervised by IBGE PAM labels at the output.
-The post-training pixel path is described in Section~\ref{sec:pixel-formulation} and diagrammed in Appendix~\ref{app:pixel-pipeline}.}
+The MapBiomas soybean mask selects cells before municipal averaging of Sentinel-2, Xavier weather, and MapBiomas Solo; the spectral and climate means feed parallel STNet trunks, and soil enters the decoder by late fusion. The decoder prediction $\hat{y}_{m,y}$ is supervised by IBGE PAM labels at the output.
+The post-training pixel path is described in Section~\ref{sec:pixel-formulation} and shown in Figure~\ref{fig:data-flow-pixel}.}
 \label{fig:data-flow}
 \end{figure*}
 
@@ -221,5 +204,5 @@ For each municipality--season, we construct a four-value MapBiomas Solo soil vec
 \subsection{Year leave-one-out splits}
 Evaluation follows year leave-one-out over harvest years 2020--2024 (Section~\ref{sec:loo}).
 In each fold, every municipality--year from the four training years is used for fitting; the left-out year is never seen in training and provides the only reported municipal scores for that fold.
-All main-text metrics are municipal aggregates obtained by averaging pixel-level scores on the LOO year only (Section~\ref{sec:pixel-formulation}).
+Municipal-mean LOO metrics appear in Section~\ref{sec:experiments}; pixel-path LOO metrics and maps appear in Section~\ref{sec:results}.
 We do not validate the pixel-level maps against field-level yields because no field-level ground-truth data are available.
