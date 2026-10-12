@@ -1,26 +1,101 @@
-\section{Methods}
-\label{sec:methods}
+\section{Methodology}
+\label{sec:methodology}
 
-\subsection{Pixel scoring under municipal supervision}
+We first describe the MSTNet architecture (STNet trunks and late-fusion head), then how the network is trained under municipal PAM labels and scored at pixel level after training, and finally the loss.
+
+\subsection{MSTNet architecture}
+\label{sec:architecture}
+MSTNet (\emph{Multi} STNet) places one STNet trunk on each time-varying stream so that modalities with different sampling rates need not share a common calendar.
+The single-trunk STNet material and notation below follow~\citet{xu2024sitsmoco}; their encoder builds on the self-attention architecture for satellite time series of~\citet{russwurm2020selfattention}.
+We add trunk indices $s$ and $c$ for the dual-stream case and replace the classification head by a regression decoder with late soil fusion.
+Figure~\ref{fig:mstnet-arch} summarizes the network.
+
+\paragraph{Sequential encoding.}
+Write a satellite imagery time series (SITS) as $\mathbf{X}=[\mathbf{x}_1,\ldots,\mathbf{x}_T]$ with $\mathbf{x}_t\in\mathbb{R}^{C}$.
+In MSTNet the spectral trunk takes $\mathbf{X}_s$ with $C_s=10$ Sentinel-2 bands and length $T_s=45$, the number of clear observations in the municipality with the densest Sentinel-2 series over the Oct--Mar window.
+Shorter municipal series are zero-padded and masked to this length.
+The climate trunk takes $\mathbf{X}_c$ with $C_c=5$ climate channels over the Oct--Mar window.
+That window has 183 days in leap years, when February has 29 days, and 182 days otherwise, so we fix $T_c=183$ and pad ordinary seasons by one masked step.
+Each timestep is mapped by a trunk-specific, weight-sharing MLP,
+\begin{equation}
+  \mathbf{e}_{i,t} = MLP_i(\mathbf{x}_{i,t}),
+  \label{eq:mlp-step}
+\end{equation}
+and the trunk embedding matrix stacks these vectors as
+\begin{equation}
+  \mathbf{E}_i=[\mathbf{e}_{i,1},\ldots,\mathbf{e}_{i,T_i}]\in\mathbb{R}^{T_i\times d},
+  \label{eq:mlp-encode}
+\end{equation}
+where $i\in\{s,c\}$.
+Because self-attention is permutation-equivariant, a day-of-year (DoY) positional vector $\mathbf{p}_{i,t}\in\mathbb{R}^{d}$ is added at every step,
+\begin{equation}
+  \mathbf{e}_{i,t}' = \mathbf{e}_{i,t} + \mathbf{p}_{i,t},
+  \label{eq:doy-add}
+\end{equation}
+with
+\begin{equation}
+  \mathbf{p}_{i,t}
+  =
+  \bigl[\sin(\mathrm{DoY}_{i,t}/\tau^{2k/d}),\,
+        \cos(\mathrm{DoY}_{i,t}/\tau^{2k/d})\bigr]_{k=1}^{d/2},
+  \label{eq:doy-pe}
+\end{equation}
+and $\tau=1000$, which gives $\mathbf{E}_i'=[\mathbf{e}_{i,1}',\ldots,\mathbf{e}_{i,T_i}']$.
+The DoY calendars differ by trunk: spectral steps follow the clear Sentinel-2 acquisition dates, while climate steps follow the daily Oct--Mar grid.
+
+\paragraph{Transformer encoder.}
+Each trunk applies a Transformer encoder to $\mathbf{E}_i'$.
+Inside each encoder layer, multi-head self-attention forms query, key, and value projections at every timestep, runs scaled dot-product attention over the sequence in parallel heads, and recombines the head outputs.
+A position-wise feed-forward network follows, and both sublayers use residual connections with layer normalization, yielding $\mathbf{O}_i=[\mathbf{o}_{i,1},\ldots,\mathbf{o}_{i,T_i}]\in\mathbb{R}^{T_i\times d}$.
+
+\paragraph{Seq2Vec.}
+A Seq2Vec module collapses $\mathbf{O}_i$ to a single vector $\mathbf{o}_i\in\mathbb{R}^{d}$.
+On the spectral trunk we use an NDVI-weighted temporal mean: with NIR and red channels of $\mathbf{x}_{s,t}$,
+\begin{equation}
+  \mathrm{NDVI}_t
+  =
+  \frac{x_{s,t}^{\mathrm{NIR}}-x_{s,t}^{\mathrm{Red}}}{x_{s,t}^{\mathrm{NIR}}+x_{s,t}^{\mathrm{Red}}},
+  \label{eq:ndvi}
+\end{equation}
+\begin{equation}
+  \mathbf{w}=\mathrm{softmax}\bigl([\mathrm{NDVI}_t]_{t=1}^{T_s}\bigr),
+  \label{eq:ndvi-weights}
+\end{equation}
+\begin{equation}
+  \mathbf{o}_s
+  =
+  \sum_{t=1}^{T_s} w_t\,\mathbf{o}_{s,t},
+  \label{eq:ndvi-seq2vec}
+\end{equation}
+so cloudy or low-vegetation dates receive small weight.
+On the climate trunk there is no NDVI analogue; we take the mean of $\mathbf{O}_c$ over valid (unmasked) days, denoted $\mathbf{o}_c$.
+
+\paragraph{Output head.}
+Since MapBiomas Solo properties $\mathbf{s}$ are static once the harvest year is known, we fuse them directly in the decoder.
+MSTNet concatenates the trunk embeddings with soil and decodes a scalar productivity estimate,
+\begin{equation}
+  \hat{y}
+  =
+  MLP_2\bigl([\mathbf{o}_s;\mathbf{o}_c;\mathbf{s}]\bigr),
+  \label{eq:output-head}
+\end{equation}
+with $\hat{y}$ interpreted per pixel or per municipal aggregate according to the input path in Section~\ref{sec:pixel-formulation}.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{mstnet_arch.pdf}
+\caption{MSTNet architecture.
+Each STNet trunk $i\in\{s,c\}$ maps a SITS $\mathbf{X}_i$ of length $T_i$ through a shared per-timestep MLP to $\mathbf{E}_i$, adds DoY encodings to form $\mathbf{E}_i'$, applies a Transformer encoder to obtain $\mathbf{O}_i$, and pools with Seq2Vec to $\mathbf{o}_s$ with NDVI weights or $\mathbf{o}_c$ as a mean over valid days.
+The output head concatenates $\mathbf{o}_s$, $\mathbf{o}_c$, and MapBiomas Solo features~$\mathbf{s}$, then $MLP_2$ predicts productivity~$\hat{y}$.
+Adapted from Fig.~2 of~\citet{xu2024sitsmoco}.}
+\label{fig:mstnet-arch}
+\end{figure*}
+
+\subsection{Municipal-mean training and post-training pixel scoring}
 \label{sec:pixel-formulation}
 Let $\mathcal{P}_{m,y}$ denote the soybean pixels observed in municipality $m$ in harvest year $y$.
-MSTNet defines a productivity score $\hat{y}_p$ for each soy pixel $p$ from its Sentinel-2 sequence $\mathbf{x}_p$, the municipal daily climate series $\mathbf{c}_{m,y}$ (broadcast to all pixels in $m$), and soil covariates $\mathbf{s}_p$ (or a municipal soil vector when only polygon-level soil is available).
-Reported municipal predictions average those pixel scores,
-\begin{equation}
-  \hat{y}_{m,y}
-  =
-  \frac{1}{|\mathcal{P}_{m,y}|}
-  \sum_{p \in \mathcal{P}_{m,y}}
-  \hat{y}_p ,
-  \qquad
-  \hat{y}_p = f_\theta(\mathbf{x}_p, \mathbf{c}_{m,y}, \mathbf{s}_p),
-  \label{eq:pixel-mean-agg}
-\end{equation}
-and are compared with the PAM label $y_{m,y}$.
-At inference the field $\{\hat{y}_p\}$ can also be kept as a map or averaged over any sub-municipal polygon.
-Appendix~\ref{app:pixel-pipeline} sketches this pipeline.
-
-Training uses a cheaper surrogate: soy-masked Sentinel-2 reflectance is averaged before encoding,
+Training uses the municipal-mean path: every covariate stream is restricted to those soy pixels and averaged before it enters the network.
+For Sentinel-2 reflectance at date $t$,
 \begin{equation}
   \bar{\mathbf{x}}_{m,y,t}
   =
@@ -28,27 +103,53 @@ Training uses a cheaper surrogate: soy-masked Sentinel-2 reflectance is averaged
   \sum_{p \in \mathcal{P}_{m,y,t}}\mathbf{x}_{p,t},
   \label{eq:municipal-mean}
 \end{equation}
-so each municipality--year is one forward pass
-$\hat{y}_{m,y}^{\mathrm{train}}=f_\theta(\bar{\mathbf{x}}_{m,y},\mathbf{c}_{m,y},\mathbf{s}_m)$
-supervised by PAM.
-The LOO metrics in Sections~\ref{sec:experiments}--\ref{sec:results} are not from that surrogate: they apply the trained weights pixel by pixel and aggregate with~\eqref{eq:pixel-mean-agg}.
-Because $f_\theta$ is nonlinear, mean-then-encode and encode-then-mean need not coincide; the pixel-mean evaluation is the operational downscaling check.
-Appendix~\ref{app:muni-mean-loo} reports the same LOO years under the municipal-mean evaluation path for reference.
+and the same soy-masked average yields the municipal climate series $\bar{\mathbf{c}}_{m,y}$ and soil vector $\bar{\mathbf{s}}_{m,y}$.
+Each municipality--year is then one forward pass
+$\hat{y}_{m,y}^{\mathrm{train}}=f_\theta(\bar{\mathbf{x}}_{m,y},\bar{\mathbf{c}}_{m,y},\bar{\mathbf{s}}_{m,y})$
+supervised by PAM (Figure~\ref{fig:data-flow}).
 
-\subsection{Architecture}
-MSTNet (\emph{Multi} STNet) places one STNet trunk on each time-varying stream so that modalities with different sampling rates need not share a common calendar~\citep{xu2024sitsmoco}.
-A spectral trunk encodes Sentinel-2 sequences (ten bands, length $T=45$) with day-of-year positional encodings and NDVI-weighted temporal pooling.
-A climate trunk encodes daily Xavier weather (five channels: precipitation, ETo, Rs, Tmax, Tmin) over the Oct--Mar window (length $183$), pooled by a mean over valid days.
-MapBiomas Solo properties are fixed once the harvest year is known. They are concatenated with the pooled trunk embeddings and passed through a multilayer-perceptron decoder that outputs a productivity estimate (per pixel or per municipal aggregate, depending on the input path).
-As an ablation on a spectral-only single-trunk STNet, we also try mean pooling over valid spectral timesteps instead of NDVI weights.
-That spectral-only model uses ten-band inputs and has no climate or soil branches.
+After training, the same weights define a productivity score $\hat{y}_p$ for each soy pixel $p$ from its Sentinel-2 sequence $\mathbf{x}_p$, the municipal daily climate series $\mathbf{c}_{m,y}$ (broadcast to all pixels in $m$), and soil covariates $\mathbf{s}_p$.
+Each pixel score is
+\begin{equation}
+  \hat{y}_p = f_\theta(\mathbf{x}_p, \mathbf{c}_{m,y}, \mathbf{s}_p),
+  \label{eq:pixel-score}
+\end{equation}
+and municipal predictions average those scores,
+\begin{equation}
+  \hat{y}_{m,y}
+  =
+  \frac{1}{|\mathcal{P}_{m,y}|}
+  \sum_{p \in \mathcal{P}_{m,y}}
+  \hat{y}_p ,
+  \label{eq:pixel-mean-agg}
+\end{equation}
+then compared with the PAM label $y_{m,y}$.
+The same field $\{\hat{y}_p\}$ can be kept as a map or averaged over any sub-municipal polygon.
+This post-training pixel path is the source of the LOO metrics, maps, and scatterplots in Section~\ref{sec:results}.
+Appendix~\ref{app:pixel-pipeline} diagrams the corresponding data pipeline and recalls the shared MSTNet architecture at pixel scoring time.
+The same forward path would be used to train pixel-wise by scoring every soy pixel and averaging before the loss; we do not train that way because it is much slower while targeting the same municipal labels.
+Because $f_\theta$ is nonlinear, mean-then-encode and encode-then-mean need not coincide.
+Section~\ref{sec:exp-muni-mean} reports the same LOO years under the municipal-mean path.
 
-Each MSTNet trunk uses one Transformer layer, $d_{\mathrm{model}}=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=64$, and dropout $0.4$.
-
-\subsection{Loss and optimization}
-Training minimizes mean squared error between predicted and observed municipal productivity after standardizing targets with the training-set mean and standard deviation.
-Reported metrics (RMSE, MAE, and $R^2$) are computed after transforming predictions back to \si{t/ha}.
-
-Optimization uses AdamW with learning rate $1\times10^{-3}$, weight decay $5\times10^{-4}$, and batches of 40 municipalities.
-The learning rate is scheduled to drop at epochs 40 and 120; training stops early after fifteen epochs without improvement in validation $R^2$.
-No self-supervised pretraining is used: the network is trained from scratch under municipal supervision.
+\subsection{Loss}
+\label{sec:loss}
+Let $y_{m,y}$ be the PAM productivity for municipality $m$ in harvest year $y$, and let $\mu$ and $\sigma$ be the mean and standard deviation of PAM targets on the training years of the current fold.
+Targets are standardized as
+\begin{equation}
+  \tilde{y}_{m,y}
+  =
+  \frac{y_{m,y}-\mu}{\sigma},
+  \label{eq:target-standardize}
+\end{equation}
+and the municipal-mean forward pass outputs a prediction $\hat{y}_{m,y}^{\mathrm{train}}$ in the same standardized space.
+Training minimizes the mean squared error over the municipal-mean training set $\mathcal{D}$,
+\begin{equation}
+  \mathcal{L}(\theta)
+  =
+  \frac{1}{|\mathcal{D}|}
+  \sum_{(m,y)\in\mathcal{D}}
+  \bigl(\hat{y}_{m,y}^{\mathrm{train}}-\tilde{y}_{m,y}\bigr)^2.
+  \label{eq:mse-loss}
+\end{equation}
+Within each leave-one-year-out fold, $\mu$, $\sigma$, and the channel-wise standardization statistics for Sentinel-2, climate, and soil are recomputed using only the four training years and then applied unchanged to the held-out year.
+Reported metrics (RMSE, MAE, and $R^2$) use the inverse map $\sigma\hat{y}+\mu$ back to \si{t/ha}.
