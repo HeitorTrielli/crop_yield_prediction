@@ -13,8 +13,18 @@
 \usepackage{xcolor}
 \usepackage{caption}
 \usepackage{subcaption}
+\usepackage[section]{placeins}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+
+% Prefer floats near their callouts rather than deferred to the end.
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.7}
+\setcounter{topnumber}{5}
+\setcounter{bottomnumber}{5}
+\setcounter{totalnumber}{10}
 
 \hypersetup{
   colorlinks=true,
@@ -40,10 +50,10 @@
 \input{sections/results}
 \input{sections/discussion}
 \input{sections/conclusion}
-\input{sections/data_availability}
-\input{sections/appendix}
 
 \bibliographystyle{plainnat}
 \bibliography{refs}
+
+\input{sections/appendix}
 
 \end{document}
