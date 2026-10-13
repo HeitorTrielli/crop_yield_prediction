@@ -1,8 +1,11 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-We presented MSTNet, a multi-frequency Transformer that uses Sentinel-2 time series, daily Xavier climate, and MapBiomas Solo covariates to predict soybean productivity from municipal PAM labels while scoring soy pixels for sub-municipal maps.
-Under year leave-one-out on Paran\'{a} harvest years 2020--2024, municipal aggregates of pixel scores reach mean $R^2=0.302$ and RMSE $=0.427$\,\si{t/ha} when the 2022 drought fold is excluded; that drought LOO fold fails ($R^2=-0.422$) because no similar season remains in training.
+We presented MSTNet, a multi-frequency Transformer that learns soybean productivity from municipal PAM labels and scores soy pixels for sub-municipal maps.
+Sentinel-2 time series and daily Xavier climate enter parallel STNet trunks; MapBiomas Solo enters the decoder by late fusion.
+Training uses soy-masked municipal means; after training, the same weights score every soy pixel and average to municipalities or arbitrary polygons.
 
-These figures give a reproducible LOO benchmark for municipal-supervision, pixel-scoring yield models in Paran\'{a}.
-Calibrated intramunicipal maps, broader geographies, and claims about individual covariate groups still need field checks, matched ablations, and additional LOO seasons.
+Under year leave-one-out on Paran\'{a} harvest years 2020--2024, excluding the 2022 drought fold, municipal-mean LOO reaches mean $R^2=0.275$ and the pixel path reaches mean $R^2=0.302$ with RMSE $=0.427$\,\si{t/ha}.
+The 2022 fold fails under both paths because no similar drought season remains in training.
+That failure is a coverage problem: training sets that include poor-yield municipality--years from other seasons and regions should make drought-like responses recognizable.
+Intramunicipal maps remain qualitative until field yields are available to score them, and controlled ablations are still in progress.
