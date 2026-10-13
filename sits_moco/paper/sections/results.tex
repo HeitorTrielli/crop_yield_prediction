@@ -1,30 +1,35 @@
 \section{Results}
 \label{sec:results}
 
+We report post-training pixel-path LOO accuracy against PAM, then examine the 2022 drought fold, partial-season truncations, and finally scatterplots and spatial maps for every LOO year.
+Municipal-mean LOO metrics for the same checkpoints are in Section~\ref{sec:exp-muni-mean}; the corresponding municipal-mean scatterplots, error maps, and partial-season curves are in Appendix~\ref{app:muni-mean-eval}.
+
 \subsection{Year-LOO municipal accuracy}
-Table~\ref{tab:loo-metrics} reports pixel-mean municipal metrics on the left-out year of each fold.
+Table~\ref{tab:loo-metrics} reports post-training pixel-path metrics on the left-out year of each fold: every soy pixel is scored and the scores are averaged to the municipality before comparison with PAM.
+Deltas are relative to the municipal-mean path on the same checkpoints (Table~\ref{tab:loo-muni-mean}).
 Across the five folds, mean $R^2$ is $0.157$ and mean RMSE is $0.623$\,\si{t/ha}.
-Excluding the 2022 drought fold, mean $R^2$ rises to $0.302$ and mean RMSE falls to $0.427$\,\si{t/ha}.
+Excluding the 2022 drought fold, mean $R^2$ rises to $0.302$ and mean RMSE falls to $0.427$\,\si{t/ha}, a mean $\Delta R^2$ of $+0.027$ over the municipal-mean path.
 The strongest non-drought fold is 2021 ($R^2=0.402$, RMSE $=0.323$\,\si{t/ha}).
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering
 \caption{Year leave-one-out metrics for MSTNet (pixel-by-pixel scores averaged to municipalities).
 Each row is a fold that trains on the other four harvest years and evaluates only the listed LOO year.
-RMSE and MAE are in \si{t/ha}.}
+RMSE, MAE, $\Delta\mathrm{RMSE}$, and $\Delta\mathrm{MAE}$ are in \si{t/ha}.
+Each $\Delta$ is the pixel-path metric minus the municipal-mean-path metric from Table~\ref{tab:loo-muni-mean} on the same fold; negative $\Delta\mathrm{RMSE}$ or $\Delta\mathrm{MAE}$ and positive $\Delta R^2$ mean the pixel path improves on the municipal-mean path.}
 \label{tab:loo-metrics}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccccccc}
 \toprule
-LOO year & $n$ & RMSE & MAE & $R^2$ \\
+LOO year & $n$ & RMSE & MAE & $R^2$ & $\Delta\mathrm{RMSE}$ & $\Delta\mathrm{MAE}$ & $\Delta R^2$ \\
 \midrule
-2020 & 346 & 0.395 & 0.316 & 0.291 \\
-2021 & 343 & 0.323 & 0.244 & 0.402 \\
-2022 & 342 & 1.404 & 1.136 & $-0.422$ \\
-2023 & 339 & 0.424 & 0.337 & 0.231 \\
-2024 & 336 & 0.568 & 0.439 & 0.284 \\
+2020 & 346 & 0.395 & 0.316 & 0.291 & $-0.016$ & $0.000$ & $+0.058$ \\
+2021 & 343 & 0.323 & 0.244 & 0.402 & $+0.003$ & $+0.005$ & $-0.008$ \\
+2022 & 342 & 1.404 & 1.136 & $-0.422$ & $+0.062$ & $+0.067$ & $-0.122$ \\
+2023 & 339 & 0.424 & 0.337 & 0.231 & $-0.009$ & $-0.008$ & $+0.032$ \\
+2024 & 336 & 0.568 & 0.439 & 0.284 & $-0.009$ & $-0.006$ & $+0.025$ \\
 \midrule
-Mean & --- & 0.623 & 0.495 & 0.157 \\
-Mean excl.\ 2022 & --- & 0.427 & 0.334 & 0.302 \\
+Mean & --- & 0.623 & 0.495 & 0.157 & $+0.006$ & $+0.012$ & $-0.003$ \\
+Mean excl.\ 2022 & --- & 0.427 & 0.334 & 0.302 & $-0.008$ & $-0.002$ & $+0.027$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -33,42 +38,97 @@ Mean excl.\ 2022 & --- & 0.427 & 0.334 & 0.302 \\
 Harvest 2022 is the only year in our 2020--2024 sample with a severe drought across Paran\'{a}.
 When 2022 is the LOO year, the training set contains no analogous drought season, so the model must extrapolate outside the climatic regimes seen in training.
 That fold collapses: $R^2=-0.422$ and RMSE $=1.404$\,\si{t/ha}, far worse than the other LOO years.
-Figure~\ref{fig:map2022} shows the corresponding municipal error map.
+Figure~\ref{fig:map-error} places that drought error map beside the best non-drought fold, 2021.
+The 2022 panel shows a spatially coherent band of large positive errors across the west and northwest of the state: the model over-predicts where observed PAM productivity collapsed.
+That footprint matches the known geography of the 2021/22 drought, which hit the West and Northwest hardest, including the Toledo, Cascavel, and Paranava\'{\i} regions.
+Municipalities such as Palotina, Terra Roxa, Medianeira, Toledo, and Assis Chateaubriand appear among the largest over-predictions in our LOO fold.
 The remaining folds, trained with 2022 available when another year is held out, do not face that missing-regime problem to the same degree.
 We therefore treat 2022 as a stress test of out-of-distribution seasons rather than as a typical LOO score, and we report means both with and without that fold.
 
-\begin{figure}[t]
+\subsection{Partial-season evaluation}
+\label{sec:incomplete-series}
+After training on the full Oct--Mar window, we also score each LOO fold on truncated inputs that keep only the first $k$ season months, for $k=1,\ldots,6$, on the pixel path.
+Table~\ref{tab:incomplete-r2} and Figure~\ref{fig:incomplete-r2} report municipal $R^2$ as months are added.
+With one or two months the scores are strongly negative on every fold.
+Positive $R^2$ appears around $k=4$ on non-drought years and approaches the full-season value by $k=5$--$6$: excluding 2022, mean $R^2$ rises from $-0.156$ at three months to $0.165$, $0.288$, and $0.302$ at four, five, and six months.
+The small gain from adding March, relative to stopping in February, suggests that on the observed years either harvest is largely complete before March begins or almost all information used by the model is already available by late February; we cannot separate these explanations because the actual harvest dates are not observed.
+The drought fold stays negative for every truncation.
+Appendix~\ref{app:muni-mean-eval} reports the same truncations under the municipal-mean path.
+
+\begin{table}[!htbp]
 \centering
-\includegraphics[width=0.72\textwidth]{map_error_2022.png}
-\caption{Municipal aggregate prediction error map for LOO year 2022 (drought fold).}
-\label{fig:map2022}
+\caption{Pixel-path year-LOO $R^2$ under incomplete seasons.
+Each column keeps only the first $k$ months of the Oct--Mar window ($k=1$ is October only; $k=6$ is the full season reported in Table~\ref{tab:loo-metrics}).}
+\label{tab:incomplete-r2}
+\begin{tabular}{lcccccc}
+\toprule
+LOO year & Oct & Nov & Dec & Jan & Feb & Mar \\
+\midrule
+2020 & $-9.763$ & $-0.302$ & $0.050$ & $0.162$ & $0.257$ & $0.291$ \\
+2021 & $-7.178$ & $-8.708$ & $-0.752$ & $-0.013$ & $0.387$ & $0.402$ \\
+2022 & $-1.049$ & $-0.931$ & $-0.692$ & $-0.500$ & $-0.443$ & $-0.422$ \\
+2023 & $-2.434$ & $-2.326$ & $-0.263$ & $0.200$ & $0.238$ & $0.231$ \\
+2024 & $-2.754$ & $-2.407$ & $0.343$ & $0.312$ & $0.272$ & $0.284$ \\
+\midrule
+Mean & $-4.636$ & $-2.935$ & $-0.263$ & $0.032$ & $0.142$ & $0.157$ \\
+Mean excl.\ 2022 & $-5.532$ & $-3.436$ & $-0.156$ & $0.165$ & $0.288$ & $0.302$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{incomplete_series_r2.pdf}
+\caption{Pixel-path LOO $R^2$ versus season length.
+Each curve is one left-out year; the black squares are the mean over non-drought folds.
+Points below the axis floor are clipped and marked with downward triangles.}
+\label{fig:incomplete-r2}
 \end{figure}
 
 \subsection{Scatterplots and spatial examples}
 Figure~\ref{fig:scatter} shows predicted versus observed municipal productivity for every LOO year.
 Non-drought folds track the identity line with moderate scatter; the 2022 panel shows the systematic failure under drought.
-Figure~\ref{fig:map2021} maps municipal errors for the 2021 LOO fold.
-Figure~\ref{fig:guara} shows pixel-level scores for Guarapuava under the 2021 LOO checkpoint.
-That map is qualitative; we have no field yields to score it against, only the municipal PAM total when the pixels are averaged.
+Even on better years, predictions compress toward a mid-range value: many municipalities are scored near the same average productivity, and the model under-separates the highest-yielding municipalities from the rest.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \includegraphics[width=\linewidth,height=0.42\textheight,keepaspectratio]{scatter_panel.pdf}
-\caption{Predicted versus observed municipal soybean productivity (\si{t/ha}) for each year-LOO fold of MSTNet.
+\caption{Predicted versus observed municipal soybean productivity (\si{t/ha}) for each year-LOO fold of MSTNet under the pixel path.
 Every panel evaluates only the left-out year. The dashed line is identity.}
 \label{fig:scatter}
 \end{figure}
 
-\begin{figure}[t]
+Figure~\ref{fig:map-error} maps municipal aggregate errors for the best and worst LOO years on the pixel path, 2021 and 2022.
+Relative to the more scattered 2021 residuals, the 2022 errors concentrate where the drought hit hardest, so the spatial pattern of model failure is itself informative about the missed regime.
+The remaining years appear in Appendix~\ref{app:extra-heatmaps}.
+
+\begin{figure}[!htbp]
 \centering
-\includegraphics[width=0.72\textwidth]{map_error_2021.png}
-\caption{Municipal aggregate prediction error map for LOO year 2021.}
-\label{fig:map2021}
+\includegraphics[width=\linewidth,keepaspectratio]{map_error_panel.png}
+\caption{Municipal aggregate prediction error maps under the pixel path for the best non-drought LOO year (2021) and the drought LOO year (2022).}
+\label{fig:map-error}
 \end{figure}
 
-\begin{figure}[t]
+Figure~\ref{fig:mambore} shows pixel-level scores for Mambor\'{e} under those same two checkpoints.
+This is the main goal of the method: after training only on municipal PAM labels, the network can score arbitrary polygons, here the soy pixels inside one municipality, without field-level yields.
+Figure~\ref{fig:mambore-ndvi} stacks the 2022 productivity map with mean NDVI and peak NDVI over the same soy pixels; we use 2022 because its peak NDVI field is less homogeneous than in the other LOO years, so intramunicipal contrast is easier to see.
+Those maps remain qualitative; we have no field yields to score them against, only the municipal PAM total when the pixels are averaged.
+Mambor\'{e} maps for 2020, 2023, and 2024 are in Appendix~\ref{app:extra-heatmaps}.
+
+\begin{figure}[!htbp]
 \centering
-\includegraphics[width=0.72\textwidth]{guarapuava_heatmap.png}
-\caption{Intramunicipal map of downscaled pixel-level productivity predictions for Guarapuava, Paran\'{a} (LOO year 2021).}
-\label{fig:guara}
+\includegraphics[width=\linewidth,keepaspectratio]{mambore_panel.png}
+\caption{Intramunicipal maps of downscaled pixel-level productivity predictions for Mambor\'{e}, Paran\'{a}, under the 2021 and 2022 LOO checkpoints.}
+\label{fig:mambore}
 \end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.92\linewidth,height=0.88\textheight,keepaspectratio]{mambore_ndvi_compare.png}
+\caption{Mambor\'{e} under the 2022 LOO checkpoint: predicted productivity, mean NDVI, and peak NDVI on soy pixels, stacked so that spatial patterns can be compared directly.}
+\label{fig:mambore-ndvi}
+\end{figure}
+
+\subsection{Ablations}
+\label{sec:ablations}
+Work in progress.

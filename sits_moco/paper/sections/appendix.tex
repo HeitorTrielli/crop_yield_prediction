@@ -2,12 +2,12 @@
 \section{Pixel-level MSTNet pipeline}
 \label{app:pixel-pipeline}
 
-Section~\ref{sec:pixel-formulation} defines the pixel-scoring evaluation~\eqref{eq:pixel-mean-agg}: soy-masked Sentinel-2 pixels are scored one by one, municipal climate is shared across pixels, soil enters by late fusion, and the mean of the pixel predictions is compared with PAM.
-Figure~\ref{fig:data-flow} shows the municipality-mean spectral path used for training.
-Figure~\ref{fig:data-flow-pixel} shows the pixel-by-pixel path used for the reported LOO metrics and for intramunicipal maps.
-At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged over any polygon. That map is not a training target.
+Figure~\ref{fig:data-flow} in the main text shows the municipal-mean path used for training and for the municipal-mean LOO metrics in Section~\ref{sec:experiments}.
+Figure~\ref{fig:data-flow-pixel} diagrams the pixel-wise alternative used after training: soy-masked Sentinel-2 pixels are encoded one by one, climate is broadcast across pixels, soil enters by late fusion, and the mean of the pixel predictions $\hat{y}_p$ is compared with PAM~\eqref{eq:pixel-mean-agg}.
+We do not train with that path; it is much slower than municipal-mean training while targeting the same labels.
+The diagram is still useful because the post-training evaluation in Section~\ref{sec:results} follows the same forward path without backpropagating through every pixel, and the resulting field $\{\hat{y}_p\}$ can be kept as a map or averaged over any polygon.
 
-\begin{figure*}[t]
+\begin{figure}[!htbp]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
@@ -20,7 +20,7 @@ At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged ov
   src/.style={
     draw=black!40, fill=white, rounded corners=2pt,
     align=center, inner xsep=5pt, inner ysep=5pt,
-    minimum width=2.35cm, minimum height=1.5cm, line width=0.45pt
+    minimum width=2.35cm, minimum height=1.15cm, line width=0.45pt
   },
   mid/.style={
     draw=black!40, fill=black!2, rounded corners=2pt,
@@ -39,95 +39,53 @@ At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged ov
   },
   rowlab/.style={font=\scriptsize\color{black!50}, anchor=east},
   arr/.style={->, line width=0.55pt, draw=black!45},
-  iconfields/.pic={
-    \fill[green!48!black!60] (-0.24,-0.13) -- (-0.02,-0.13) -- (0.00,0.00) -- (-0.22,0.03) -- cycle;
-    \fill[yellow!50!green!55] (0.00,-0.13) -- (0.24,-0.13) -- (0.24,0.00) -- (0.03,0.00) -- cycle;
-    \fill[green!32!black!40] (-0.22,0.04) -- (0.00,0.02) -- (0.04,0.15) -- (-0.24,0.15) -- cycle;
-    \fill[olive!50!black!35] (0.04,0.02) -- (0.24,0.02) -- (0.24,0.15) -- (0.06,0.15) -- cycle;
-    \draw[white, line width=0.3pt] (-0.24,-0.13) rectangle (0.24,0.15);
-  },
-  iconmask/.pic={
-    \fill[black!10] (-0.22,-0.13) rectangle (0.22,0.13);
-    \fill[green!55!black]
-      (-0.10,-0.06) .. controls (-0.12,0.04) and (0.00,0.13) .. (0.06,0.09)
-      .. controls (0.16,0.03) and (0.12,-0.08) .. (0.00,-0.09)
-      .. controls (-0.05,-0.10) and (-0.08,-0.08) .. cycle;
-  },
-  iconcloud/.pic={
-    \fill[black!12!cyan!28] (-0.05,0.03) circle [radius=0.08];
-    \fill[black!12!cyan!28] (0.05,0.05) circle [radius=0.10];
-    \fill[black!12!cyan!28] (0.00,0.10) circle [radius=0.09];
-    \fill[black!12!cyan!28] (-0.13,0.02) circle [radius=0.06];
-    \fill[black!12!cyan!28] (0.13,0.02) circle [radius=0.06];
-    \draw[cyan!35!black, line width=0.28pt] (-0.06,-0.03) -- (-0.08,-0.11);
-    \draw[cyan!35!black, line width=0.28pt] (0.00,-0.03) -- (0.00,-0.13);
-    \draw[cyan!35!black, line width=0.28pt] (0.06,-0.03) -- (0.08,-0.10);
-  },
-  iconsoil/.pic={
-    \fill[brown!70!black!55] (-0.20,-0.13) rectangle (0.20,-0.05);
-    \fill[brown!50!orange!40] (-0.20,-0.05) rectangle (0.20,0.02);
-    \fill[brown!28!yellow!40] (-0.20,0.02) rectangle (0.20,0.07);
-    \fill[green!38!black!28] (-0.20,0.07) rectangle (0.20,0.13);
-    \draw[black!30, line width=0.22pt] (-0.20,-0.13) rectangle (0.20,0.13);
-  },
-  iconpam/.pic={
-    \fill[white] (-0.13,-0.13) rectangle (0.15,0.13);
-    \draw[violet!40!black, line width=0.28pt] (-0.13,-0.13) rectangle (0.15,0.13);
-    \fill[violet!15] (-0.13,0.06) rectangle (0.15,0.13);
-    \fill[violet!45!black] (-0.05,-0.09) rectangle (-0.01,-0.04);
-    \fill[violet!55!black] (0.01,-0.09) rectangle (0.05,-0.01);
-    \fill[violet!65!black] (0.07,-0.09) rectangle (0.11,0.02);
-  },
 ]
 
-  % ===== Sources =====
   \node[rowlab] at (-8.0, 0) {Sources};
 
-  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]-6.3,0) {};
-  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]-6.3,0) {};
-  \node[src] (s2) at (-6.3, 0) {%
-    \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconfields}}\\[2pt]
-      \scriptsize Sentinel-2\\[0pt]
-      \scriptsize via GEE
-    \end{tabular}};
+  \node[src] (s2) at (-6.3, 0) {\scriptsize Sentinel-2};
+  \begin{scope}[on background layer]
+    \node[src, fill=black!7, draw=black!26, line width=0.4pt,
+          inner sep=0pt, fit=(s2), xshift=4pt, yshift=-4pt] {};
+    \node[src, fill=black!3, draw=black!30, line width=0.4pt,
+          inner sep=0pt, fit=(s2), xshift=2pt, yshift=-2pt] {};
+  \end{scope}
 
   \node[src] (soy) at (-3.15, 0) {%
     \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconmask}}\\[2pt]
       \scriptsize MapBiomas\\[0pt]
       \scriptsize soy mask
     \end{tabular}};
 
-  \node[src, fill=black!7, draw=black!28] at ([shift={(5pt,-5pt)}]0,0) {};
-  \node[src, fill=black!3, draw=black!32] at ([shift={(2.5pt,-2.5pt)}]0,0) {};
   \node[src] (xav) at (0, 0) {%
     \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconcloud}}\\[2pt]
       \scriptsize Xavier\\[0pt]
       \scriptsize weather
     \end{tabular}};
+  \begin{scope}[on background layer]
+    \node[src, fill=black!7, draw=black!26, line width=0.4pt,
+          inner sep=0pt, fit=(xav), xshift=4pt, yshift=-4pt] {};
+    \node[src, fill=black!3, draw=black!30, line width=0.4pt,
+          inner sep=0pt, fit=(xav), xshift=2pt, yshift=-2pt] {};
+  \end{scope}
 
   \node[src] (soil) at (3.15, 0) {%
     \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconsoil}}\\[2pt]
       \scriptsize MapBiomas\\[0pt]
       \scriptsize Solo
     \end{tabular}};
 
-  \node[src] (pam) at (6.3, 0) {%
-    \begin{tabular}{@{}c@{}}
-      \tikz{\pic{iconpam}}\\[2pt]
-      \scriptsize IBGE PAM
-    \end{tabular}};
+  \node[src] (pam) at (6.3, 0) {\scriptsize IBGE PAM};
 
-  % ===== Pixel preparation =====
   \node[rowlab] at (-8.0, -3.0) {Pixels};
 
-  % many soy pixels (stacked)
-  \node[mid, fill=black!7, draw=black!28] at ([shift={(4pt,-4pt)}]-4.725,-3.0) {};
-  \node[mid, fill=black!3, draw=black!32] at ([shift={(2pt,-2pt)}]-4.725,-3.0) {};
   \node[mid] (p_s2) at (-4.725, -3.0) {\scriptsize Soy pixel series};
+  \begin{scope}[on background layer]
+    \node[mid, fill=black!7, draw=black!26, line width=0.4pt,
+          inner sep=0pt, fit=(p_s2), xshift=4pt, yshift=-4pt] {};
+    \node[mid, fill=black!3, draw=black!30, line width=0.4pt,
+          inner sep=0pt, fit=(p_s2), xshift=2pt, yshift=-2pt] {};
+  \end{scope}
 
   \node[mid] (p_cl) at (0, -3.0) {\scriptsize Climate\\[-1pt]\scriptsize (broadcast)};
   \node[mid] (p_so) at (3.15, -3.0) {\scriptsize Soil\\[-1pt]\scriptsize (per pixel)};
@@ -139,7 +97,6 @@ At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged ov
   \draw[arr] (soil.south) -- (p_so.north);
   \draw[arr] (pam.south) -- (p_lb.north);
 
-  % ===== Encoders =====
   \node[rowlab] at (-8.0, -6.2) {Encoders};
   \node[enc=blue!55!black] (e_s2) at (-4.725, -6.2) {\scriptsize Spectral encoder};
   \node[enc=orange!65!black] (e_cl) at (0, -6.2) {\scriptsize Climate encoder};
@@ -161,7 +118,6 @@ At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged ov
   \draw[arr] (p_s2.south) -- (e_s2.north);
   \draw[arr] (p_cl.south) -- (e_cl.north);
 
-  % ===== Decoder (pixel scores; single node, not stacked) =====
   \node[rowlab] at (-8.0, -9.0) {Decoder};
   \node[dec, minimum width=3.6cm, text width=3.4cm] (dec) at (-2.3625, -9.0)
     {\scriptsize Late fusion + MLP $\Rightarrow\hat{y}_p$};
@@ -170,13 +126,11 @@ At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged ov
   \draw[arr] (e_cl.south) -- ++(0,-0.7) -| (dec.30);
   \draw[arr] (p_so.south) -- (p_so.south |- dec.east) -- (dec.east);
 
-  % ===== Municipal aggregation of predictions =====
   \node[rowlab] at (-8.0, -11.2) {Aggregate};
   \node[dec] (agg) at (-2.3625, -11.2) {\scriptsize Mean of pixel predictions};
 
   \draw[arr] (dec.south) -- (agg.north);
 
-  % ===== Output =====
   \node[rowlab] at (-8.0, -13.4) {Output};
   \node[dec] (out) at (-2.3625, -13.4) {$\hat{y}_{m,y}$};
 
@@ -184,39 +138,95 @@ At inference the pixel field $\{\hat{y}_p\}$ can be kept as a map or averaged ov
   \draw[arr] (p_lb.south) -- (p_lb.south |- out.east) -- (out.east);
 \end{tikzpicture}%
 }
-\caption{Pixel-by-pixel MSTNet pipeline.
+\caption{Pixel-wise MSTNet data pipeline used for post-training evaluation and sub-municipal maps, not for training.
 Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion.
-The mean of pixel predictions $\hat{y}_p$ yields $\hat{y}_{m,y}$, which is supervised by IBGE PAM.}
+The mean of pixel predictions $\hat{y}_p$ yields $\hat{y}_{m,y}$ for comparison with IBGE PAM.}
 \label{fig:data-flow-pixel}
-\end{figure*}
+\end{figure}
 
-\section{Municipal-mean evaluation on LOO years}
-\label{app:muni-mean-loo}
+The network weights are shared with the municipal-mean training path: the MSTNet blocks in Figure~\ref{fig:mstnet-arch} are unchanged, and only the input aggregation differs, as in Figure~\ref{fig:data-flow-pixel}.
 
-Training encodes soy-masked municipal-mean Sentinel-2 series~\eqref{eq:municipal-mean}.
-Table~\ref{tab:loo-metrics} in the main text instead scores every soy pixel and averages the predictions~\eqref{eq:pixel-mean-agg}.
-Table~\ref{tab:loo-muni-mean} reports the same left-out years under the municipal-mean evaluation path, using the same fold checkpoints.
-The two paths are close on non-drought folds; the 2022 drought fold remains poor under either aggregation ($R^2=-0.300$ municipal-mean versus $-0.422$ pixel-mean).
-Excluding 2022, mean municipal-mean LOO $R^2$ is $0.275$.
+\section{Municipal-mean LOO diagnostics}
+\label{app:muni-mean-eval}
+Section~\ref{sec:exp-muni-mean} reports full-season municipal-mean LOO metrics.
+Here we add the municipal-mean counterparts of the partial-season curves, scatterplots, and Paraná error maps from Section~\ref{sec:results}.
+There is no Mambor\'{e} panel for this path because municipal-mean inputs do not produce intramunicipal scores.
 
-\begin{table}[ht]
+\subsection{Partial-season evaluation}
+Table~\ref{tab:incomplete-r2-muni} and Figure~\ref{fig:incomplete-r2-muni} report municipal-mean $R^2$ when only the first $k$ season months are kept.
+As on the pixel path, early truncations are strongly negative; excluding 2022, mean $R^2$ reaches $-0.034$, $0.269$, and $0.275$ at four, five, and six months.
+
+\begin{table}[!htbp]
 \centering
-\caption{Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode).
-Each row evaluates only the listed LOO year with the fold trained on the other four harvest years.
-RMSE and MAE are in \si{t/ha}.}
-\label{tab:loo-muni-mean}
-\begin{tabular}{lcccc}
+\caption{Municipal-mean year-LOO $R^2$ under incomplete seasons.
+Each column keeps only the first $k$ months of the Oct--Mar window ($k=6$ matches Table~\ref{tab:loo-muni-mean}).}
+\label{tab:incomplete-r2-muni}
+\begin{tabular}{lcccccc}
 \toprule
-LOO year & $n$ & RMSE & MAE & $R^2$ \\
+LOO year & Oct & Nov & Dec & Jan & Feb & Mar \\
 \midrule
-2020 & 346 & 0.411 & 0.316 & 0.233 \\
-2021 & 343 & 0.320 & 0.239 & 0.410 \\
-2022 & 342 & 1.342 & 1.069 & $-0.300$ \\
-2023 & 339 & 0.433 & 0.345 & 0.199 \\
-2024 & 336 & 0.577 & 0.445 & 0.259 \\
+2020 & $-19.078$ & $-1.517$ & $0.127$ & $0.072$ & $0.221$ & $0.233$ \\
+2021 & $-19.950$ & $-18.097$ & $-1.441$ & $-0.605$ & $0.377$ & $0.410$ \\
+2022 & $-0.975$ & $-0.858$ & $-0.524$ & $-0.360$ & $-0.308$ & $-0.300$ \\
+2023 & $-3.056$ & $-4.617$ & $-0.643$ & $0.128$ & $0.220$ & $0.199$ \\
+2024 & $-4.293$ & $-3.539$ & $0.253$ & $0.271$ & $0.256$ & $0.259$ \\
 \midrule
-Mean & --- & 0.617 & 0.483 & 0.160 \\
-Mean excl.\ 2022 & --- & 0.435 & 0.336 & 0.275 \\
+Mean & $-9.470$ & $-5.725$ & $-0.446$ & $-0.099$ & $0.153$ & $0.160$ \\
+Mean excl.\ 2022 & $-11.594$ & $-6.942$ & $-0.426$ & $-0.034$ & $0.269$ & $0.275$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.85\textwidth]{incomplete_series_r2_muni_mean.pdf}
+\caption{Municipal-mean LOO $R^2$ versus season length.
+Each curve is one left-out year; the black squares are the mean over non-drought folds.
+Points below the axis floor are clipped and marked with downward triangles.}
+\label{fig:incomplete-r2-muni}
+\end{figure}
+
+\subsection{Scatterplots and spatial maps}
+Figure~\ref{fig:scatter-muni} shows predicted versus observed municipal productivity under the municipal-mean path for every LOO year.
+Figure~\ref{fig:map-error-muni} shows municipal error maps for the best and worst LOO years; Figure~\ref{fig:map-error-muni-app} shows 2020, 2023, and 2024.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth,height=0.42\textheight,keepaspectratio]{scatter_panel_muni_mean.pdf}
+\caption{Predicted versus observed municipal soybean productivity (\si{t/ha}) for each year-LOO fold under the municipal-mean path.
+Every panel evaluates only the left-out year. The dashed line is identity.}
+\label{fig:scatter-muni}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth,keepaspectratio]{map_error_panel_muni_mean.png}
+\caption{Municipal aggregate prediction error maps under the municipal-mean path for LOO years 2021 and 2022.}
+\label{fig:map-error-muni}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth,keepaspectratio]{map_error_panel_muni_mean_appendix.png}
+\caption{Municipal aggregate prediction error maps under the municipal-mean path for LOO years 2020, 2023, and 2024.}
+\label{fig:map-error-muni-app}
+\end{figure}
+
+\section{Additional pixel-path heatmaps}
+\label{app:extra-heatmaps}
+Section~\ref{sec:results} highlights the best and worst LOO years for the pixel-path Paraná and Mambor\'{e} maps.
+Figures~\ref{fig:map-error-app} and~\ref{fig:mambore-app} report the remaining folds, 2020, 2023, and 2024.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth,keepaspectratio]{map_error_panel_appendix.png}
+\caption{Municipal aggregate prediction error maps under the pixel path for LOO years 2020, 2023, and 2024.}
+\label{fig:map-error-app}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth,keepaspectratio]{mambore_panel_appendix.png}
+\caption{Intramunicipal Mambor\'{e} productivity maps under the pixel path for LOO years 2020, 2023, and 2024.}
+\label{fig:mambore-app}
+\end{figure}

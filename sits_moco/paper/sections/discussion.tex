@@ -2,17 +2,22 @@
 \label{sec:discussion}
 
 Year leave-one-out gives a clearer picture of temporal risk than a single fixed holdout.
-On non-drought folds, municipal aggregates of pixel scores reach $R^2$ between $0.23$ and $0.40$, with RMSE about $0.32$--$0.57$\,\si{t/ha}.
-The pooled mean excluding 2022 is $R^2=0.302$ and RMSE $=0.427$\,\si{t/ha}.
+On non-drought folds, the municipal-mean path reaches $R^2$ between $0.20$ and $0.41$, while municipal aggregates of pixel scores reach $R^2$ between $0.23$ and $0.40$.
+Excluding 2022, the pooled means are $R^2=0.275$ for municipal-mean evaluation and $R^2=0.302$ for the pixel path.
+Those two routes are not the same estimator.
+Municipal-mean LOO applies $f_\theta$ to soy-masked averages of the inputs (mean-then-encode), whereas the pixel path scores each soy pixel and averages the outputs (encode-then-mean).
+Since $f_\theta$ is nonlinear, predicting from municipal means need not match the mean of pixel-wise predictions.
+The slightly higher pooled $R^2$ on the pixel path suggests that post-training downscaling can recover municipal signal that is smoothed away when covariates are pre-averaged.
+
+Training on the encode-then-mean path would align checkpoint selection with pixel inference and sub-municipal maps, but we kept municipal-mean training for practical reasons.
+Each municipality--year is one training example (municipalities times training years per LOO fold), and the full fold fits in memory.
+Pixel-wise training would run a forward and backward pass on every soy pixel in those municipality--years before municipal averaging, which amounts to hundreds of millions of pixel updates per epoch.
+The network fits in GPU memory; the bottleneck is reading pixel time series from disk in batches.
+That I/O load made pixel-wise training too costly relative to municipal-mean fitting, so we train mean-then-encode and report pixel-path LOO on the same checkpoints.
 
 The 2022 fold is the exception that matters for operations.
-It is the only drought year in the sample, so leaving it out removes every training example from that regime.
-The resulting negative $R^2$ and RMSE above $1.4$\,\si{t/ha} show that the present covariates and capacity do not invent drought behaviour from wetter years alone.
-When 2022 remains in training and another year is held out, LOO skill is much more stable.
-Any operational deployment should therefore monitor season type explicitly and avoid treating a single mild year as representative.
-
-Because scores are defined per pixel, municipal PAM labels can still support downscaling to arbitrary sub-municipal shapes (Figure~\ref{fig:guara}).
-The numbers here evaluate municipal aggregates of those pixel scores; they do not check intramunicipal maps against field yields.
-Training used municipality-mean Sentinel-2 series for speed, so LOO skill is a transfer check under encode-then-mean evaluation.
-Other limitations are the single-state geography, no repeated seeds, and scarce matched external baselines.
-Next steps are multi-state LOO, controlled modality ablations, stronger baselines, and independent yield data when spatially resolved accuracy is required.
+It is the only drought year in the Paran\'{a} sample, so leaving it out removes every training example from that regime.
+The resulting negative $R^2$ under both evaluation paths shows that the present covariates and capacity do not invent drought behaviour from wetter years alone.
+When 2022 remains in training and another year is held out, LOO $R^2$ is much more stable.
+This gap is mainly a data problem.
+If the training set includes municipalities that suffered poor yields in other years and regions, drought-like response patterns become observable rather than unique to one left-out season.\footnote{We have already begun that expansion by adding Rio Grande do Sul, S\~{a}o Paulo, and Goi\'{a}s to the municipal-mean pipeline. On that multi-state year LOO setup we obtain mean $R^2$ about $0.46$, with fold scores ranging from about $0.2$ to $0.7$. We do not report those numbers as main results here because the pixel-by-pixel pipeline has not yet been run at that scale, and municipal-mean scores alone would miss the downscaling objective that motivates MSTNet.}
