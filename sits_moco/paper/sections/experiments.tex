@@ -1,26 +1,57 @@
 \section{Experiments}
 \label{sec:experiments}
 
+We first fix the MSTNet training setup, then define the year leave-one-out protocol, and finally report municipal-mean LOO metrics.
+Section~\ref{sec:results} presents the corresponding pixel-path scores and maps.
+
 \subsection{Proposed model}
-The proposed model is MSTNet: one STNet trunk for Sentinel-2, one for daily Xavier climate (precipitation, ETo, Rs, Tmax, and Tmin), and late fusion of MapBiomas Solo properties in the decoder.
-Each trunk uses one Transformer layer with $d_{\mathrm{model}}=128$, four attention heads, $d_{\mathrm{inner}}=64$, and dropout $0.4$.
-Training fits municipality-mean Sentinel-2 series; reported metrics apply the selected weights pixel by pixel and average the scores to municipalities (Section~\ref{sec:pixel-formulation}).
+The proposed model is MSTNet: one STNet trunk for the Sentinel-2 series, one for the daily climate series, and late fusion of soil features in the decoder.
+Each trunk uses one Transformer encoder layer with $d=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=64$, and dropout $0.4$.
+Optimization uses AdamW with learning rate $1\times10^{-3}$, weight decay $5\times10^{-4}$, and batches of 40 municipalities.
+The learning rate drops at epochs 40 and 120; training stops early after fifteen epochs without improvement in the validation loss.
+Training and checkpoint selection use the municipal-mean path (Section~\ref{sec:pixel-formulation}).
 
 \subsection{Year leave-one-out design}
 \label{sec:loo}
-We evaluate temporal generalization with year leave-one-out (LOO) over harvest years 2020--2024.
-For each fold with left-out year $Y$:
-\begin{itemize}
-  \item all municipality--years with harvest year $\neq Y$ are used for training;
-  \item year $Y$ is held out entirely (no municipality from $Y$ enters training);
-  \item model selection within the fold uses validation $R^2$ on year $Y$;
-  \item the reported fold score is the pixel-mean municipal evaluation on year $Y$ only.
-\end{itemize}
+We evaluate temporal generalization with year leave-one-out cross-validation (LOO) over harvest years 2020--2024.
+For each fold with left-out year $Y$, all municipality--years with harvest year $\neq Y$ are used for training on the municipal-mean path, and year $Y$ is held out entirely so that no municipality from $Y$ enters training.
+Model selection within the fold uses the municipal-mean validation loss on year $Y$; after training, each fold is scored on year $Y$ under both the municipal-mean path and the post-training pixel path.
 Input standardization is refit on each fold's training years.
 This yields five independently trained checkpoints, one per left-out year.
-Main-text tables and figures report only those LOO-year scores.
-Appendix~\ref{app:muni-mean-loo} records the municipal-mean evaluation path on the same LOO years.
 
-\subsection{Evaluation protocol}
-For each LOO fold we compare municipal aggregates of pixel predictions with PAM labels on the held-out year.
-We report per-fold RMSE, MAE, and $R^2$, predicted-versus-observed scatterplots for every LOO year, a municipal error map for a non-drought fold (2021), and a qualitative intramunicipal map for Guarapuava.
+\subsection{Municipal-mean LOO metrics}
+\label{sec:exp-muni-mean}
+Table~\ref{tab:loo-muni-mean} reports LOO metrics when the same fold checkpoints are evaluated on the municipal-mean path used in training.
+Across the five folds, mean $R^2$ is $0.160$ and mean RMSE is $0.617$\,\si{t/ha}.
+Excluding the 2022 drought fold, mean $R^2$ is $0.275$ and mean RMSE is $0.435$\,\si{t/ha}.
+On non-drought folds, $R^2$ ranges from $0.199$ in 2023 to $0.410$ in 2021, the strongest year, with RMSE between $0.320$ and $0.577$\,\si{t/ha}.
+The 2022 fold collapses to $R^2=-0.300$ and RMSE $=1.342$\,\si{t/ha}, so the five-fold mean is pulled down by that single out-of-distribution season.
+Section~\ref{sec:results} reports the corresponding post-training pixel-path scores, maps, and scatterplots.
+
+\begin{table}[!htbp]
+\centering
+\caption{Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode).
+Each row evaluates only the listed LOO year with the fold trained on the other four harvest years.
+RMSE and MAE are in \si{t/ha}.}
+\label{tab:loo-muni-mean}
+\begin{tabular}{lcccc}
+\toprule
+LOO year & $n$ & RMSE & MAE & $R^2$ \\
+\midrule
+2020 & 346 & 0.411 & 0.316 & 0.233 \\
+2021 & 343 & 0.320 & 0.239 & 0.410 \\
+2022 & 342 & 1.342 & 1.069 & $-0.300$ \\
+2023 & 339 & 0.433 & 0.345 & 0.199 \\
+2024 & 336 & 0.577 & 0.445 & 0.259 \\
+\midrule
+Mean & --- & 0.617 & 0.483 & 0.160 \\
+Mean excl.\ 2022 & --- & 0.435 & 0.336 & 0.275 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation protocol for the Results section}
+For each LOO fold we also compare municipal predictions with PAM labels on the held-out year under the post-training pixel path~\eqref{eq:pixel-mean-agg}.
+The same pixel path is re-run with truncated seasons that keep only the first $k$ months of the Oct--Mar window for $k=1,\ldots,6$, so that early-season $R^2$ can be compared with the full-window score.
+Section~\ref{sec:results} reports the full-season per-fold RMSE, MAE, and $R^2$ values, the partial-season $R^2$ curves, predicted-versus-observed scatterplots for every LOO year, municipal error and Mambor\'{e} maps for the best and worst folds, and a 2022 Mambor\'{e} comparison against mean and peak NDVI.
+Appendix~\ref{app:muni-mean-eval} reports the municipal-mean counterparts of the partial-season curves, scatterplots, and Paraná error maps; Appendix~\ref{app:extra-heatmaps} adds the remaining pixel-path heatmaps.
