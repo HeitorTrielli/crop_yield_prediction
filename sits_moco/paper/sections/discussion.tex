@@ -21,3 +21,9 @@ The resulting negative $R^2$ under both evaluation paths shows that the present 
 When 2022 remains in training and another year is held out, LOO $R^2$ is much more stable.
 This gap is mainly a data problem.
 If the training set includes municipalities that suffered poor yields in other years and regions, drought-like response patterns become observable rather than unique to one left-out season.\footnote{We have already begun that expansion by adding Rio Grande do Sul, S\~{a}o Paulo, and Goi\'{a}s to the municipal-mean pipeline. On that multi-state year LOO setup we obtain mean $R^2$ about $0.46$, with fold scores ranging from about $0.2$ to $0.7$. We do not report those numbers as main results here because the pixel-by-pixel pipeline has not yet been run at that scale, and municipal-mean scores alone would miss the downscaling objective that motivates MSTNet.}
+
+Leave-one-modality-out runs on the same year-LOO protocol show that climate carries most of the non-drought signal, Sentinel-2 less, and soil least.
+Omitting climate costs about $0.21$ in mean pixel-path $R^2$ when 2022 is excluded, versus about $0.10$ without Sentinel-2 and about $0.06$ without soil.
+Soil still matters for interpretation: texture and SOC are nearly static across years, so they act as a spatial productivity prior that helps typical seasons but can worsen the drought fold.
+Without soil the 2022 LOO score rises from a large negative $R^2$ to near zero, while ordinary years still favor the full three-stream model.
+Ranking modalities by the mean that includes 2022 can therefore look misleading; the fair comparison for typical seasons is the mean that excludes that fold.

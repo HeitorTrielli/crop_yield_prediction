@@ -1,4 +1,4 @@
-\begin{thebibliography}{7}
+\begin{thebibliography}{9}
 \providecommand{\natexlab}[1]{#1}
 \providecommand{\url}[1]{\texttt{#1}}
 \expandafter\ifx\csname urlstyle\endcsname\relax
@@ -31,10 +31,23 @@ Noel Gorelick, Matt Hancher, Mike Dixon, Simon Ilyushchenko, David Thau, and
 \newblock Collection 10 of the annual land cover and land use maps of brazil
   (1985--2024), 2025{\natexlab{a}}.
 
-\bibitem[{MapBiomas}(2025{\natexlab{b}})]{mapbiomassoil2025}
+\bibitem[{MapBiomas}(2025{\natexlab{b}})]{mapbiomassoc2025}
+{MapBiomas}.
+\newblock Annual maps of soil organic carbon stock in brazil 0--30 cm
+  (1985--2024): Mapbiomas soil collection 3 (beta), 2025{\natexlab{b}}.
+
+\bibitem[{MapBiomas}(2025{\natexlab{c}})]{mapbiomassoil2025}
 {MapBiomas}.
 \newblock Soil particle size and texture maps for brazil 0--100 cm: Mapbiomas
-  soil collection 3 (beta), 2025{\natexlab{b}}.
+  soil collection 3 (beta), 2025{\natexlab{c}}.
+
+\bibitem[Ru{\ss}wurm and K{\"o}rner(2020)]{russwurm2020selfattention}
+Marc Ru{\ss}wurm and Marco K{\"o}rner.
+\newblock Self-attention for raw optical {Satellite} {Time} {Series}
+  classification.
+\newblock \emph{ISPRS Journal of Photogrammetry and Remote Sensing},
+  169:\penalty0 421--435, 2020.
+\newblock \doi{10.1016/j.isprsjprs.2020.06.006}.
 
 \bibitem[Xavier et~al.(2022)Xavier, Scanlon, King, and Alves]{xavier2022}
 Alexandre~C{\^a}ndido Xavier, Bridget~R. Scanlon, Carey~W. King, and Aline~I.

@@ -1,7 +1,7 @@
 \section{Results}
 \label{sec:results}
 
-We report post-training pixel-path LOO accuracy against PAM, then examine the 2022 drought fold, partial-season truncations, and finally scatterplots and spatial maps for every LOO year.
+We report post-training pixel-path LOO accuracy against PAM, then examine the 2022 drought fold, partial-season truncations, scatterplots and spatial maps, and modality ablations.
 Municipal-mean LOO metrics for the same checkpoints are in Section~\ref{sec:exp-muni-mean}; the corresponding municipal-mean scatterplots, error maps, and partial-season curves are in Appendix~\ref{app:muni-mean-eval}.
 
 \subsection{Year-LOO municipal accuracy}
@@ -111,9 +111,8 @@ The remaining years appear in Appendix~\ref{app:extra-heatmaps}.
 
 Figure~\ref{fig:mambore} shows pixel-level scores for Mambor\'{e} under those same two checkpoints.
 This is the main goal of the method: after training only on municipal PAM labels, the network can score arbitrary polygons, here the soy pixels inside one municipality, without field-level yields.
-Figure~\ref{fig:mambore-ndvi} stacks the 2022 productivity map with mean NDVI and peak NDVI over the same soy pixels; we use 2022 because its peak NDVI field is less homogeneous than in the other LOO years, so intramunicipal contrast is easier to see.
 Those maps remain qualitative; we have no field yields to score them against, only the municipal PAM total when the pixels are averaged.
-Mambor\'{e} maps for 2020, 2023, and 2024 are in Appendix~\ref{app:extra-heatmaps}.
+Appendix~\ref{app:extra-heatmaps} adds the remaining Mambor\'{e} years and a stacked comparison of the 2022 productivity map with mean and peak NDVI.
 
 \begin{figure}[!htbp]
 \centering
@@ -121,14 +120,44 @@ Mambor\'{e} maps for 2020, 2023, and 2024 are in Appendix~\ref{app:extra-heatmap
 \caption{Intramunicipal maps of downscaled pixel-level productivity predictions for Mambor\'{e}, Paran\'{a}, under the 2021 and 2022 LOO checkpoints.}
 \label{fig:mambore}
 \end{figure}
-
-\begin{figure}[!htbp]
-\centering
-\includegraphics[width=0.92\linewidth,height=0.88\textheight,keepaspectratio]{mambore_ndvi_compare.png}
-\caption{Mambor\'{e} under the 2022 LOO checkpoint: predicted productivity, mean NDVI, and peak NDVI on soy pixels, stacked so that spatial patterns can be compared directly.}
-\label{fig:mambore-ndvi}
-\end{figure}
+\FloatBarrier
 
 \subsection{Ablations}
 \label{sec:ablations}
-Work in progress.
+To probe modality importance we retrain variants that omit one of the three input streams: no soil (Sentinel-2 + climate), no climate (Sentinel-2 + soil), and no Sentinel-2 (climate + soil).
+For each omitted modality we take the best of three architectures under the same year-LOO municipal-mean validation objective used for the full model, then score the held-out year on the pixel path.
+Table~\ref{tab:ablations} compares those winners with full MSTNet on the pixel path; Appendix~\ref{app:ablations-muni} reports the municipal-mean counterparts.
+Excluding 2022, full MSTNet has mean $R^2=0.302$ and RMSE $=0.427$\,\si{t/ha}.
+Omitting climate costs about $0.21$ in mean $R^2$, omitting Sentinel-2 about $0.10$, and omitting soil about $0.06$.
+With 2022 included, the no-soil mean $R^2$ rises above the full model because that drought fold recovers about $0.42$ in $R^2$ when soil is removed, while the non-drought years still favor the full three-stream setup.
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{Year-LOO pixel-path metrics for full MSTNet and leave-one-modality-out ablations.
+Each ablation is the best of three architectures under municipal-mean year-LOO validation, then evaluated by scoring soy pixels and averaging to municipalities.
+RMSE is in \si{t/ha}.
+The first block is the full three-stream baseline; blocks below omit one modality.}
+\label{tab:ablations}
+\begin{tabular}{lllccccccc}
+\toprule
+Variant & Inputs & Metric & 2020 & 2021 & 2022 & 2023 & 2024 & Mean & Mean excl.\ 2022 \\
+\midrule
+\multirow{2}{*}{Full MSTNet} & \multirow{2}{*}{S2+clim.+soil}
+  & $R^2$ & 0.291 & 0.402 & $-0.422$ & 0.231 & 0.284 & 0.157 & 0.302 \\
+  & & RMSE & 0.395 & 0.323 & 1.404 & 0.424 & 0.568 & 0.623 & 0.427 \\
+\midrule
+\multirow{2}{*}{No soil} & \multirow{2}{*}{S2+clim.}
+  & $R^2$ & 0.151 & 0.187 & 0.003 & 0.236 & 0.376 & 0.191 & 0.238 \\
+  & & RMSE & 0.433 & 0.376 & 1.176 & 0.423 & 0.530 & 0.588 & 0.440 \\
+\midrule
+\multirow{2}{*}{No climate} & \multirow{2}{*}{S2+soil}
+  & $R^2$ & 0.095 & 0.063 & $-0.288$ & 0.032 & 0.179 & 0.016 & 0.092 \\
+  & & RMSE & 0.447 & 0.404 & 1.336 & 0.476 & 0.608 & 0.654 & 0.484 \\
+\midrule
+\multirow{2}{*}{No Sentinel-2} & \multirow{2}{*}{clim.+soil}
+  & $R^2$ & 0.124 & 0.230 & $-0.056$ & 0.170 & 0.280 & 0.150 & 0.201 \\
+  & & RMSE & 0.440 & 0.366 & 1.209 & 0.441 & 0.569 & 0.605 & 0.454 \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -149,7 +149,7 @@ The network weights are shared with the municipal-mean training path: the MSTNet
 \section{Municipal-mean LOO diagnostics}
 \label{app:muni-mean-eval}
 Section~\ref{sec:exp-muni-mean} reports full-season municipal-mean LOO metrics.
-Here we add the municipal-mean counterparts of the partial-season curves, scatterplots, and Paraná error maps from Section~\ref{sec:results}.
+Here we add the municipal-mean counterparts of the partial-season curves, scatterplots, Paraná error maps, and modality ablations from Section~\ref{sec:results}.
 There is no Mambor\'{e} panel for this path because municipal-mean inputs do not produce intramunicipal scores.
 
 \subsection{Partial-season evaluation}
@@ -212,10 +212,49 @@ Every panel evaluates only the left-out year. The dashed line is identity.}
 \label{fig:map-error-muni-app}
 \end{figure}
 
+\subsection{Modality ablations}
+\label{app:ablations-muni}
+Table~\ref{tab:ablations-muni} reports the same leave-one-modality-out winners as Table~\ref{tab:ablations}, scored on the municipal-mean path used in training.
+Excluding 2022, full MSTNet has mean $R^2=0.275$.
+Omitting climate costs about $0.10$ in mean $R^2$, omitting Sentinel-2 about $0.07$, and omitting soil about $0.04$.
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{Year-LOO municipal-mean metrics for full MSTNet and leave-one-modality-out ablations.
+Each ablation is the best of three architectures under municipal-mean year-LOO validation.
+RMSE is in \si{t/ha}.
+The first block is the full three-stream baseline; blocks below omit one modality.}
+\label{tab:ablations-muni}
+\begin{tabular}{lllccccccc}
+\toprule
+Variant & Inputs & Metric & 2020 & 2021 & 2022 & 2023 & 2024 & Mean & Mean excl.\ 2022 \\
+\midrule
+\multirow{2}{*}{Full MSTNet} & \multirow{2}{*}{S2+clim.+soil}
+  & $R^2$ & 0.233 & 0.410 & $-0.300$ & 0.199 & 0.259 & 0.160 & 0.275 \\
+  & & RMSE & 0.411 & 0.320 & 1.342 & 0.433 & 0.577 & 0.617 & 0.435 \\
+\midrule
+\multirow{2}{*}{No soil} & \multirow{2}{*}{S2+clim.}
+  & $R^2$ & 0.207 & 0.303 & 0.076 & 0.133 & 0.295 & 0.203 & 0.234 \\
+  & & RMSE & 0.418 & 0.348 & 1.132 & 0.450 & 0.563 & 0.582 & 0.445 \\
+\midrule
+\multirow{2}{*}{No climate} & \multirow{2}{*}{S2+soil}
+  & $R^2$ & 0.292 & 0.233 & $-0.197$ & 0.145 & 0.035 & 0.101 & 0.176 \\
+  & & RMSE & 0.394 & 0.365 & 1.288 & 0.447 & 0.658 & 0.630 & 0.466 \\
+\midrule
+\multirow{2}{*}{No Sentinel-2} & \multirow{2}{*}{clim.+soil}
+  & $R^2$ & 0.131 & 0.262 & $-0.064$ & 0.167 & 0.258 & 0.151 & 0.204 \\
+  & & RMSE & 0.438 & 0.358 & 1.214 & 0.441 & 0.578 & 0.606 & 0.454 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \section{Additional pixel-path heatmaps}
 \label{app:extra-heatmaps}
 Section~\ref{sec:results} highlights the best and worst LOO years for the pixel-path Paraná and Mambor\'{e} maps.
 Figures~\ref{fig:map-error-app} and~\ref{fig:mambore-app} report the remaining folds, 2020, 2023, and 2024.
+Figure~\ref{fig:mambore-ndvi} stacks the 2022 Mambor\'{e} productivity map with mean NDVI and peak NDVI on the same soy pixels; we use 2022 because its peak NDVI field is less homogeneous than in the other LOO years, so intramunicipal contrast is easier to see.
+That comparison is qualitative only.
 
 \begin{figure}[!htbp]
 \centering
@@ -229,4 +268,11 @@ Figures~\ref{fig:map-error-app} and~\ref{fig:mambore-app} report the remaining f
 \includegraphics[width=\linewidth,keepaspectratio]{mambore_panel_appendix.png}
 \caption{Intramunicipal Mambor\'{e} productivity maps under the pixel path for LOO years 2020, 2023, and 2024.}
 \label{fig:mambore-app}
+\end{figure}
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.92\linewidth,height=0.88\textheight,keepaspectratio]{mambore_ndvi_compare.png}
+\caption{Mambor\'{e} under the 2022 LOO checkpoint: predicted productivity, mean NDVI, and peak NDVI on soy pixels, stacked so that spatial patterns can be compared directly.}
+\label{fig:mambore-ndvi}
 \end{figure}
