@@ -1,9 +1,26 @@
 \section{Discussion}
 \label{sec:discussion}
 
-Year leave-one-out gives a clearer picture of temporal risk than a single fixed holdout.
+The year-LOO scores raise a few interpretation questions before we turn to model limits.
+We first place MSTNet against the municipality holdout used by~\citet{song2022soy}, then focus on the 2022 drought fold, and finally discuss where the encoder and decoder may still fall short and what might help.
+
+\subsection{Temporal versus spatial holdout}
+\label{sec:discussion-yoo-vs-muni}
+
+Year leave-one-out gives a clearer picture of temporal risk than holding out municipalities while sharing the same harvest years between train and test.
+\citet{song2022soy} report both holdouts for Brazilian soybean under IBGE municipal labels.
+Their main spatial evaluation randomly holds out 20\% of municipalities while keeping all years in both pools, which measures interpolation under shared seasons rather than a forecast of an unseen year.
+Their leave-one-year-out assessment is harder: RMSE ranges from $259$ to $816$\,\si{kg/ha}, with notably weaker years (e.g.\ 2005 and 2015).
+A forward 2020 map trained on 2001--2019 reaches $R^2=0.66$ before a post-hoc linear bias correction that uses a small fraction of 2020 municipal labels, so that year is not a pure holdout either.
+Our primary scores are year-LOO by design so that held-out seasons never appear in training.
+Appendix~\ref{app:muni80-20} reports the same MSTNet under their 80/20 municipality holdout on Paran\'{a}: pooled holdout $R^2=0.736$, with yearly $R^2$ between $0.283$ and $0.636$ and a five-year mean of $0.467$.
+That pooled score is comparable to the spatial holdout of~\citet{song2022soy}, but much of it comes from separating years rather than municipalities within a year: when the same predictions are scored year by year, $R^2$ falls well below the pooled figure.
+We also evaluate only within Paran\'{a}, so we cannot claim that the model distinguishes largely distinct geographies the way a national fit can.
+We do expect, however, that adding more training data---more years, or more states even when their geography differs---would more likely raise than lower performance.
 On non-drought folds, the municipal-mean path reaches $R^2$ between $0.20$ and $0.41$, while municipal aggregates of pixel scores reach $R^2$ between $0.23$ and $0.40$.
 Excluding 2022, the pooled means are $R^2=0.275$ for municipal-mean evaluation and $R^2=0.302$ for the pixel path.
+Those year-LOO magnitudes sit closer to the temporal assessment of~\citet{song2022soy} than to a spatial holdout with shared seasons, as expected for a five-year Paran\'{a} panel rather than a national nineteen-year fit.
+
 Those two routes are not the same estimator.
 Municipal-mean LOO applies $f_\theta$ to soy-masked averages of the inputs (mean-then-encode), whereas the pixel path scores each soy pixel and averages the outputs (encode-then-mean).
 Since $f_\theta$ is nonlinear, predicting from municipal means need not match the mean of pixel-wise predictions.
@@ -15,6 +32,9 @@ Pixel-wise training would run a forward and backward pass on every soy pixel in 
 The network fits in GPU memory; the bottleneck is reading pixel time series from disk in batches.
 That I/O load made pixel-wise training too costly relative to municipal-mean fitting, so we train mean-then-encode and report pixel-path LOO on the same checkpoints.
 
+\subsection{The 2022 drought year}
+\label{sec:discussion-drought-2022}
+
 The 2022 fold is the exception that matters for operations.
 It is the only drought year in the Paran\'{a} sample, so leaving it out removes every training example from that regime.
 The resulting negative $R^2$ under both evaluation paths shows that the present covariates and capacity do not invent drought behaviour from wetter years alone.
@@ -22,8 +42,42 @@ When 2022 remains in training and another year is held out, LOO $R^2$ is much mo
 This gap is mainly a data problem.
 If the training set includes municipalities that suffered poor yields in other years and regions, drought-like response patterns become observable rather than unique to one left-out season.\footnote{We have already begun that expansion by adding Rio Grande do Sul, S\~{a}o Paulo, and Goi\'{a}s to the municipal-mean pipeline. On that multi-state year LOO setup we obtain mean $R^2$ about $0.46$, with fold scores ranging from about $0.2$ to $0.7$. We do not report those numbers as main results here because the pixel-by-pixel pipeline has not yet been run at that scale, and municipal-mean scores alone would miss the downscaling objective that motivates MSTNet.}
 
-Leave-one-modality-out runs on the same year-LOO protocol show that climate carries most of the non-drought signal, Sentinel-2 less, and soil least.
+Leave-one-modality-out runs on the same year-LOO folds show that climate carries most of the non-drought signal, Sentinel-2 less, and soil least.
 Omitting climate costs about $0.21$ in mean pixel-path $R^2$ when 2022 is excluded, versus about $0.10$ without Sentinel-2 and about $0.06$ without soil.
 Soil still matters for interpretation: texture and SOC are nearly static across years, so they act as a spatial productivity prior that helps typical seasons but can worsen the drought fold.
 Without soil the 2022 LOO score rises from a large negative $R^2$ to near zero, while ordinary years still favor the full three-stream model.
 Ranking modalities by the mean that includes 2022 can therefore look misleading; the fair comparison for typical seasons is the mean that excludes that fold.
+
+\subsection{Where the encoder and decoder may still struggle}
+\label{sec:discussion-encoder-decoder}
+Beyond the LOO scores above, a natural worry for this setup is that municipal MSE can be reduced by getting the seasonal level roughly right while leaving municipalities poorly ordered within a year.
+Climate already carries most of the non-drought signal, so the trunks may prefer year-level structure over the smaller within-year productivity residual that PAM still varies about the seasonal mean.
+The decoder may then shrink forecasts toward a mid-range mode: a narrow MLP with heavy dropout has little incentive under plain MSE to spread predictions when residual signal is noisy, and the same head must jointly learn cross-year calibration and within-municipality ranking.
+Drought LOO makes that conflict sharper, because absolute level and residual ordering are asked of one scalar pathway with no analogous season in training.
+There may also be a signal ceiling: management, cultivar, planting date, and field history are absent, and soy-masked municipal means discard within-municipality heterogeneity that could distinguish productive from marginal soy areas inside the same PAM unit.
+Those are hypotheses about where capacity and supervision may be misallocated, not claims that any one of them is already proven.
+
+\subsection{Ideas for the encoder}
+\label{sec:discussion-improve-encoder}
+If within-year residual productivity is under-represented, the encoder may need supervision that asks for it explicitly.
+An auxiliary yield probe on the fused embedding would push the trunks to stay linearly (or lightly nonlinearly) predictive of PAM rather than only useful after a deep head.
+Within-year ranking or correlation losses over municipalities that share a harvest year would penalize scrambling who is above or below the seasonal mean.
+Supervised contrastive or ordinal objectives on within-year yield terciles would go further by pulling same-tercile municipalities together and pushing different terciles apart inside each season.
+Reconstruction of spectral or climate tokens could help trunks keep raw structure during fine-tuning, but it does not ask for productivity geometry and is unlikely to be enough on its own.
+Year-adversarial training looks less attractive here: year and climate structure seem to be the dominant useful signal in the ablations, so erasing it risks removing what the model uses for LOO calibration.
+On the input side, distributional municipal summaries (quantiles, variance) or more encode-then-mean training when I/O allows could reduce the information lost by averaging before the trunks.
+Attention or phenology-weighted climate pooling might emphasize stress windows better than a uniform seasonal mean.
+Static soil might also work better as a gated or residualized spatial prior against the seasonal climate state than as an unconditional concatenation that can help ordinary years and hurt drought LOO.
+Broader geographic and drought coverage remains essential either way: trunks cannot learn drought-sensitive features that never appear among the training municipality--years.
+
+\subsection{Ideas for the decoder}
+\label{sec:discussion-improve-decoder}
+If the head is flattening mid-range forecasts, architectural and objective changes may help.
+Wider residual MLPs with a linear skip from the fused vector, milder dropout, and smoother activations would leave more room for residual signal to reach the output.
+Modality-specific scores fused late could make climate level, spectral residual, and soil prior easier to combine without one pathway dominating.
+Within-year correlation or ranking losses, and penalties against unrealistically small prediction variance inside a year, would push the head to order municipalities rather than collapse them to the training mode.
+Predicting a year-level baseline plus a municipal deviation about that baseline would separate drought calibration from within-year ranking.
+Mixture or quantile heads are natural if PAM residuals are heavy-tailed across municipalities, because under-dispersion then becomes an explicit modelling failure rather than a silent MSE optimum.
+None of this removes the need for regimes that look like the left-out year, or for covariates that capture management and cultivar.
+A better decoder can only extract more of whatever residual the encoder and inputs retain.
+The useful agenda, in our view, is joint: keep year-level climate structure, add explicit within-year productivity pressure in the encoder, and give the decoder less incentive to flatten the mid-range of the prediction surface.

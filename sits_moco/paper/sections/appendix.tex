@@ -249,6 +249,36 @@ Variant & Inputs & Metric & 2020 & 2021 & 2022 & 2023 & 2024 & Mean & Mean excl.
 \end{tabular}
 \end{table}
 
+\section{80/20 municipality holdout}
+\label{app:muni80-20}
+Section~\ref{sec:discussion-yoo-vs-muni} contrasts year-LOO with the municipality holdout used by~\citet{song2022soy}: randomly hold out 20\% of municipalities for testing, keep the other 80\% for training, and include every harvest year in both pools.
+Table~\ref{tab:muni80-20} reports that holdout for the same Paran\'{a} MSTNet architecture as Table~\ref{tab:loo-muni-mean} (one Transformer layer, $d=128$, four heads, $d_{\mathrm{inner}}=64$, dropout $0.4$), trained once on the municipal-mean path with the 80\% training municipalities and scored on the held-out 20\%.
+Per-year rows restrict the holdout to a single harvest year; Mean averages those five yearly scores; Pooled scores all holdout municipality--years together.
+Pooled $R^2=0.736$ (RMSE $0.448$\,\si{t/ha}) is much higher than year-LOO on the same architecture, while the yearly $R^2$ values ($0.283$--$0.636$) show that much of the pooled score comes from shared seasonal structure across years rather than pure spatial interpolation within a fixed season.
+
+\begin{table}[!htbp]
+\centering
+\caption{80/20 municipality holdout for Paran\'{a} MSTNet under the municipal-mean path.
+Twenty percent of municipalities are held out for validation and test; all harvest years 2020--2024 appear in both pools.
+RMSE and MAE are in \si{t/ha}.
+Mean is the unweighted average of the five yearly scores; Pooled aggregates all holdout municipality--years.}
+\label{tab:muni80-20}
+\begin{tabular}{lcccc}
+\toprule
+Subset & $n$ & RMSE & MAE & $R^2$ \\
+\midrule
+2020 & 70 & 0.330 & 0.262 & 0.426 \\
+2021 & 68 & 0.305 & 0.233 & 0.409 \\
+2022 & 69 & 0.694 & 0.468 & 0.636 \\
+2023 & 68 & 0.411 & 0.323 & 0.283 \\
+2024 & 68 & 0.385 & 0.300 & 0.581 \\
+\midrule
+Mean & --- & 0.425 & 0.317 & 0.467 \\
+Pooled & 343 & 0.448 & 0.317 & 0.736 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \section{Additional pixel-path heatmaps}
 \label{app:extra-heatmaps}
 Section~\ref{sec:results} highlights the best and worst LOO years for the pixel-path Paraná and Mambor\'{e} maps.

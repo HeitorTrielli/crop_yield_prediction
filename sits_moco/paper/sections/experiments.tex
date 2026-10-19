@@ -1,7 +1,7 @@
 \section{Experiments}
 \label{sec:experiments}
 
-We first fix the MSTNet training setup, then define the year leave-one-out protocol, and finally report municipal-mean LOO metrics.
+We first fix the MSTNet training setup, then define the year leave-one-out design, and finally report municipal-mean LOO metrics.
 Section~\ref{sec:results} presents the corresponding pixel-path scores and maps.
 
 \subsection{Proposed model}
@@ -50,7 +50,7 @@ Mean excl.\ 2022 & --- & 0.435 & 0.336 & 0.275 \\
 \end{tabular}
 \end{table}
 
-\subsection{Evaluation protocol for the Results section}
+\subsection{Pixel-path evaluation}
 For each LOO fold we also compare municipal predictions with PAM labels on the held-out year under the post-training pixel path~\eqref{eq:pixel-mean-agg}.
 The same pixel path is re-run with truncated seasons that keep only the first $k$ months of the Oct--Mar window for $k=1,\ldots,6$, so that early-season $R^2$ can be compared with the full-window score.
 Section~\ref{sec:results} reports the full-season per-fold RMSE, MAE, and $R^2$ values, the partial-season $R^2$ curves, predicted-versus-observed scatterplots for every LOO year, municipal error and Mambor\'{e} maps for the best and worst folds, and a 2022 Mambor\'{e} comparison against mean and peak NDVI.
