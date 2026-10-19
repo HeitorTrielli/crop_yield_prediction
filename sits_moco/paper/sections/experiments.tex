@@ -1,8 +1,8 @@
 \section{Experiments}
 \label{sec:experiments}
 
-We first fix the MSTNet training setup, then define the year leave-one-out design, and finally report municipal-mean LOO metrics.
-Section~\ref{sec:results} presents the corresponding pixel-path scores and maps.
+We first fix the MSTNet training setup, then define the year leave-one-out design, report municipal-mean LOO metrics, and describe the leave-one-modality ablations.
+Section~\ref{sec:results} presents the corresponding pixel-path scores, maps, and ablation tables.
 
 \subsection{Proposed model}
 The proposed model is MSTNet: one STNet trunk for the Sentinel-2 series, one for the daily climate series, and late fusion of soil features in the decoder.
@@ -30,7 +30,7 @@ Section~\ref{sec:results} reports the corresponding post-training pixel-path sco
 
 \begin{table}[!htbp]
 \centering
-\caption{Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode).
+\caption{\textbf{Year leave-one-out metrics for MSTNet under the municipal-mean evaluation path (mean-then-encode).}
 Each row evaluates only the listed LOO year with the fold trained on the other four harvest years.
 RMSE and MAE are in \si{t/ha}.}
 \label{tab:loo-muni-mean}
@@ -55,3 +55,9 @@ For each LOO fold we also compare municipal predictions with PAM labels on the h
 The same pixel path is re-run with truncated seasons that keep only the first $k$ months of the Oct--Mar window for $k=1,\ldots,6$, so that early-season $R^2$ can be compared with the full-window score.
 Section~\ref{sec:results} reports the full-season per-fold RMSE, MAE, and $R^2$ values, the partial-season $R^2$ curves, predicted-versus-observed scatterplots for every LOO year, municipal error and Mambor\'{e} maps for the best and worst folds, and a 2022 Mambor\'{e} comparison against mean and peak NDVI.
 Appendix~\ref{app:muni-mean-eval} reports the municipal-mean counterparts of the partial-season curves, scatterplots, and Paraná error maps; Appendix~\ref{app:extra-heatmaps} adds the remaining pixel-path heatmaps.
+
+\subsection{Modality ablations}
+\label{sec:exp-ablations}
+To isolate each modality we retrain three ablations on the same year-LOO folds as the full model, each omitting one input stream: no soil (Sentinel-2 + climate), no climate (Sentinel-2 + soil), and no Sentinel-2 (climate + soil).
+Hyperparameters match full MSTNet; only the inputs change---late soil fusion is dropped, or the climate trunk is removed, or the Sentinel-2 trunk is removed.
+Checkpoint selection still uses municipal-mean validation loss on the held-out year; Section~\ref{sec:ablations} and Appendix~\ref{app:ablations-muni} report pixel-path and municipal-mean scores.

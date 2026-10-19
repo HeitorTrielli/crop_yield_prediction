@@ -13,7 +13,7 @@ Figure~\ref{fig:mstnet-arch} summarizes the network.
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\textwidth]{mstnet_arch.pdf}
-\caption{MSTNet architecture.
+\caption{\textbf{MSTNet architecture.}
 Each STNet trunk $i\in\{s,c\}$ maps a SITS $\mathbf{X}_i$ of length $T_i$ through a shared per-timestep MLP to $\mathbf{E}_i$, adds DoY encodings to form $\mathbf{E}_i'$, applies a Transformer encoder to obtain $\mathbf{O}_i$, and pools with Seq2Vec to $\mathbf{o}_s$ with NDVI weights or $\mathbf{o}_c$ as a mean over valid days.
 The output head concatenates $\mathbf{o}_s$, $\mathbf{o}_c$, and MapBiomas Solo features~$\mathbf{s}$, then $MLP_2$ predicts productivity~$\hat{y}$.
 Adapted from Fig.~2 of~\citet{xu2024sitsmoco}.}

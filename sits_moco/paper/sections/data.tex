@@ -8,19 +8,19 @@ After training we also run a pixel-wise forward pass and average the scores for 
 
 \begin{table}[!htbp]
 \centering
-\caption{Summary of data sources used in the experiments.}
+\caption{\textbf{Summary of data sources used in the experiments.}}
 \label{tab:data-sources}
 \footnotesize
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}lp{7.0cm}p{4.1cm}@{}}
 \toprule
-Category & Variables and processing & Source \\
+Category & Variables & Source \\
 \midrule
-Satellite & Ten Sentinel-2 L2A reflectance bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), soy-masked zonal means via Google Earth Engine & Copernicus Sentinel-2 L2A~\citep{esa2021sentinel2}; GEE~\citep{gorelick2017gee} \\
+Satellite & Ten Sentinel-2 L2A reflectance bands (B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12) & Copernicus Sentinel-2 L2A~\citep{esa2021sentinel2}; GEE~\citep{gorelick2017gee} \\
 \midrule
-Climate & Daily precipitation, ETo, Rs, Tmax, and Tmin; soy-masked averages of Xavier cells & Xavier BR-DWGD~\citep{xavier2022} \\
+Climate & Daily precipitation, ETo, Rs, Tmax, and Tmin & Xavier BR-DWGD~\citep{xavier2022} \\
 \midrule
-Soil & Clay, silt, sand, and soil organic-carbon stock at 0--30\,cm; soy-masked averages, late-fused & MapBiomas Solo Collection~3~\citep{mapbiomassoil2025,mapbiomassoc2025} \\
+Soil & Clay, silt, sand, and soil organic-carbon stock at 0--30\,cm & MapBiomas Solo Collection~3~\citep{mapbiomassoil2025,mapbiomassoc2025} \\
 \midrule
 Crop mask & MapBiomas soybean class~39, used to select cells before aggregating Sentinel-2, climate, and soil & MapBiomas Collection~10~\citep{mapbiomas2025} \\
 \midrule
@@ -179,7 +179,7 @@ Target & Municipal soybean productivity (\si{t/ha}) & IBGE PAM~\citep{ibgepam} \
   \draw[arr] (a_lb.south) -- (a_lb.south |- out.east) -- (out.east);
 \end{tikzpicture}%
 }
-\caption{Data pipeline for MSTNet training (municipal-mean path).
+\caption{\textbf{Data pipeline for MSTNet training (municipal-mean path).}
 The MapBiomas soybean mask selects cells before municipal averaging of Sentinel-2, Xavier weather, and MapBiomas Solo; the spectral and climate means feed parallel STNet trunks, and soil enters the decoder by late fusion. The decoder prediction $\hat{y}_{m,y}$ is supervised by IBGE PAM labels at the output.
 The post-training pixel path is described in Section~\ref{sec:pixel-formulation} and diagrammed in Appendix~\ref{app:pixel-pipeline}.}
 \label{fig:data-flow}

@@ -6,7 +6,7 @@ In Brazil, the Municipal Agricultural Production survey (PAM) from the Brazilian
 Similar reliance on aggregated statistics is found in other countries, including the United States (county-level) and India (district-level), where official yield estimates are commonly reported for administrative regions rather than individual fields.
 Sentinel-2 imagery, gridded weather, and soil maps describe crop condition at much finer scales, but field-level yield labels are rarely available statewide.
 The closest Brazilian precedent for learning soybean yield from IBGE municipal statistics and then mapping at pixel resolution is~\citet{song2022soy}, who trained random forests on soy-masked Landsat/{MODIS} phenology metrics, climate, weather, topography, and soil, and produced annual 30\,m maps for 2001--2020.
-We want a model in that same municipal-to-pixel spirit that learns from municipal labels, predicts at smaller regions, and remains cheap enough to run over large areas.
+Our goal is a model in that same municipal-to-pixel spirit: one that learns from municipal labels, predicts at smaller regions, and remains cheap enough to run over large areas.
 
 MSTNet (\emph{Multi} STNet) extends the Spectral--Temporal Network (STNet) of~\citet{xu2024sitsmoco}.
 Its Transformer encoder follows the self-attention architecture for satellite time series of~\citet{russwurm2020selfattention}, and each covariate stream gets its own trunk when the streams are sampled at different frequencies.

@@ -1,83 +1,92 @@
 \section{Discussion}
 \label{sec:discussion}
 
-The year-LOO scores raise a few interpretation questions before we turn to model limits.
-We first place MSTNet against the municipality holdout used by~\citet{song2022soy}, then focus on the 2022 drought fold, and finally discuss where the encoder and decoder may still fall short and what might help.
+We discuss how MSTNet relates to~\citet{song2022soy}, how mean-then-encode training relates to encode-then-mean pixel evaluation, what the 2022 drought fold implies for operations, and where the present features, architecture, and losses may still fall short, with a few ideas for future work.
 
 \subsection{Temporal versus spatial holdout}
 \label{sec:discussion-yoo-vs-muni}
 
-Year leave-one-out gives a clearer picture of temporal risk than holding out municipalities while sharing the same harvest years between train and test.
-\citet{song2022soy} report both holdouts for Brazilian soybean under IBGE municipal labels.
-Their main spatial evaluation randomly holds out 20\% of municipalities while keeping all years in both pools, which measures interpolation under shared seasons rather than a forecast of an unseen year.
-Their leave-one-year-out assessment is harder: RMSE ranges from $259$ to $816$\,\si{kg/ha}, with notably weaker years (e.g.\ 2005 and 2015).
-A forward 2020 map trained on 2001--2019 reaches $R^2=0.66$ before a post-hoc linear bias correction that uses a small fraction of 2020 municipal labels, so that year is not a pure holdout either.
-Our primary scores are year-LOO by design so that held-out seasons never appear in training.
-Appendix~\ref{app:muni80-20} reports the same MSTNet under their 80/20 municipality holdout on Paran\'{a}: pooled holdout $R^2=0.736$, with yearly $R^2$ between $0.283$ and $0.636$ and a five-year mean of $0.467$.
-That pooled score is comparable to the spatial holdout of~\citet{song2022soy}, but much of it comes from separating years rather than municipalities within a year: when the same predictions are scored year by year, $R^2$ falls well below the pooled figure.
-We also evaluate only within Paran\'{a}, so we cannot claim that the model distinguishes largely distinct geographies the way a national fit can.
-We do expect, however, that adding more training data---more years, or more states even when their geography differs---would more likely raise than lower performance.
-On non-drought folds, the municipal-mean path reaches $R^2$ between $0.20$ and $0.41$, while municipal aggregates of pixel scores reach $R^2$ between $0.23$ and $0.40$.
-Excluding 2022, the pooled means are $R^2=0.275$ for municipal-mean evaluation and $R^2=0.302$ for the pixel path.
-Those year-LOO magnitudes sit closer to the temporal assessment of~\citet{song2022soy} than to a spatial holdout with shared seasons, as expected for a five-year Paran\'{a} panel rather than a national nineteen-year fit.
+To the best of our knowledge, the closest counterpart in aim is~\citet{song2022soy}: they use Brazilian soybean yield at municipal scale from multi-year satellite, climate, and soil inputs under IBGE PAM labels, while keeping the model capable of predicting at the pixel level.
+In the main results we focused on the temporal holdout.
+As~\citet{song2022soy} also did, however, a spatial holdout is another valid way to measure what the model can do.
+The two ask different questions.
+A spatial split that holds out part of the (municipality, year) pairs tests whether the model can interpolate to unseen places under seasons already observed in training, which is useful for downscaling and gap-filling within known years.
+Leave-one-year-out keeps the places and drops a calendar year, testing whether the model can generalize to an unseen season, closer to forecasting the current year.
+Temporal holdout is typically harder because the model cannot rely on having already seen that year's climate regime, phenology, or yield level among the training municipality--years; spatial holdout can still borrow seasonal structure shared across the panel.
 
-Those two routes are not the same estimator.
-Municipal-mean LOO applies $f_\theta$ to soy-masked averages of the inputs (mean-then-encode), whereas the pixel path scores each soy pixel and averages the outputs (encode-then-mean).
+Very briefly on the numbers:~\citet{song2022soy} report spatial-holdout $R^2=0.69$ (RMSE $344$\,\si{kg/ha}) and leave-one-year-out RMSE from $259$ to $816$\,\si{kg/ha}, with a mean per-year leave-one-year-out $R^2$ of about $0.42$ across 2001--2019.
+Under the same spatial split on Paran\'{a}, MSTNet reaches pooled $R^2=0.736$ (RMSE $0.448$\,\si{t/ha}; Table~\ref{tab:muni80-20}), with yearly holdout $R^2$ from $0.283$ to $0.636$ (mean $0.467$).
+That puts our spatial performance roughly in line with theirs, at least on the spatial split.
+The pooled score is also higher than the best single-year $R^2$ ($0.636$), which is the signature of strong between-year separation: when all harvest years sit in one pool, getting the seasonal level right across wet and dry years inflates $R^2$, whereas within a fixed year the model has less room to separate municipalities.
+A caveat is the panel: we have only five harvest years in Paran\'{a}, whereas they observe nineteen years across many Brazilian states.
+More years are clearly helpful for temporal coverage.
+More states can help if neighbouring regions share yield-relevant structure, but can also add geographic and management complexity that a single model must absorb.
+
+\subsection{Mean-then-encode versus encode-then-mean}
+\label{sec:discussion-mean-vs-pixel}
+
+Municipal-mean evaluation and the post-training pixel path are not the same estimator.
+The former applies $f_\theta$ to soy-masked averages of the inputs (mean-then-encode), whereas the latter scores each soy pixel and averages the outputs (encode-then-mean).
 Since $f_\theta$ is nonlinear, predicting from municipal means need not match the mean of pixel-wise predictions.
 The slightly higher pooled $R^2$ on the pixel path suggests that post-training downscaling can recover municipal signal that is smoothed away when covariates are pre-averaged.
 
 Training on the encode-then-mean path would align checkpoint selection with pixel inference and sub-municipal maps, but we kept municipal-mean training for practical reasons.
 Each municipality--year is one training example (municipalities times training years per LOO fold), and the full fold fits in memory.
-Pixel-wise training would run a forward and backward pass on every soy pixel in those municipality--years before municipal averaging, which amounts to hundreds of millions of pixel updates per epoch.
-The network fits in GPU memory; the bottleneck is reading pixel time series from disk in batches.
-That I/O load made pixel-wise training too costly relative to municipal-mean fitting, so we train mean-then-encode and report pixel-path LOO on the same checkpoints.
+Pixel-wise training would run a forward and backward pass on every soy pixel in those municipality--years before municipal averaging, which amounts to hundreds of millions of pixel updates per epoch, rather than the tens of thousands of municipal updates per epoch.
+Besides the extra wall-clock time of millions of additional forward and backward passes per epoch, the data themselves become an I/O bottleneck: the network weights fit comfortably in GPU memory, as well as the tens of thousands of the mean-pixel series, but at hundreds of millions of soy pixels the time series no longer fit and must be streamed from disk in batches.
+Those costs made pixel-wise training too expensive relative to municipal-mean fitting, so we train mean-then-encode and report pixel-path LOO on the same checkpoints.
 
 \subsection{The 2022 drought year}
 \label{sec:discussion-drought-2022}
 
-The 2022 fold is the exception that matters for operations.
+The 2022 fold is the exception that matters for generalizability evaluation.
 It is the only drought year in the Paran\'{a} sample, so leaving it out removes every training example from that regime.
-The resulting negative $R^2$ under both evaluation paths shows that the present covariates and capacity do not invent drought behaviour from wetter years alone.
+The resulting negative $R^2$ under both evaluation paths shows that the present covariates are not enough to learn drought behaviour from wetter years alone.
 When 2022 remains in training and another year is held out, LOO $R^2$ is much more stable.
 This gap is mainly a data problem.
 If the training set includes municipalities that suffered poor yields in other years and regions, drought-like response patterns become observable rather than unique to one left-out season.\footnote{We have already begun that expansion by adding Rio Grande do Sul, S\~{a}o Paulo, and Goi\'{a}s to the municipal-mean pipeline. On that multi-state year LOO setup we obtain mean $R^2$ about $0.46$, with fold scores ranging from about $0.2$ to $0.7$. We do not report those numbers as main results here because the pixel-by-pixel pipeline has not yet been run at that scale, and municipal-mean scores alone would miss the downscaling objective that motivates MSTNet.}
 
-Leave-one-modality-out runs on the same year-LOO folds show that climate carries most of the non-drought signal, Sentinel-2 less, and soil least.
-Omitting climate costs about $0.21$ in mean pixel-path $R^2$ when 2022 is excluded, versus about $0.10$ without Sentinel-2 and about $0.06$ without soil.
+Modality ablations on the same year-LOO folds show that climate carries most of the non-drought signal, Sentinel-2 less, and soil least.
+Omitting climate costs about $0.32$ in mean pixel-path $R^2$ when 2022 is excluded, versus about $0.26$ without Sentinel-2 and about $0.07$ without soil.
 Soil still matters for interpretation: texture and SOC are nearly static across years, so they act as a spatial productivity prior that helps typical seasons but can worsen the drought fold.
-Without soil the 2022 LOO score rises from a large negative $R^2$ to near zero, while ordinary years still favor the full three-stream model.
+Without soil, the 2022 LOO score rises from $-0.422$ to $-0.203$, while ordinary years still favor the full three-stream model.
 Ranking modalities by the mean that includes 2022 can therefore look misleading; the fair comparison for typical seasons is the mean that excludes that fold.
 
-\subsection{Where the encoder and decoder may still struggle}
+That same distinctiveness has the opposite effect under the spatial holdout: among the five seasons, 2022 has the highest per-year $R^2$ (Table~\ref{tab:muni80-20}).
+Since drought-year municipality--years appear on both sides of the split, the model can learn the 2022 response from the training municipalities and use it to rank held-out places within that same season. The year is then no longer an unseen regime, only unseen municipalities inside a season already represented in training.
+
+Paran\'{a} year-LOO makes 2022 look uniquely hard only because that drought is absent from training.
+Once drought seasons are represented among the training years, we expect the opposite: drought years should be the easier folds, because climate and spectral inputs leave a strong imprint of stress that the model can map to yield collapse.
+Favourable seasons are the harder case for within-year ranking: after the seasonal level is set, the residual gap between good and poor municipalities will have more to do with management, cultivar, and planting decisions that our covariates do not observe.
+
+\subsection{Model limits}
 \label{sec:discussion-encoder-decoder}
-Beyond the LOO scores above, a natural worry for this setup is that municipal MSE can be reduced by getting the seasonal level roughly right while leaving municipalities poorly ordered within a year.
-Climate already carries most of the non-drought signal, so the trunks may prefer year-level structure over the smaller within-year productivity residual that PAM still varies about the seasonal mean.
-The decoder may then shrink forecasts toward a mid-range mode: a narrow MLP with heavy dropout has little incentive under plain MSE to spread predictions when residual signal is noisy, and the same head must jointly learn cross-year calibration and within-municipality ranking.
-Drought LOO makes that conflict sharper, because absolute level and residual ordering are asked of one scalar pathway with no analogous season in training.
-There may also be a signal ceiling: management, cultivar, planting date, and field history are absent, and soy-masked municipal means discard within-municipality heterogeneity that could distinguish productive from marginal soy areas inside the same PAM unit.
-Those are hypotheses about where capacity and supervision may be misallocated, not claims that any one of them is already proven.
+Two failure modes matter beyond the headline LOO scores.
+First, the model can look competent by forecasting the year well while ranking municipalities badly inside that year.
+Climate already explains most of the year-to-year swing on non-drought folds, so MSE rewards getting the seasonal level right; the smaller within-year gaps in PAM are easier to ignore.
+Second, mid-range municipalities can collapse toward a common predicted value: under plain MSE alone there is little reason to spread predictions when within-year residuals are noisy, yet absolute level must still be calibrated across years.
+Drought LOO stresses both failure modes at once, because the model must predict an unseen seasonal level and still order municipalities without any drought example in training.
+A further ceiling is the covariates themselves: management, cultivar, planting cycle, and field history are missing, and soy-masked municipal means erase within-municipality contrast that might separate productive from marginal soy inside the same PAM unit.
 
-\subsection{Ideas for the encoder}
-\label{sec:discussion-improve-encoder}
-If within-year residual productivity is under-represented, the encoder may need supervision that asks for it explicitly.
-An auxiliary yield probe on the fused embedding would push the trunks to stay linearly (or lightly nonlinearly) predictive of PAM rather than only useful after a deep head.
-Within-year ranking or correlation losses over municipalities that share a harvest year would penalize scrambling who is above or below the seasonal mean.
-Supervised contrastive or ordinal objectives on within-year yield terciles would go further by pulling same-tercile municipalities together and pushing different terciles apart inside each season.
-Reconstruction of spectral or climate tokens could help trunks keep raw structure during fine-tuning, but it does not ask for productivity geometry and is unlikely to be enough on its own.
-Year-adversarial training looks less attractive here: year and climate structure seem to be the dominant useful signal in the ablations, so erasing it risks removing what the model uses for LOO calibration.
-On the input side, distributional municipal summaries (quantiles, variance) or more encode-then-mean training when I/O allows could reduce the information lost by averaging before the trunks.
-Attention or phenology-weighted climate pooling might emphasize stress windows better than a uniform seasonal mean.
-Static soil might also work better as a gated or residualized spatial prior against the seasonal climate state than as an unconditional concatenation that can help ordinary years and hurt drought LOO.
-Broader geographic and drought coverage remains essential either way: trunks cannot learn drought-sensitive features that never appear among the training municipality--years.
+\subsubsection{Architecture and losses}
+\label{sec:discussion-architecture-losses}
 
-\subsection{Ideas for the decoder}
-\label{sec:discussion-improve-decoder}
-If the head is flattening mid-range forecasts, architectural and objective changes may help.
-Wider residual MLPs with a linear skip from the fused vector, milder dropout, and smoother activations would leave more room for residual signal to reach the output.
-Modality-specific scores fused late could make climate level, spectral residual, and soil prior easier to combine without one pathway dominating.
-Within-year correlation or ranking losses, and penalties against unrealistically small prediction variance inside a year, would push the head to order municipalities rather than collapse them to the training mode.
-Predicting a year-level baseline plus a municipal deviation about that baseline would separate drought calibration from within-year ranking.
-Mixture or quantile heads are natural if PAM residuals are heavy-tailed across municipalities, because under-dispersion then becomes an explicit modelling failure rather than a silent MSE optimum.
-None of this removes the need for regimes that look like the left-out year, or for covariates that capture management and cultivar.
-A better decoder can only extract more of whatever residual the encoder and inputs retain.
-The useful agenda, in our view, is joint: keep year-level climate structure, add explicit within-year productivity pressure in the encoder, and give the decoder less incentive to flatten the mid-range of the prediction surface.
+As stated above, the model might be good at forecasting the year well while ranking municipalities badly inside that year.
+We have a couple of ideas on how to update the architecture and losses to reward within-year ranking.
+
+The simplest ``brute-force'' fix is to put the missing objective in the loss: within-year ranking or correlation terms, and a penalty when predictions inside a year are unrealistically tight.
+Those terms ask who is above or below that year's mean and back-propagate through both the decoder and the embedding, so the same failure mode can be fixed in either place.
+A year-level baseline plus a municipal deviation would separate seasonal calibration from within-year ranking more explicitly, and would make under-dispersion a measurable failure.
+
+A generative auxiliary task might also enrich the embedding: it pressures input fidelity so trunks do not discard spectral or climate detail that a deep yield head does not need for a coarse seasonal fit. That keeps more of the input structure available for ranking, without itself teaching within-year order.
+
+On the climate trunk specifically, Seq2Vec today is a uniform mean over valid days, unlike the NDVI-weighted pool on the spectral side; a learned or phenology-aware climate Seq2Vec that up-weights dry or hot windows could make the climate embedding more sensitive to stress without changing daily inputs or the pixel-path layout.
+Another way to make the embedding space richer is self-supervised pre-training of the trunks, as~\citet{xu2024sitsmoco} do for STNet on large Sentinel-2 archives before downstream fine-tuning. We train MSTNet from scratch on municipal means, so having the pre-training might be helpful.
+
+\subsubsection{Features}
+\label{sec:discussion-features}
+A keen reader may notice that we did not engineer yield covariates from the streams. The spectral trunk receives Sentinel-2 band time series, the climate trunk receives daily Xavier variables, and soil enters as MapBiomas Solo attributes, without the vegetation indices, phenology summaries, or seasonal aggregates that are often used in the literature.
+NDVI appears only as Seq2Vec pooling weights on the spectral trunk, not as an input feature alongside the bands.
+This choice was conscientiously made and the working assumption is that a multi-frequency Transformer can recover the nonlinear relationships that hand-crafted indices encode.
+Although our expectation is that the MLP and the Transformer will recover all relevant information for the yield prediction task, in practice that recovery is not guaranteed. With only municipal PAM labels and an MSE that mostly rewards the seasonal level, the network may never be forced to form the same cues that hand-crafted features make explicit.
+Passing standard indices and climate stress summaries as additional channels would test whether explicit phenology and stress cues still help when the raw series are already in the model.

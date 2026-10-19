@@ -3,9 +3,17 @@
 
 We presented MSTNet, a multi-frequency Transformer that learns soybean productivity from municipal PAM labels and scores soy pixels for sub-municipal maps.
 Sentinel-2 time series and daily Xavier climate enter parallel STNet trunks; MapBiomas Solo enters the decoder by late fusion.
-Training uses soy-masked municipal means; after training, the same weights score every soy pixel and average to municipalities or arbitrary polygons.
+Training uses soy-masked municipal means for speed; after training, the same weights score every soy pixel and average to municipalities or arbitrary polygons.
 
-Under year leave-one-out on Paran\'{a} harvest years 2020--2024, excluding the 2022 drought fold, municipal-mean LOO reaches mean $R^2=0.275$ and the pixel path reaches mean $R^2=0.302$ with RMSE $=0.427$\,\si{t/ha}.
-The 2022 fold fails under both paths because no similar drought season remains in training.
-That failure is a coverage problem: training sets that include poor-yield municipality--years from other seasons and regions should make drought-like responses recognizable.
-Modality ablations show that climate contributes the most on non-drought folds, with Sentinel-2 next and soil last, while intramunicipal maps remain qualitative until field yields are available to score them.
+Year leave-one-out on Paran\'{a} harvest years 2020--2024 is the primary score.
+Excluding the 2022 drought fold, municipal-mean LOO reaches mean $R^2=0.275$ and the pixel path reaches mean $R^2=0.302$ (RMSE $=0.427$\,\si{t/ha}), slightly above the municipal-mean path on the same checkpoints.
+Partial-season scoring approaches that full-window accuracy by February on non-drought folds, allowing an early prediction of that year's yield.
+Fixed-architecture modality ablations rank climate first, Sentinel-2 second, and soil last on ordinary years; soil can help typical seasons and hurt the drought fold.
+Under an 80/20 municipality holdout with shared seasons instead of year-level split, pooled $R^2=0.736$, though much of that pooled score separates years rather than places within a year.
+
+The 2022 LOO collapse is a missing-regime problem, not evidence that drought is intrinsically hard for these covariates: when 2022 appears on both sides of a spatial split it becomes the strongest year, and we expect drought years to become easier once stress seasons are present in training, while favourable seasons remain harder for within-year ranking.
+Intramunicipal maps stay qualitative until field yields can score them.
+
+Further work follows the discussion in Section~\ref{sec:discussion-encoder-decoder}.
+On the data side, we are still lacking broader geographic and drought coverage and pixel-path evaluation at multi-state scale, so stress regimes are represented in training rather than left as LOO surprises.
+On the model side, within-year ranking or correlation losses, a year-level baseline plus municipal deviation, generative auxiliary tasks, and a stress-aware climate Seq2Vec should push the stack beyond seasonal-level fit, while adding standard vegetation indices and climate stress summaries as explicit features will test whether hand-crafted cues still help when the raw series are already present.

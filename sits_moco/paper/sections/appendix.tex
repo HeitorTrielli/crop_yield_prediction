@@ -138,7 +138,7 @@ The diagram is still useful because the post-training evaluation in Section~\ref
   \draw[arr] (p_lb.south) -- (p_lb.south |- out.east) -- (out.east);
 \end{tikzpicture}%
 }
-\caption{Pixel-wise MSTNet data pipeline used for post-training evaluation and sub-municipal maps, not for training.
+\caption{\textbf{Pixel-wise MSTNet data pipeline used for post-training evaluation and sub-municipal maps, not for training.}
 Soy-masked Sentinel-2 pixels are encoded individually; municipal Xavier climate is broadcast to pixels and soil enters by late fusion.
 The mean of pixel predictions $\hat{y}_p$ yields $\hat{y}_{m,y}$ for comparison with IBGE PAM.}
 \label{fig:data-flow-pixel}
@@ -158,7 +158,7 @@ As on the pixel path, early truncations are strongly negative; excluding 2022, m
 
 \begin{table}[!htbp]
 \centering
-\caption{Municipal-mean year-LOO $R^2$ under incomplete seasons.
+\caption{\textbf{Municipal-mean year-LOO $R^2$ under incomplete seasons.}
 Each column keeps only the first $k$ months of the Oct--Mar window ($k=6$ matches Table~\ref{tab:loo-muni-mean}).}
 \label{tab:incomplete-r2-muni}
 \begin{tabular}{lcccccc}
@@ -180,7 +180,7 @@ Mean excl.\ 2022 & $-11.594$ & $-6.942$ & $-0.426$ & $-0.034$ & $0.269$ & $0.275
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.85\textwidth]{incomplete_series_r2_muni_mean.pdf}
-\caption{Municipal-mean LOO $R^2$ versus season length.
+\caption{\textbf{Municipal-mean LOO $R^2$ versus season length.}
 Each curve is one left-out year; the black squares are the mean over non-drought folds.
 Points below the axis floor are clipped and marked with downward triangles.}
 \label{fig:incomplete-r2-muni}
@@ -193,7 +193,7 @@ Figure~\ref{fig:map-error-muni} shows municipal error maps for the best and wors
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\linewidth,height=0.42\textheight,keepaspectratio]{scatter_panel_muni_mean.pdf}
-\caption{Predicted versus observed municipal soybean productivity (\si{t/ha}) for each year-LOO fold under the municipal-mean path.
+\caption{\textbf{Predicted versus observed municipal soybean productivity (\si{t/ha}) for each year-LOO fold under the municipal-mean path.}
 Every panel evaluates only the left-out year. The dashed line is identity.}
 \label{fig:scatter-muni}
 \end{figure}
@@ -201,50 +201,51 @@ Every panel evaluates only the left-out year. The dashed line is identity.}
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\linewidth,keepaspectratio]{map_error_panel_muni_mean.png}
-\caption{Municipal aggregate prediction error maps under the municipal-mean path for LOO years 2021 and 2022.}
+\caption{\textbf{Municipal aggregate prediction error maps under the municipal-mean path for LOO years 2021 and 2022.}}
 \label{fig:map-error-muni}
 \end{figure}
 
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\linewidth,keepaspectratio]{map_error_panel_muni_mean_appendix.png}
-\caption{Municipal aggregate prediction error maps under the municipal-mean path for LOO years 2020, 2023, and 2024.}
+\caption{\textbf{Municipal aggregate prediction error maps under the municipal-mean path for LOO years 2020, 2023, and 2024.}}
 \label{fig:map-error-muni-app}
 \end{figure}
 
 \subsection{Modality ablations}
 \label{app:ablations-muni}
-Table~\ref{tab:ablations-muni} reports the same leave-one-modality-out winners as Table~\ref{tab:ablations}, scored on the municipal-mean path used in training.
+Table~\ref{tab:ablations-muni} reports the same leave-one-modality-out runs as Table~\ref{tab:ablations}, scored on the municipal-mean path used in training.
 Excluding 2022, full MSTNet has mean $R^2=0.275$.
-Omitting climate costs about $0.10$ in mean $R^2$, omitting Sentinel-2 about $0.07$, and omitting soil about $0.04$.
+Omitting Sentinel-2 costs about $0.24$ in mean $R^2$, omitting climate about $0.15$, and omitting soil about $0.03$.
 
 \begin{table}[!htbp]
 \centering
-\small
-\caption{Year-LOO municipal-mean metrics for full MSTNet and leave-one-modality-out ablations.
-Each ablation is the best of three architectures under municipal-mean year-LOO validation.
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{\textbf{Year-LOO municipal-mean metrics for full MSTNet and leave-one-modality-out ablations.}
+Each ablation uses the same hyperparameters as full MSTNet and drops only one input stream.
 RMSE is in \si{t/ha}.
-The first block is the full three-stream baseline; blocks below omit one modality.}
+Full MSTNet keeps S2+climate+soil; No soil keeps S2+climate; No climate keeps S2+soil; No Sentinel-2 keeps climate+soil.}
 \label{tab:ablations-muni}
-\begin{tabular}{lllccccccc}
+\begin{tabular}{@{}llccccccc@{}}
 \toprule
-Variant & Inputs & Metric & 2020 & 2021 & 2022 & 2023 & 2024 & Mean & Mean excl.\ 2022 \\
+Variant & Metric & 2020 & 2021 & 2022 & 2023 & 2024 & Mean & Excl.\ 2022 \\
 \midrule
-\multirow{2}{*}{Full MSTNet} & \multirow{2}{*}{S2+clim.+soil}
+\multirow{2}{*}{Full MSTNet}
   & $R^2$ & 0.233 & 0.410 & $-0.300$ & 0.199 & 0.259 & 0.160 & 0.275 \\
-  & & RMSE & 0.411 & 0.320 & 1.342 & 0.433 & 0.577 & 0.617 & 0.435 \\
+  & RMSE & 0.411 & 0.320 & 1.342 & 0.433 & 0.577 & 0.617 & 0.435 \\
 \midrule
-\multirow{2}{*}{No soil} & \multirow{2}{*}{S2+clim.}
-  & $R^2$ & 0.207 & 0.303 & 0.076 & 0.133 & 0.295 & 0.203 & 0.234 \\
-  & & RMSE & 0.418 & 0.348 & 1.132 & 0.450 & 0.563 & 0.582 & 0.445 \\
+\multirow{2}{*}{No soil}
+  & $R^2$ & 0.205 & 0.343 & $-0.159$ & 0.163 & 0.290 & 0.169 & 0.250 \\
+  & RMSE & 0.419 & 0.338 & 1.267 & 0.442 & 0.565 & 0.606 & 0.441 \\
 \midrule
-\multirow{2}{*}{No climate} & \multirow{2}{*}{S2+soil}
-  & $R^2$ & 0.292 & 0.233 & $-0.197$ & 0.145 & 0.035 & 0.101 & 0.176 \\
-  & & RMSE & 0.394 & 0.365 & 1.288 & 0.447 & 0.658 & 0.630 & 0.466 \\
+\multirow{2}{*}{No climate}
+  & $R^2$ & 0.257 & 0.203 & $-0.290$ & 0.158 & $-0.130$ & 0.040 & 0.122 \\
+  & RMSE & 0.405 & 0.372 & 1.337 & 0.444 & 0.713 & 0.654 & 0.483 \\
 \midrule
-\multirow{2}{*}{No Sentinel-2} & \multirow{2}{*}{clim.+soil}
-  & $R^2$ & 0.131 & 0.262 & $-0.064$ & 0.167 & 0.258 & 0.151 & 0.204 \\
-  & & RMSE & 0.438 & 0.358 & 1.214 & 0.441 & 0.578 & 0.606 & 0.454 \\
+\multirow{2}{*}{No Sentinel-2}
+  & $R^2$ & $-0.434$ & 0.187 & $-0.302$ & 0.095 & 0.299 & $-0.031$ & 0.036 \\
+  & RMSE & 0.562 & 0.376 & 1.343 & 0.460 & 0.562 & 0.661 & 0.490 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -258,7 +259,7 @@ Pooled $R^2=0.736$ (RMSE $0.448$\,\si{t/ha}) is much higher than year-LOO on the
 
 \begin{table}[!htbp]
 \centering
-\caption{80/20 municipality holdout for Paran\'{a} MSTNet under the municipal-mean path.
+\caption{\textbf{80/20 municipality holdout for Paran\'{a} MSTNet under the municipal-mean path.}
 Twenty percent of municipalities are held out for validation and test; all harvest years 2020--2024 appear in both pools.
 RMSE and MAE are in \si{t/ha}.
 Mean is the unweighted average of the five yearly scores; Pooled aggregates all holdout municipality--years.}
@@ -289,20 +290,20 @@ That comparison is qualitative only.
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\linewidth,keepaspectratio]{map_error_panel_appendix.png}
-\caption{Municipal aggregate prediction error maps under the pixel path for LOO years 2020, 2023, and 2024.}
+\caption{\textbf{Municipal aggregate prediction error maps under the pixel path for LOO years 2020, 2023, and 2024.}}
 \label{fig:map-error-app}
 \end{figure}
 
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=\linewidth,keepaspectratio]{mambore_panel_appendix.png}
-\caption{Intramunicipal Mambor\'{e} productivity maps under the pixel path for LOO years 2020, 2023, and 2024.}
+\caption{\textbf{Intramunicipal Mambor\'{e} productivity maps under the pixel path for LOO years 2020, 2023, and 2024.}}
 \label{fig:mambore-app}
 \end{figure}
 
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.92\linewidth,height=0.88\textheight,keepaspectratio]{mambore_ndvi_compare.png}
-\caption{Mambor\'{e} under the 2022 LOO checkpoint: predicted productivity, mean NDVI, and peak NDVI on soy pixels, stacked so that spatial patterns can be compared directly.}
+\caption{\textbf{Mambor\'{e} under the 2022 LOO checkpoint: predicted productivity, mean NDVI, and peak NDVI on soy pixels, stacked so that spatial patterns can be compared directly.}}
 \label{fig:mambore-ndvi}
 \end{figure}
