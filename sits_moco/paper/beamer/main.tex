@@ -318,8 +318,8 @@
     \midrule
     Full MSTNet (S2 + climate + soil) & 0.157 & \textbf{0.302} \\
     No soil & 0.147 & 0.234 \\
-    No climate & $-0.112$ & $-0.017$ \\
     No Sentinel-2 & $-0.027$ & 0.040 \\
+    No climate & $-0.112$ & $-0.017$ \\
     \bottomrule
   \end{tabular}
 
@@ -363,6 +363,82 @@
   \centering
   \vspace{2.5cm}
   {\Large Thank you}
+\end{frame}
+
+\appendix
+
+\begin{frame}{Appendix: encoder math}
+  Per-timestep MLP and DoY positional encoding ($i\in\{s,c\}$):
+  \begin{align*}
+    \mathbf{e}_{i,t}
+    &=
+    MLP_i(\mathbf{x}_{i,t}),
+    \\[0.25em]
+    \mathbf{p}_{i,t}
+    &=
+    \bigl[\sin(\mathrm{DoY}_{i,t}/\tau^{2k/d}),\,
+          \cos(\mathrm{DoY}_{i,t}/\tau^{2k/d})\bigr]_{k=1}^{d/2},
+    \\[0.25em]
+    \mathbf{e}_{i,t}'
+    &=
+    \mathbf{e}_{i,t}+\mathbf{p}_{i,t},
+    \qquad
+    \tau=1000.
+  \end{align*}
+  Transformer on $\mathbf{E}_i'$ yields $\mathbf{O}_i$. Seq2Vec pools to one vector:
+  \[
+    \mathbf{w}
+    =
+    \mathrm{softmax}\bigl([\mathrm{NDVI}_t]_{t=1}^{T_s}\bigr),
+    \qquad
+    \mathbf{o}_s
+    =
+    \sum_{t=1}^{T_s} w_t\,\mathbf{o}_{s,t}.
+  \]
+  {\footnotesize Climate: mean of $\mathbf{O}_c$ over valid days $\to\mathbf{o}_c$.}
+\end{frame}
+
+\begin{frame}{Appendix: decoder and loss}
+  Late fusion:
+  \[
+    \hat{y}
+    =
+    MLP_2\bigl([\mathbf{o}_s;\mathbf{o}_c;\mathbf{s}]\bigr).
+  \]
+  Standardized municipal-mean MSE:
+  \[
+    \tilde{y}_{m,y}
+    =
+    \frac{y_{m,y}-\mu}{\sigma},
+    \qquad
+    \mathcal{L}(\theta)
+    =
+    \frac{1}{|\mathcal{D}|}
+    \sum_{(m,y)\in\mathcal{D}}
+    \bigl(\hat{y}_{m,y}^{\mathrm{train}}-\tilde{y}_{m,y}\bigr)^2.
+  \]
+  {\footnotesize $\mu,\sigma$ from training years of the fold; metrics use $\sigma\hat{y}+\mu$.}
+\end{frame}
+
+\begin{frame}{Appendix: training paths}
+  \textbf{Train:} average soy-pixel inputs $\to$ one municipal prediction $\to$ PAM
+  \[
+    \bar{\mathbf{x}}_{m,y,t}
+    =
+    \frac{1}{|\mathcal{P}_{m,y,t}|}
+    \sum_{p\in\mathcal{P}_{m,y,t}}
+    \mathbf{x}_{p,t}
+  \]
+
+  \vspace{0.4em}
+  \textbf{Score:} predict each soy pixel $\to$ one municipal prediction (mean of $\hat{y}_p$)
+  \[
+    \hat{y}_{m,y}
+    =
+    \frac{1}{|\mathcal{P}_{m,y}|}
+    \sum_{p\in\mathcal{P}_{m,y}}
+    \hat{y}_p
+  \]
 \end{frame}
 
 \end{document}
