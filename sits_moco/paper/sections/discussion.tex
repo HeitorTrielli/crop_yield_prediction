@@ -80,13 +80,13 @@ A year-level baseline plus a municipal deviation would separate seasonal calibra
 
 A generative auxiliary task might also enrich the embedding: it pressures input fidelity so trunks do not discard spectral or climate detail that a deep yield head does not need for a coarse seasonal fit. That keeps more of the input structure available for ranking, without itself teaching within-year order.
 
-On the climate trunk specifically, Seq2Vec today is a uniform mean over valid days, unlike the NDVI-weighted pool on the spectral side; a learned or phenology-aware climate Seq2Vec that up-weights dry or hot windows could make the climate embedding more sensitive to stress without changing daily inputs or the pixel-path layout.
+On the climate trunk encoder specifically, Seq2Vec today is a uniform mean over valid days, unlike the NDVI-weighted pool on the spectral side; a learned or phenology-aware climate Seq2Vec that up-weights dry or hot windows could make the climate embedding more sensitive to stress without changing daily inputs or the pixel-path layout.
 Another way to make the embedding space richer is self-supervised pre-training of the trunks, as~\citet{xu2024sitsmoco} do for STNet on large Sentinel-2 archives before downstream fine-tuning. We train MSTNet from scratch on municipal means, so having the pre-training might be helpful.
 
 \subsubsection{Features}
 \label{sec:discussion-features}
 A keen reader may notice that we did not engineer yield covariates from the streams. The spectral trunk receives Sentinel-2 band time series, the climate trunk receives daily Xavier variables, and soil enters as MapBiomas Solo attributes, without the vegetation indices, phenology summaries, or seasonal aggregates that are often used in the literature.
-NDVI appears only as Seq2Vec pooling weights on the spectral trunk, not as an input feature alongside the bands.
+NDVI appears only as Seq2Vec pooling weights inside the spectral encoder, not as an input feature alongside the bands.
 This choice was conscientiously made and the working assumption is that a multi-frequency Transformer can recover the nonlinear relationships that hand-crafted indices encode.
 Although our expectation is that the MLP and the Transformer will recover all relevant information for the yield prediction task, in practice that recovery is not guaranteed. With only municipal PAM labels and an MSE that mostly rewards the seasonal level, the network may never be forced to form the same cues that hand-crafted features make explicit.
 Passing standard indices and climate stress summaries as additional channels would test whether explicit phenology and stress cues still help when the raw series are already in the model.

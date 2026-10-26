@@ -6,7 +6,7 @@ Section~\ref{sec:results} presents the corresponding pixel-path scores, maps, an
 
 \subsection{Proposed model}
 The proposed model is MSTNet: one STNet trunk for the Sentinel-2 series, one for the daily climate series, and late fusion of soil features in the decoder.
-Each trunk uses one Transformer encoder layer with $d=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=64$, and dropout $0.4$.
+Each trunk encoder uses one Transformer layer with $d=128$, four attention heads, feed-forward width $d_{\mathrm{inner}}=64$, and dropout $0.4$, then Seq2Vec (NDVI-weighted mean on the spectral trunk; mean over valid days on climate).
 Optimization uses AdamW with learning rate $1\times10^{-3}$, weight decay $5\times10^{-4}$, and batches of 40 municipalities.
 The learning rate drops at epochs 40 and 120; training stops early after fifteen epochs without improvement in the validation loss.
 Training and checkpoint selection use the municipal-mean path (Section~\ref{sec:pixel-formulation}).

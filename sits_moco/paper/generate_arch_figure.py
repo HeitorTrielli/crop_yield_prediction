@@ -137,24 +137,26 @@ def _h_arrow_to(ax, x0, x1, y, color="#666666", lw=1.1, tip=0.07):
     )
 
 
-def draw_encoder(ax, x, y, w, h):
+def draw_encoder(ax, x, y, w, h, *, stack_w=None):
     """
-    Xu-style Transformer encoder (bottom→top), with correct residuals:
+    STNet encoder panel: Transformer stack (left) + room for Seq2Vec (right).
 
       E' ──► Multi-Head Attention ──► Add & Norm ──► Feed Forward ──► Add & Norm ──► O
        │                              ▲                │                              ▲
        └──────────────────────────────┘                └──────────────────────────────┘
 
     Left residual rail is inset inside the gray panel (not on the border).
-    Returns (bus_y, bus_left_x, out_xy).
+    ``stack_w`` is the Transformer column width; the rest of ``w`` holds Seq2Vec.
+    Returns (bus_y, bus_left_x, out_xy) where out_xy is the Transformer exit into Seq2Vec.
     """
     rbox(ax, x, y, w, h, C_GRAY, C_GRAY_E, lw=1.15, rs=0.08, z=2)
-    tab(ax, x + (w - 1.05) / 2, y + h - 0.04, 1.05, 0.24, "encoder", C_SEQ, C_SEQ_E, fs=8)
-
     # Left pad for residual rail; tight top pad (less empty headroom)
     pad_l, pad_r, pad_b, pad_t = 1.00, 0.18, 0.55, 0.14
+    tf_w = stack_w if stack_w is not None else w
+    # Tab centered on the Transformer column (not the full panel with Seq2Vec)
+    tab(ax, x + (tf_w - 1.05) / 2, y + h - 0.04, 1.05, 0.24, "encoder", C_SEQ, C_SEQ_E, fs=8)
     bx = x + pad_l
-    bw = w - pad_l - pad_r
+    bw = tf_w - pad_l - pad_r
     rail_x = x + 0.32
 
     h_att, h_n, h_ff = 0.46, 0.30, 0.38
@@ -230,8 +232,8 @@ def draw_encoder(ax, x, y, w, h):
 
     out_y = y_n2 + h_n / 2
     txt(ax, x + 0.12, bus_y - 0.02, r"$\mathbf{E}'$", fs=8.5, c=C_INK, ha="left", va="top")
-    # Incoming rail joins the central trunk at (cx, bus_y)
-    return bus_y, cx, (x + w, out_y)
+    # Incoming rail joins the central trunk at (cx, bus_y); exit is the Transformer column edge
+    return bus_y, cx, (x + tf_w, out_y)
 
 
 def _feature_strip(ax, x, y, w, h, z=3):
@@ -252,10 +254,13 @@ def _feature_strip(ax, x, y, w, h, z=3):
         )
 
 
-def draw_seq2vec(ax, x, y, w, h, accent, cmap_name, note):
+def draw_seq2vec(ax, x, y, w, h, accent, cmap_name, note, *, framed=True):
     """Xu Fig. 2 Seq2Vec: staggered sequence strips → pooled vector, with T axis."""
     del accent, cmap_name  # palette is fixed to match Xu; note is the pooling label
-    dashed_region(ax, x, y, w, h, fc="#FFFFFF")
+    if framed:
+        dashed_region(ax, x, y, w, h, fc="#FFFFFF")
+    else:
+        rbox(ax, x, y, w, h, "#FFFFFF", C_GRAY_E, lw=0.95, rs=0.06, z=2)
     tab(ax, x + 0.08, y + h - 0.04, 0.95, 0.22, "Seq2Vec", C_SEQ, C_SEQ_E, fs=7.8)
 
     # Content fills the box from the bottom up (no floating bars over empty space)
@@ -342,9 +347,11 @@ def draw_branch(
     mlp_w, mlp_h = 0.50, 0.30
     sum_r = 0.10
 
-    # Encoder + Seq2Vec (taller for E' arrows; more gap before Seq2Vec)
-    x_enc, enc_w = ox + 2.00, 3.45
-    x_s2v, s2v_w = x_enc + enc_w + 0.42, 1.55
+    # Encoder panel: Transformer stack + Seq2Vec inside the same gray box
+    x_enc = ox + 2.00
+    tf_w, s2v_gap, s2v_w = 3.45, 0.36, 1.55
+    enc_w = tf_w + s2v_gap + s2v_w + 0.16  # inner pad after Seq2Vec
+    x_s2v = x_enc + tf_w + s2v_gap
     # Tight to content: pad_b + blocks + 3*gaps + pad_t ≈ 3.65
     enc_h = 3.75
     enc_y = y_mid - enc_h / 2
@@ -433,8 +440,10 @@ def draw_branch(
     )
     txt(ax, x_in + 0.16, gap_y, r"$\vdots$", fs=10, c=accent)
 
-    # Encoder
-    bus_y, bus_left_x, (enc_right, out_y) = draw_encoder(ax, x_enc, enc_y, enc_w, enc_h)
+    # Encoder (Transformer + Seq2Vec share one panel)
+    bus_y, bus_left_x, (tf_right, out_y) = draw_encoder(
+        ax, x_enc, enc_y, enc_w, enc_h, stack_w=tf_w
+    )
 
     # Clean gather: stubs → vertical rail → land on the LEFT of the E' bus (no overshoot)
     sum_x = x_sum + 0.14
@@ -444,20 +453,21 @@ def draw_branch(
     ax.plot([rail_x, rail_x], [min(ys[-1], bus_y), ys[0]], color=C_ARROW, lw=1.15, zorder=4)
     ax.plot([rail_x, bus_left_x], [bus_y, bus_y], color=C_ARROW, lw=1.15, solid_capstyle="butt", zorder=4)
 
-    # Seq2Vec → o (orthogonal: out of encoder at out_y, then down to midline)
-    # Compact Seq2Vec box (content-sized), vertically centered on the encoder
+    # Seq2Vec inside the encoder; O flows horizontally into it, then o exits the panel
     s2v_h = 2.35
     s2v_y = enc_y + 0.5 * (enc_h - s2v_h)
-    draw_seq2vec(ax, x_s2v, s2v_y, s2v_w, s2v_h, accent, cmap_name, s2v_note)
-    mid_x = enc_right + 0.10
-    ax.plot([enc_right, mid_x], [out_y, out_y], color=C_ARROW, lw=1.0, zorder=4)
+    draw_seq2vec(ax, x_s2v, s2v_y, s2v_w, s2v_h, accent, cmap_name, s2v_note, framed=False)
+    mid_x = tf_right + 0.5 * s2v_gap
+    ax.plot([tf_right, mid_x], [out_y, out_y], color=C_ARROW, lw=1.0, zorder=4)
     ax.plot([mid_x, mid_x], [out_y, y_mid], color=C_ARROW, lw=1.0, zorder=4)
-    # Just right of the drop (small offset — avoid sitting on the line or far away)
     txt(ax, mid_x + 0.04, out_y, r"$\mathbf{O}$", fs=9, c=C_INK, ha="left")
     arr(ax, mid_x, y_mid, x_s2v, y_mid, lw=1.0, ms=7)
-    txt(ax, x_s2v + s2v_w + 0.12, y_mid, o_label, fs=10, c=accent, w="bold", ha="left")
+    enc_right = x_enc + enc_w
+    # Exit through the encoder pad; label sits just outside the panel
+    ax.plot([x_s2v + s2v_w, enc_right], [y_mid, y_mid], color=C_ARROW, lw=1.0, zorder=4)
+    txt(ax, enc_right + 0.14, y_mid, o_label, fs=10, c=accent, w="bold", ha="left")
 
-    return x_s2v + s2v_w + 0.55, y_mid, bot, top - bot
+    return enc_right + 0.55, y_mid, bot, top - bot
 
 
 def main():
@@ -468,7 +478,7 @@ def main():
     ax.axis("off")
     fig.patch.set_facecolor("white")
 
-    branch_w = 8.15
+    branch_w = 8.55
 
     zs = draw_branch(
         ax,

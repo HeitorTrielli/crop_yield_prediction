@@ -14,8 +14,8 @@ Figure~\ref{fig:mstnet-arch} summarizes the network.
 \centering
 \includegraphics[width=\textwidth]{mstnet_arch.pdf}
 \caption{\textbf{MSTNet architecture.}
-Each STNet trunk $i\in\{s,c\}$ maps a SITS $\mathbf{X}_i$ of length $T_i$ through a shared per-timestep MLP to $\mathbf{E}_i$, adds DoY encodings to form $\mathbf{E}_i'$, applies a Transformer encoder to obtain $\mathbf{O}_i$, and pools with Seq2Vec to $\mathbf{o}_s$ with NDVI weights or $\mathbf{o}_c$ as a mean over valid days.
-The output head concatenates $\mathbf{o}_s$, $\mathbf{o}_c$, and MapBiomas Solo features~$\mathbf{s}$, then $MLP_2$ predicts productivity~$\hat{y}$.
+Each STNet trunk $i\in\{s,c\}$ is an encoder: a shared per-timestep MLP embeds $\mathbf{X}_i$ as $\mathbf{E}_i$, DoY encodings form $\mathbf{E}_i'$, a Transformer yields the sequence $\mathbf{O}_i$, and Seq2Vec pools to a single vector---$\mathbf{o}_s$ with NDVI weights or $\mathbf{o}_c$ as a mean over valid days.
+The output head (decoder) concatenates $\mathbf{o}_s$, $\mathbf{o}_c$, and MapBiomas Solo features~$\mathbf{s}$, then $MLP_2$ predicts productivity~$\hat{y}$.
 Adapted from Fig.~2 of~\citet{xu2024sitsmoco}.}
 \label{fig:mstnet-arch}
 \end{figure}
@@ -53,13 +53,11 @@ with
 and $\tau=1000$, which gives $\mathbf{E}_i'=[\mathbf{e}_{i,1}',\ldots,\mathbf{e}_{i,T_i}']$.
 The DoY calendars differ by trunk: spectral steps follow the clear Sentinel-2 acquisition dates, while climate steps follow the daily Oct--Mar grid.
 
-\paragraph{Transformer encoder.}
-Each trunk applies a Transformer encoder to $\mathbf{E}_i'$.
-Inside each encoder layer, multi-head self-attention forms query, key, and value projections at every timestep, runs scaled dot-product attention over the sequence in parallel heads, and recombines the head outputs.
+\paragraph{STNet encoder.}
+The trunk encoder comprises the per-timestep MLP and DoY encodings above, a Transformer over $\mathbf{E}_i'$, and Seq2Vec pooling to a fixed vector $\mathbf{o}_i$.
+Inside each Transformer layer, multi-head self-attention forms query, key, and value projections at every timestep, runs scaled dot-product attention over the sequence in parallel heads, and recombines the head outputs.
 A position-wise feed-forward network follows, and both sublayers use residual connections with layer normalization, yielding $\mathbf{O}_i=[\mathbf{o}_{i,1},\ldots,\mathbf{o}_{i,T_i}]\in\mathbb{R}^{T_i\times d}$.
-
-\paragraph{Seq2Vec.}
-A Seq2Vec module collapses $\mathbf{O}_i$ to a single vector $\mathbf{o}_i\in\mathbb{R}^{d}$.
+Seq2Vec then collapses $\mathbf{O}_i$ to $\mathbf{o}_i\in\mathbb{R}^{d}$, so the encoder output that enters the decoder is a single embedding per trunk, not a sequence.
 On the spectral trunk we use an NDVI-weighted temporal mean: with NIR and red channels of $\mathbf{x}_{s,t}$,
 \begin{equation}
   \mathrm{NDVI}_t
@@ -82,7 +80,7 @@ On the climate trunk there is no NDVI analogue; we take the mean of $\mathbf{O}_
 
 \paragraph{Output head.}
 Since MapBiomas Solo properties $\mathbf{s}$ are static once the harvest year is known, we fuse them directly in the decoder.
-MSTNet concatenates the trunk embeddings with soil and decodes a scalar productivity estimate,
+MSTNet concatenates the trunk encoder embeddings with soil and decodes a scalar productivity estimate,
 \begin{equation}
   \hat{y}
   =

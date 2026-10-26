@@ -9,7 +9,7 @@ The closest Brazilian precedent for learning soybean yield from IBGE municipal s
 Our goal is a model in that same municipal-to-pixel spirit: one that learns from municipal labels, predicts at smaller regions, and remains cheap enough to run over large areas.
 
 MSTNet (\emph{Multi} STNet) extends the Spectral--Temporal Network (STNet) of~\citet{xu2024sitsmoco}.
-Its Transformer encoder follows the self-attention architecture for satellite time series of~\citet{russwurm2020selfattention}, and each covariate stream gets its own trunk when the streams are sampled at different frequencies.
+Each trunk is an STNet encoder---per-timestep MLP, DoY positional encodings, a Transformer over the season, and Seq2Vec pooling to a fixed embedding---with the Transformer built on the self-attention architecture for satellite time series of~\citet{russwurm2020selfattention}, and each covariate stream gets its own trunk when the streams are sampled at different frequencies.
 Here, one trunk encodes soy-masked Sentinel-2 reflectance and another encodes daily climate.
 Annual MapBiomas Solo properties, which are static once the harvest year is fixed, are concatenated in the decoder.
 Predictions are defined per soy pixel.
