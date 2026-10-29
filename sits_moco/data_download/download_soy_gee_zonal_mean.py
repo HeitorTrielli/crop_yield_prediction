@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-Download MapBiomas-soy zonal MEAN Sentinel-2 time series per municipality from GEE.
+Download MapBiomas-soy zonal MEAN Sentinel-2 or Sentinel-1 time series from GEE.
 
 For each season:
   1. MapBiomas soybean inventory (class 39, harvest year)
-  2. Chunk municipalities by UF and run one S2 reduceRegions export per chunk
+  2. Chunk municipalities by UF and run one reduceRegions export per chunk
      (one daily mosaic, many polygons — far cheaper than one GEE task per muni)
   3. Split the Drive table into one CSV per municipality (same schema as before)
      (GEE COMPLETED can precede Drive listing; wait --drive-wait before giving up,
      and do not start a new export just because the CSV is late)
-  4. Quality columns: valid_pixel_count, clear_fraction, mean_cloud_score_soy
+  4. S2 quality: valid_pixel_count, clear_fraction, mean_cloud_score_soy
+     S1 quality: valid_pixel_count, valid_fraction
   5. Sidecar area file: mapbiomas_soy_area_ha vs IBGE PAM (filter after download)
 
 Usage:
   python data_download/download_soy_gee_zonal_mean.py \\
       --shapefile-dir files/shapefiles --season-year 2024 \\
       --gee-project crop-yield-pred-506711 --gee-account heigthtrielli@gmail.com
+
+  # Sentinel-1 VV/VH/angle means for all currently supported states:
+  python data_download/download_soy_gee_zonal_mean.py \\
+      --sensor s1 --shapefile-dir files/shapefiles --season-years 2020-2024 \\
+      --states pr,rs,sp,go,sc --pam-csv files/pam_soy_br_2020_2024.csv \\
+      --skip-existing
 
   # Rio Grande do Sul only, skip municipalities already on disk:
   python data_download/download_soy_gee_zonal_mean.py \\
@@ -41,7 +48,7 @@ Output layout:
     {code}_area.csv             mapbiomas soy area (one row)
     mapbiomas_soy_inventory.csv all munis × this season (soy pixels / ha)
   {output_dir}/mapbiomas_no_soy.csv
-    (season_year, municipality_code) with zero MapBiomas soy — skipped for S2
+    (season_year, municipality_code) with zero MapBiomas soy — skipped
 """
 
 from __future__ import annotations
@@ -69,13 +76,14 @@ from drive_api import (
 )
 from gee_export import DEFAULT_GEE_ACCOUNT, DEFAULT_GEE_PROJECT, initialize_gee
 from gee_zonal import (
+    chunk_s1_zonal_feature_collection,
     chunk_zonal_feature_collection,
     mapbiomas_soy_areas_for_collection,
     start_table_export_task,
     wait_for_gee_task,
 )
 
-ZONAL_SELECTORS = [
+S2_ZONAL_SELECTORS = [
     "B11",
     "B12",
     "B2",
@@ -95,7 +103,20 @@ ZONAL_SELECTORS = [
     "soy_pixel_count",
     "valid_pixel_count",
 ]
-ZONAL_CSV_FIELDS = ["system:index", *ZONAL_SELECTORS, ".geo"]
+S1_ZONAL_SELECTORS = [
+    "VV",
+    "VH",
+    "angle",
+    "date",
+    "doy",
+    "municipality_code",
+    "season_year",
+    "soy_pixel_count",
+    "valid_fraction",
+    "valid_pixel_count",
+]
+S2_ZONAL_CSV_FIELDS = ["system:index", *S2_ZONAL_SELECTORS, ".geo"]
+S1_ZONAL_CSV_FIELDS = ["system:index", *S1_ZONAL_SELECTORS, ".geo"]
 EMPTY_GEO = '{"type":"MultiPoint","coordinates":[]}'
 
 from download_pam_soy_sidra import (
@@ -131,6 +152,12 @@ def log(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--sensor",
+        choices=["s2", "s1"],
+        default="s2",
+        help="Satellite source (default: s2). S1 exports VV, VH, and incidence angle.",
+    )
     shape_group = p.add_mutually_exclusive_group(required=False)
     shape_group.add_argument(
         "--shapefile",
@@ -174,14 +201,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("files/zonal_mean"),
-        help="Base output directory (default: files/zonal_mean)",
+        default=None,
+        help="Base output directory (default: files/zonal_mean for S2; files/zonal_mean_s1 for S1)",
     )
     p.add_argument(
         "--drive-folder",
         type=str,
-        default="GEE_Soy_Zonal_Export",
-        help="Temporary Drive folder for CSV exports",
+        default=None,
+        help="Temporary Drive folder (sensor-specific default)",
     )
     p.add_argument(
         "--gee-project",
@@ -214,6 +241,12 @@ def parse_args() -> argparse.Namespace:
         help="Cloud Score+ clear pixel threshold (default: 0.60)",
     )
     p.add_argument(
+        "--orbit-pass",
+        choices=["ASCENDING", "DESCENDING"],
+        default=None,
+        help="Optional Sentinel-1 orbit pass filter; ignored for Sentinel-2",
+    )
+    p.add_argument(
         "--max-download-workers",
         type=int,
         default=None,
@@ -237,12 +270,12 @@ def parse_args() -> argparse.Namespace:
         "--export-chunk-size",
         type=int,
         default=40,
-        help="Municipalities per S2 reduceRegions export, grouped by UF (default: 40)",
+        help="Municipalities per reduceRegions export, grouped by UF (default: 40)",
     )
     p.add_argument(
         "--inventory-only",
         action="store_true",
-        help="Build soy inventories and stop (no Sentinel-2 export)",
+        help="Build soy inventories and stop (no satellite export)",
     )
     p.add_argument(
         "--rebuild-inventory",
@@ -318,6 +351,19 @@ def parse_args() -> argparse.Namespace:
         "Default: all municipalities under --shapefile-dir",
     )
     args = p.parse_args()
+    if args.output_dir is None:
+        args.output_dir = Path(
+            "files/zonal_mean_s1" if args.sensor == "s1" else "files/zonal_mean"
+        )
+    if args.drive_folder is None:
+        args.drive_folder = (
+            "GEE_Soy_Zonal_Export_S1"
+            if args.sensor == "s1"
+            else "GEE_Soy_Zonal_Export"
+        )
+    args.zonal_selectors = (
+        S1_ZONAL_SELECTORS if args.sensor == "s1" else S2_ZONAL_SELECTORS
+    )
     args.ingest_only = bool(args.ingest_drive) or args.ingest_dir is not None
     if args.ingest_drive and args.ingest_dir is not None:
         p.error("Use only one of --ingest-drive or --ingest-dir")
@@ -940,8 +986,12 @@ def split_chunk_csv(
             lookup[alias] = p.stem
 
     grouped: dict[str, list[dict[str, str]]] = {}
+    csv_fields = S2_ZONAL_CSV_FIELDS
     with open(chunk_csv, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        if reader.fieldnames and {"VV", "VH"}.issubset(reader.fieldnames):
+            csv_fields = S1_ZONAL_CSV_FIELDS
+        for row in reader:
             stem = _row_muni_stem(row.get("municipality_code", ""), lookup)
             if stem is None:
                 raw = str(row.get("municipality_code") or "").strip()
@@ -961,10 +1011,10 @@ def split_chunk_csv(
         rows.sort(key=lambda r: str(r.get("date") or ""))
         out_dir.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=ZONAL_CSV_FIELDS, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
             w.writeheader()
             for i, row in enumerate(rows):
-                out = {k: row.get(k, "") for k in ZONAL_CSV_FIELDS}
+                out = {k: row.get(k, "") for k in csv_fields}
                 out["system:index"] = str(i)
                 out["municipality_code"] = stem
                 if not str(out.get(".geo") or "").strip():
@@ -1031,7 +1081,7 @@ def download_drive_csv(
 
 
 def year_range_from_chunk_name(name: str) -> tuple[int, int] | None:
-    m = re.match(r"^zonal_(\d{4})-(\d{4})", Path(name).name)
+    m = re.match(r"^zonal_(?:(?:s1|s2)_)?(\d{4})-(\d{4})", Path(name).name)
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
@@ -1330,18 +1380,29 @@ def _export_and_split_chunk(
         return skipped_geom
 
     fc_munis = ee.FeatureCollection(feats)
-    log(f"{label}: starting reduceRegions table export...")
-    fc = chunk_zonal_feature_collection(
-        fc_munis,
-        date_list[0],
-        date_list[-1],
-        mapbiomas_year,
-        args.cloud_pct,
-        args.cloud_score_threshold,
-        args.scale,
-    )
+    log(f"{label}: starting {args.sensor.upper()} reduceRegions table export...")
+    if args.sensor == "s1":
+        fc = chunk_s1_zonal_feature_collection(
+            fc_munis,
+            date_list[0],
+            date_list[-1],
+            mapbiomas_year,
+            args.scale,
+            args.orbit_pass,
+        )
+    else:
+        fc = chunk_zonal_feature_collection(
+            fc_munis,
+            date_list[0],
+            date_list[-1],
+            mapbiomas_year,
+            args.cloud_pct,
+            args.cloud_score_threshold,
+            args.scale,
+        )
     file_prefix = (
-        f"zonal_{year_start}-{year_end}_{shapefiles[0].stem}_{shapefiles[-1].stem}"
+        f"zonal_{args.sensor}_{year_start}-{year_end}_"
+        f"{shapefiles[0].stem}_{shapefiles[-1].stem}"
         f"_n{len(shapefiles)}"
     )
     description = file_prefix[:100]
@@ -1351,7 +1412,7 @@ def _export_and_split_chunk(
             description,
             args.drive_folder,
             file_prefix,
-            selectors=ZONAL_SELECTORS,
+            selectors=args.zonal_selectors,
         ),
         what=f"{label} export start",
     )
@@ -1389,7 +1450,11 @@ def _export_and_split_chunk(
                 {
                     "municipality_code": shp.stem,
                     "status": "no_imagery",
-                    "note": "no clear soy S2 dates",
+                    "note": (
+                        "no soy S1 acquisitions"
+                        if args.sensor == "s1"
+                        else "no clear soy S2 dates"
+                    ),
                 }
             )
             continue
@@ -1401,7 +1466,7 @@ def _export_and_split_chunk(
                 "note": f"{n_rows} dates",
             }
         )
-    log(f"{label}: saved {n_ok} CSVs ({n_empty} munis with no clear soy dates)")
+    log(f"{label}: saved {n_ok} CSVs ({n_empty} munis with no usable dates)")
     return rows
 
 
@@ -1618,7 +1683,7 @@ def main() -> None:
     if args.start_date and args.end_date:
         date_list, year_start, year_end = get_date_list_from_args(args)
         print(
-            f"Zonal mean export: {len(shapefiles)} municipalities, "
+            f"{args.sensor.upper()} zonal mean export: {len(shapefiles)} municipalities, "
             f"custom {date_list[0]}–{date_list[-1]}  "
             f"chunks={args.export_chunk_size} workers={args.workers}"
         )
@@ -1629,7 +1694,7 @@ def main() -> None:
     else:
         seasons = args.season_years_list
         print(
-            f"Zonal mean export: {len(shapefiles)} municipalities × "
+            f"{args.sensor.upper()} zonal mean export: {len(shapefiles)} municipalities × "
             f"{len(seasons)} seasons {seasons}  chunks={args.export_chunk_size} "
             f"workers={args.workers}"
             + ("  [inventory-only]" if args.inventory_only else "")

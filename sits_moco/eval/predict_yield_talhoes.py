@@ -48,7 +48,10 @@ from rasterio.warp import Resampling, reproject
 from torch.amp import autocast
 from tqdm import tqdm
 
-from datasets.daily_climate import climate_sidecar_path
+from datasets.daily_climate import (
+    climate_extra_spec_from_run_config,
+    climate_sidecar_path,
+)
 from datasets.feature_layout import (
     feature_layout_needs_climate_sidecar,
     feature_layout_needs_soil_sidecar,
@@ -885,6 +888,7 @@ def run_talhao_predictions(
         legacy_input_scaling=legacy_input_scaling,
         deterministic_head=True,
         climate_sequencelength=int(climate_sequencelength),
+        climate_extra_features=climate_extra_spec_from_run_config(run_config),
     )
 
     results: list[dict] = []

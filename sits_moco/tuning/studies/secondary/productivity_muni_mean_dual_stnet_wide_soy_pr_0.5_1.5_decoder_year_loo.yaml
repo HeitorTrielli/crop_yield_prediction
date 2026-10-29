@@ -1,0 +1,209 @@
+# Decoder-focused study for the PR-only trial_005 architecture.
+#
+# The two encoders and all training/data settings are held fixed. Only the
+# mapping from the fused 260-D representation (spectral + climate + soil) to
+# productivity changes. Each candidate is evaluated with year leave-one-out
+# folds for 2020--2024.
+#
+# Preview / run:
+#   python run_tuning_study.py show tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_decoder_year_loo.yaml --list-trials
+#   python run_tuning_study.py run  tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_decoder_year_loo.yaml --skip-completed
+#   python run_tuning_study.py summarize tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_decoder_year_loo.yaml
+
+name: productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_decoder_year_loo
+objective: val_r2
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean_soy
+  target: productivity
+  head_output: zscore
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: dual_spectral_daily_climate_soil
+  soil_fusion: late
+  climate_sequencelength: 183
+  temporal_pooling: ndvi
+  yield_csv: files/pam_soy_pr_mapbiomas_coverage_0.5_1.5.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  learning_rate: 1.0e-3
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [40, 120]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 15
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  refit_extra_scaler: true
+  suffix_prefix: dual_stnet_pr_trial005_decoder_yloo
+
+  # Frozen trial_005 encoder.
+  model_d_model: 128
+  model_n_head: 4
+  model_d_inner: 64
+  model_dropout: 0.4
+  model_n_layers: 1
+
+search:
+  strategy: list
+  year_loo: [2020, 2021, 2022, 2023, 2024]
+  extra_scaler_template: files/train_input_scaler_dual_muni_mean_soy_pr_0.5_1.5_loo{holdout_year}.json
+  trials:
+    # Exact current 260 -> 64 -> 32 -> 1 control.
+    - decoder_type: legacy
+
+    # Test whether nonlinear shrinkage itself is the bottleneck.
+    - decoder_type: linear
+
+    # Plain MLP capacity/shape.
+    - decoder_type: mlp
+      decoder_hidden_dims: "64,32"
+      decoder_activation: relu
+      decoder_norm: layer
+      decoder_dropout: 0.4
+    - decoder_type: mlp
+      decoder_hidden_dims: "128,64"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.2
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: mlp
+      decoder_hidden_dims: "512,256"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: silu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: relu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+
+    # Isolate normalization and decoder dropout.
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: none
+      decoder_dropout: 0.0
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.0
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.2
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.4
+    - decoder_type: mlp
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: none
+      decoder_dropout: 0.1
+
+    # Residual transformations preserve distinctions in the fused embedding.
+    - decoder_type: residual
+      decoder_hidden_dims: "128,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: residual
+      decoder_hidden_dims: "256,256"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: residual
+      decoder_hidden_dims: "256,256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: residual
+      decoder_hidden_dims: "256,256"
+      decoder_activation: silu
+      decoder_norm: layer
+      decoder_dropout: 0.0
+
+    # Direct linear prediction plus a learned nonlinear correction.
+    - decoder_type: linear_residual
+      decoder_hidden_dims: "128,64"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: linear_residual
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: linear_residual
+      decoder_hidden_dims: "512,256"
+      decoder_activation: silu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+
+    # Learn which fused features to expose to the head.
+    - decoder_type: gated
+      decoder_hidden_dims: "128,64"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: gated
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+
+    # Test whether modality contributions should remain separately identifiable.
+    - decoder_type: modality_additive
+    - decoder_type: modality_residual
+      decoder_hidden_dims: "128,64"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+    - decoder_type: modality_residual
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+
+    # Multiple local mappings for potentially distinct municipality regimes.
+    - decoder_type: mixture
+      decoder_hidden_dims: "128,64"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+      decoder_num_experts: 3
+    - decoder_type: mixture
+      decoder_hidden_dims: "256,128"
+      decoder_activation: gelu
+      decoder_norm: layer
+      decoder_dropout: 0.1
+      decoder_num_experts: 5

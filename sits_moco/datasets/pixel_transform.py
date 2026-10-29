@@ -21,14 +21,23 @@ from .extra_scaler import (
     scale_xavier_rain_channels,
 )
 from .feature_layout import normalize_feature_layout, resolve_feature_layout
-from .feature_recipes import assemble_recipe, extras_from_chunk
+from .feature_recipes import (
+    assemble_recipe,
+    compute_indices,
+    extras_from_chunk,
+    parse_spectral_features,
+    spectral_feature_dim,
+)
 from .constants import NO_DATA_VALUE
 from .daily_climate import (
     CLIMATE_MAX_SEQ_LEN,
+    CLIMATE_TIMING_CHANNEL_NAMES,
     N_DAILY_CLIMATE,
     broadcast_climate,
+    climate_timing_features,
     climate_to_tensors,
     pad_climate_to_length,
+    parse_climate_extra_features,
     season_doy_axis,
 )
 
@@ -99,6 +108,9 @@ class PixelTransform:
         legacy_input_scaling: bool = False,
         deterministic_head: bool = False,
         climate_sequencelength: int | None = None,
+        climate_extra_features: str = "",
+        spectral_features: str = "bands",
+        climate_keep_raw: bool = True,
     ):
         self.sequencelength = int(sequencelength)
         self.feature_layout = normalize_feature_layout(feature_layout)
@@ -114,7 +126,49 @@ class PixelTransform:
             if climate_sequencelength is not None
             else CLIMATE_MAX_SEQ_LEN
         )
+        self.climate_extra_names = parse_climate_extra_features(climate_extra_features)
+        self.climate_keep_raw = bool(climate_keep_raw)
+        if self.climate_extra_names and not self._climate_sidecar:
+            raise ValueError(
+                "climate_extra_features only applies to a daily-climate layout"
+            )
+        if not self.climate_keep_raw:
+            if not self._climate_sidecar:
+                raise ValueError(
+                    "climate_keep_raw=False only applies to a daily-climate layout"
+                )
+            if not self.climate_extra_names:
+                raise ValueError(
+                    "climate_keep_raw=False requires climate_extra_features "
+                    "(extras-only climate trunk)"
+                )
+            self.climate_input_dim = len(self.climate_extra_names)
+        elif self.climate_extra_names:
+            self.climate_input_dim += len(self.climate_extra_names)
+        self._timing_col = {
+            name: i for i, name in enumerate(CLIMATE_TIMING_CHANNEL_NAMES)
+        }
         self._recipe = lay.get("recipe")
+        self._spectral_feat = parse_spectral_features(spectral_features)
+        self.spectral_features = str(self._spectral_feat["name"])
+        # Dual layouts: spectral trunk width may grow/shrink with indices.
+        # Recipe / slice layouts keep their registered dims (ignore override).
+        if self._climate_sidecar and self._recipe is None and not self._soil_only:
+            self.spectral_input_dim = spectral_feature_dim(self.spectral_features)
+            soil_extra = N_SOIL if self._soil_sidecar else 0
+            self.input_feature_dim = self.spectral_input_dim + soil_extra
+        else:
+            if self._spectral_feat["name"] != "bands" and self._recipe is None:
+                raise ValueError(
+                    "spectral_features other than 'bands' requires a DualSTNet "
+                    f"daily-climate layout (got {self.feature_layout!r})"
+                )
+            if lay.get("spectral_dim") is not None:
+                self.spectral_input_dim = int(lay["spectral_dim"])
+            else:
+                self.spectral_input_dim = int(lay["input_dim"]) - (
+                    N_SOIL if self._soil_sidecar else 0
+                )
         self.rc = bool(randomchoice)
         self.interp = bool(interp)
         self.deterministic_head = bool(deterministic_head)
@@ -218,9 +272,23 @@ class PixelTransform:
             raise ValueError(f"climate must be [T,C] or [N,T,C], got {climate.shape}")
 
         invalid = (clim_ntc == NO_DATA_VALUE) | ~np.isfinite(clim_ntc)
-        clim_z = np.where(invalid, 0.0, clim_ntc).astype(np.float32)
+        clim_raw = np.where(invalid, 0.0, clim_ntc).astype(np.float32)
         scaler = self.extra_scaler()
-        clim_z = scaler.transform_daily_climate(clim_z)
+        parts: list[np.ndarray] = []
+        if self.climate_keep_raw:
+            parts.append(scaler.transform_daily_climate(clim_raw))
+        if self.climate_extra_names:
+            extra_z = self._zscore_climate_extras(clim_ntc, scaler)
+            day_ok = ~np.all(invalid, axis=-1)
+            extra_z = np.where(day_ok[..., None], extra_z, 0.0)
+            parts.append(extra_z.astype(np.float32, copy=False))
+        if not parts:
+            raise ValueError("Climate trunk has neither raw channels nor extras")
+        clim_z = (
+            parts[0]
+            if len(parts) == 1
+            else np.concatenate(parts, axis=-1)
+        )
         valid = ~np.all(invalid, axis=-1)
         weight = valid.astype(np.float64)
         doy = np.broadcast_to(
@@ -231,6 +299,29 @@ class PixelTransform:
             clim_z, doy, weight, self.climate_sequencelength
         )
         return climate_to_tensors(x_pad, mask_bool, doy_pad, weight_pad)
+
+    def _zscore_climate_extras(
+        self, clim_ntc: np.ndarray, scaler: InputScaler
+    ) -> np.ndarray:
+        """Append-ready extras ``[N, T, K]`` z-scored from the raw sidecar."""
+        n_pixels = int(clim_ntc.shape[0])
+        base = clim_ntc[0]
+        if n_pixels == 1 or np.array_equal(clim_ntc, np.broadcast_to(base, clim_ntc.shape)):
+            feats, _ok = climate_timing_features(base)
+            stacked = np.broadcast_to(
+                feats[None, :, :], (n_pixels, feats.shape[0], feats.shape[1])
+            ).copy()
+        else:
+            stacked = np.stack(
+                [climate_timing_features(clim_ntc[i])[0] for i in range(n_pixels)],
+                axis=0,
+            )
+        cols = []
+        for name in self.climate_extra_names:
+            raw_col = stacked[..., self._timing_col[name]]
+            cols.append(scaler.zscore_daily_derived(raw_col, name))
+        extra = np.stack(cols, axis=-1).astype(np.float32, copy=False)
+        return np.nan_to_num(extra, nan=0.0, posinf=0.0, neginf=0.0)
 
     def features_from_chunk(
         self,
@@ -336,6 +427,23 @@ class PixelTransform:
             else:
                 extra = np.zeros((_n, _t, n_extra), dtype=np.float32)
             x = np.concatenate([x_spec_n, extra], axis=-1)
+        elif self._climate_sidecar:
+            # DualSTNet spectral trunk: bands and/or hand-crafted indices.
+            parts = []
+            if self._spectral_feat["spectral"] == "zscore":
+                parts.append(x_spec_n)
+            idx_names = tuple(self._spectral_feat["indices"] or ())
+            if idx_names:
+                parts.append(compute_indices(x_spec, idx_names))
+            if not parts:
+                raise ValueError(
+                    f"Empty spectral_features {self.spectral_features!r}"
+                )
+            x = (
+                parts[0]
+                if len(parts) == 1
+                else np.concatenate(parts, axis=-1).astype(np.float32)
+            )
         else:
             x = x_spec_n
 

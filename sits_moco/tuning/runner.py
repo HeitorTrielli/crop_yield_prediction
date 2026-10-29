@@ -76,13 +76,40 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "model_n_layers": ("--model-n-layers",),
     "model_d_inner": ("--model-d-inner",),
     "model_dropout": ("--model-dropout",),
+    "decoder_type": ("--decoder-type",),
+    "decoder_hidden_dims": ("--decoder-hidden-dims",),
+    "decoder_dropout": ("--decoder-dropout",),
+    "decoder_activation": ("--decoder-activation",),
+    "decoder_norm": ("--decoder-norm",),
+    "decoder_num_experts": ("--decoder-num-experts",),
     "temporal_pooling": ("--temporal-pooling",),
     "attn_pool_queries": ("--attn-pool-queries",),
     "soil_fusion": ("--soil-fusion",),
     "climate_sequencelength": ("--climate-sequencelength",),
+    "climate_pooling": ("--climate-pooling",),
+    "climate_d_model": ("--climate-d-model",),
+    "climate_n_head": ("--climate-n-head",),
+    "climate_d_inner": ("--climate-d-inner",),
+    "climate_extra_features": ("--climate-extra-features",),
+    "spectral_features": ("--spectral-features",),
+    "climate_keep_raw": ("--climate-keep-raw",),
     "aux_loss": ("--aux-loss",),
     "aux_loss_weight": ("--aux-loss-weight",),
     "aux_min_std": ("--aux-min-std",),
+    "aux_min_munis": ("--aux-min-munis",),
+    "aux_rank_temperature": ("--aux-rank-temperature",),
+    "aux_rank_min_gap": ("--aux-rank-min-gap",),
+    "recon_mode": ("--recon-mode",),
+    "recon_loss_weight": ("--recon-loss-weight",),
+    "recon_stopgrad_encoder": ("--recon-stopgrad-encoder",),
+    "aux_yield_probe": ("--aux-yield-probe",),
+    "aux_yield_probe_weight": ("--aux-yield-probe-weight",),
+    "aux_embed_loss": ("--aux-embed-loss",),
+    "aux_embed_loss_weight": ("--aux-embed-loss-weight",),
+    "aux_embed_temperature": ("--aux-embed-temperature",),
+    "aux_embed_bins": ("--aux-embed-bins",),
+    "freeze_encoder": ("--freeze-encoder",),
+    "mse_within_state_year": ("--mse-within-state-year",),
     "pretrained": ("--pretrained",),
     "pretrained_climate": ("--pretrained-climate",),
     "datapath": ("--datapath",),
@@ -117,11 +144,18 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+# BooleanOptionalAction flags whose default is True: False must emit --no-*.
+_BOOL_DEFAULT_TRUE = frozenset({"climate_keep_raw"})
+
+
 def _param_to_flags(key: str, value: Any) -> list[str]:
     if value is None:
         return []
     if key in BOOL_PARAMS:
-        return [f"--{key.replace('_', '-')}"] if value else []
+        flag = f"--{key.replace('_', '-')}"
+        if key in _BOOL_DEFAULT_TRUE:
+            return [flag] if value else [f"--no-{key.replace('_', '-')}"]
+        return [flag] if value else []
 
     flags = FLAG_ALIASES.get(key)
     if flags is None:

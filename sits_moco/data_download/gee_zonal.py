@@ -22,10 +22,13 @@ from gee_export import (
     CLOUD_SCORE_COLLECTION,
     MAPBIOMAS_ASSET,
     NO_DATA_VALUE,
+    S1_GRD_COLLECTION,
     S2_SR_COLLECTION,
     SOY_MAPBIOMAS_CODE,
     get_dates_with_s2_scenes,
 )
+
+S1_ZONAL_BANDS = ["VV", "VH", "angle"]
 
 
 def mapbiomas_soy_mask(
@@ -276,6 +279,155 @@ def chunk_zonal_feature_collection(
         )
 
     def accumulate(date_str: ee.ComputedObject, acc: ee.ComputedObject) -> ee.FeatureCollection:
+        return ee.FeatureCollection(acc).merge(map_one_date(date_str))
+
+    merged = ee.FeatureCollection(
+        date_list.iterate(accumulate, ee.FeatureCollection([]))
+    )
+    return merged.filter(ee.Filter.gt("valid_pixel_count", 0))
+
+
+def _s1_collection(
+    region: ee.Geometry,
+    start_date: str | ee.Date,
+    end_date: str | ee.Date,
+    orbit_pass: str | None = None,
+) -> ee.ImageCollection:
+    """Sentinel-1 IW GRD with dual VV/VH polarization and incidence angle."""
+    collection = (
+        ee.ImageCollection(S1_GRD_COLLECTION)
+        .filterBounds(region)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+    )
+    if orbit_pass:
+        collection = collection.filter(
+            ee.Filter.eq("orbitProperties_pass", orbit_pass.upper())
+        )
+    return collection.select(S1_ZONAL_BANDS)
+
+
+def s1_coverage_date_list(
+    region: ee.Geometry,
+    start_date: str,
+    end_date: str,
+    orbit_pass: str | None = None,
+) -> ee.List:
+    """Unique dates with a dual-polarization Sentinel-1 IW acquisition."""
+    end_exclusive = (
+        datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    return (
+        _s1_collection(region, start_date, end_exclusive, orbit_pass)
+        .map(
+            lambda img: img.set(
+                "date",
+                ee.Date(img.get("system:time_start")).format("YYYY-MM-dd"),
+            )
+        )
+        .distinct("date")
+        .aggregate_array("date")
+    )
+
+
+def daily_s1_stack(
+    region: ee.Geometry,
+    date: ee.Date,
+    season_year: int,
+    orbit_pass: str | None = None,
+) -> ee.Image:
+    """Daily median S1 GRD (dB) masked to MapBiomas soybean pixels."""
+    composite = (
+        _s1_collection(region, date, date.advance(1, "day"), orbit_pass)
+        .median()
+        .clip(region)
+        .updateMask(mapbiomas_soy_image(season_year))
+    )
+    doy = date.getRelative("day", "year")
+    doy_img = (
+        ee.Image.constant(doy)
+        .rename("doy")
+        .toFloat()
+        .updateMask(composite.select("VV").mask())
+    )
+    return composite.addBands(doy_img)
+
+
+def _format_s1_zonal_feature(
+    feat: ee.Feature,
+    date_str: ee.ComputedObject,
+    season_year: int,
+) -> ee.Feature:
+    valid = ee.Number(_ee_or_default(feat.get("VV_count"), 0))
+    soy_pixel_count = ee.Number(_ee_or_default(feat.get("soy_pixel_count"), 0))
+    valid_fraction = ee.Number(
+        ee.Algorithms.If(
+            soy_pixel_count.gt(0),
+            valid.divide(soy_pixel_count),
+            0,
+        )
+    )
+    props = ee.Dictionary(
+        {
+            "date": date_str,
+            "municipality_code": feat.get("municipality_code"),
+            "season_year": season_year,
+            "valid_pixel_count": valid,
+            "valid_fraction": valid_fraction,
+            "soy_pixel_count": soy_pixel_count,
+            "doy": _ee_or_default(feat.get("doy_mean"), NO_DATA_VALUE),
+        }
+    )
+    for band in S1_ZONAL_BANDS:
+        props = props.set(
+            band,
+            _ee_or_default(feat.get(f"{band}_mean"), NO_DATA_VALUE),
+        )
+    return ee.Feature(None, props)
+
+
+def chunk_s1_zonal_feature_collection(
+    features: ee.FeatureCollection,
+    start_date: str,
+    end_date: str,
+    season_year: int,
+    scale: int,
+    orbit_pass: str | None = None,
+) -> ee.FeatureCollection:
+    """Municipality × acquisition-date soy-masked Sentinel-1 means."""
+    region = features.geometry()
+    date_list = s1_coverage_date_list(
+        region,
+        start_date,
+        end_date,
+        orbit_pass,
+    )
+
+    def map_one_date(date_str: ee.ComputedObject) -> ee.FeatureCollection:
+        date_str = ee.String(date_str)
+        stack = daily_s1_stack(
+            region,
+            ee.Date(date_str),
+            season_year,
+            orbit_pass,
+        )
+        reduced = stack.reduceRegions(
+            collection=features,
+            reducer=_mean_count_reducer(),
+            scale=scale,
+            tileScale=4,
+            maxPixelsPerRegion=int(1e13),
+        )
+        return reduced.map(
+            lambda f: _format_s1_zonal_feature(f, date_str, season_year)
+        )
+
+    def accumulate(
+        date_str: ee.ComputedObject,
+        acc: ee.ComputedObject,
+    ) -> ee.FeatureCollection:
         return ee.FeatureCollection(acc).merge(map_one_date(date_str))
 
     merged = ee.FeatureCollection(

@@ -573,6 +573,9 @@ class USCropsAggregatedNPY(Dataset):
         min_images: int = 0,
         min_months: int = 0,
         climate_sequencelength: int | None = None,
+        climate_extra_features: str = "",
+        spectral_features: str = "bands",
+        climate_keep_raw: bool = True,
         season_reference_date: Optional[date] = None,
         train_mid_yield_keep_fraction: float | None = DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
         train_mid_yield_lo: float = DEFAULT_TRAIN_MID_YIELD_LO,
@@ -607,6 +610,10 @@ class USCropsAggregatedNPY(Dataset):
             if climate_sequencelength is not None
             else CLIMATE_MAX_SEQ_LEN
         )
+        self.climate_extra_features = str(climate_extra_features or "")
+        self.spectral_features = str(spectral_features or "bands")
+        self.climate_keep_raw = bool(climate_keep_raw)
+        self.spectral_input_dim = int(_lay.get("spectral_dim") or self.input_feature_dim)
         # Backward-compatible flag for logging / meta (any Xavier extras starting at ch 11)
         self.use_xavier = (
             self._extra_channels_slice is not None
@@ -737,6 +744,15 @@ class USCropsAggregatedNPY(Dataset):
             target_split = split_mapping.get(mode, mode)
             if self.holdout_year is not None and mode in ("valid", "eval", "test"):
                 target_split = YEAR_LOO_HOLDOUT_SPLIT
+            elif mode in ("valid", "eval", "test"):
+                # IID muni holdout CSVs label the val/test pool as "holdout"
+                # (shared by valid and test, same as year-LOO).
+                n_named = yield_df.filter(pl.col("split") == target_split).height
+                n_hold = yield_df.filter(
+                    pl.col("split") == YEAR_LOO_HOLDOUT_SPLIT
+                ).height
+                if n_named == 0 and n_hold > 0:
+                    target_split = YEAR_LOO_HOLDOUT_SPLIT
             yield_df = yield_df.filter(pl.col("split") == target_split)
             print(f"Filtered to {target_split} split: {len(yield_df)} rows")
         elif mode == "all" and "split" in yield_df.columns:
@@ -1016,7 +1032,15 @@ class USCropsAggregatedNPY(Dataset):
             seed=seed,
             legacy_input_scaling=self.legacy_input_scaling,
             climate_sequencelength=self.climate_sequencelength,
+            climate_extra_features=self.climate_extra_features,
+            spectral_features=self.spectral_features,
+            climate_keep_raw=self.climate_keep_raw,
         )
+        # PixelTransform may widen/narrow spectral or climate dims (indices / extras).
+        self.input_feature_dim = int(self.pixel_transform.input_feature_dim)
+        self.spectral_input_dim = int(self.pixel_transform.spectral_input_dim)
+        if self._climate_sidecar:
+            self.climate_input_dim = int(self.pixel_transform.climate_input_dim)
         if self.legacy_input_scaling:
             print(
                 "Input scaling: legacy hardcoded SPECTRAL_MEAN/STD + Xavier divisors "
@@ -1028,11 +1052,16 @@ class USCropsAggregatedNPY(Dataset):
                 f"(layout {self.feature_layout!r} → +4 channels from {{code}}_soil.npy)"
             )
         if self._climate_sidecar:
+            extra_names = getattr(self.pixel_transform, "climate_extra_names", ())
+            extra_note = f" extras={','.join(extra_names)}" if extra_names else ""
+            raw_note = "raw+extras" if self.climate_keep_raw else "extras-only"
+            spec_note = getattr(self.pixel_transform, "spectral_features", "bands")
             print(
                 "  Daily climate sidecars: enabled "
                 f"(layout {self.feature_layout!r} → DualSTNet climate "
-                f"T={self.climate_sequencelength}, dim={self.climate_input_dim} "
-                "from {code}_climate_daily.npy)"
+                f"T={self.climate_sequencelength}, dim={self.climate_input_dim}"
+                f" mode={raw_note}{extra_note}; spectral={spec_note}"
+                f" dim={self.spectral_input_dim} from {{code}}_climate_daily.npy)"
             )
 
         # Cache for .npy files (OrderedDict for LRU: move to end on access)

@@ -24,6 +24,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from datasets.daily_climate import climate_extra_spec_from_run_config
 from datasets import (
     DEFAULT_MAX_COVERAGE_RATIO,
     DEFAULT_MIN_COVERAGE_RATIO,
@@ -465,6 +466,7 @@ def main():
         min_coverage_ratio=args.min_coverage_ratio,
         max_coverage_ratio=args.max_coverage_ratio,
         climate_sequencelength=int(meta["climate_sequencelength"]),
+        climate_extra_features=climate_extra_spec_from_run_config(run_config),
     )
     scaler = None
     if not bool(getattr(args, "legacy_input_scaling", False)):

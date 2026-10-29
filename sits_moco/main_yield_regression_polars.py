@@ -166,6 +166,66 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--climate-pooling",
+        type=str,
+        choices=["mean", "attention"],
+        default=None,
+        help=(
+            "Pooling on the climate trunk only. Default is mean, unless "
+            "--temporal-pooling attention, which also switches the climate trunk. "
+            "The Sentinel trunk stays on --temporal-pooling."
+        ),
+    )
+    parser.add_argument(
+        "--climate-d-model",
+        type=int,
+        default=None,
+        help="Climate-trunk width. Default: same as --model-d-model.",
+    )
+    parser.add_argument(
+        "--climate-n-head",
+        type=int,
+        default=None,
+        help="Climate-trunk attention heads. Default: same as --model-n-head. Must divide --climate-d-model.",
+    )
+    parser.add_argument(
+        "--climate-d-inner",
+        type=int,
+        default=None,
+        help="Climate-trunk feed-forward width. Default: same as --model-d-inner.",
+    )
+    parser.add_argument(
+        "--climate-extra-features",
+        type=str,
+        default="",
+        help=(
+            "Comma list of columns appended to the daily climate trunk only: "
+            "dry_spell (running days with rain < 1 mm; a missing day freezes the streak), "
+            "gdd (soybean growing degree days, base 10°C, Tmax capped at 30°C, summed from Oct 1), "
+            "wb (that day's rain minus evapotranspiration), or all."
+        ),
+    )
+    parser.add_argument(
+        "--spectral-features",
+        type=str,
+        default="bands",
+        help=(
+            "DualSTNet spectral trunk recipe (datasets/feature_recipes.SPECTRAL_GROUPS): "
+            "bands (default raw S2), ndvi/core/veg/tri/water/fullidx (indices substitute "
+            "raw bands), or bands_ndvi/bands_core/bands_veg/bands_tri/bands_water/"
+            "bands_fullidx (indices alongside bands)."
+        ),
+    )
+    parser.add_argument(
+        "--climate-keep-raw",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When climate extras are set, keep the five raw Xavier channels "
+            "(default) or use --no-climate-keep-raw for an extras-only climate trunk."
+        ),
+    )
+    parser.add_argument(
         "-j",
         "--workers",
         type=int,
@@ -522,6 +582,54 @@ def parse_args():
         help="STNet dropout probability (default: 0.2)",
     )
     parser.add_argument(
+        "--decoder-type",
+        default="legacy",
+        choices=[
+            "legacy",
+            "linear",
+            "mlp",
+            "residual",
+            "linear_residual",
+            "gated",
+            "glu",
+            "dense",
+            "highway",
+            "fourier",
+            "quadratic",
+            "quadratic_mlp",
+            "maxout",
+            "modality_additive",
+            "modality_residual",
+            "modality_bilinear",
+            "modality_attention",
+            "mixture",
+            "ensemble",
+        ],
+        help="Regression head used after DualSTNet modality fusion.",
+    )
+    parser.add_argument(
+        "--decoder-hidden-dims",
+        default="256,128",
+        help="Comma-separated hidden widths for configurable decoders.",
+    )
+    parser.add_argument(
+        "--decoder-dropout",
+        type=float,
+        default=None,
+        help="Decoder-only dropout; defaults to --model-dropout.",
+    )
+    parser.add_argument(
+        "--decoder-activation",
+        choices=["relu", "gelu", "silu"],
+        default="gelu",
+    )
+    parser.add_argument(
+        "--decoder-norm",
+        choices=["layer", "batch", "none"],
+        default="layer",
+    )
+    parser.add_argument("--decoder-num-experts", type=int, default=4)
+    parser.add_argument(
         "--temporal-pooling",
         type=str,
         choices=["ndvi", "attention"],
@@ -554,11 +662,33 @@ def parse_args():
         "--aux-loss",
         type=str,
         default="none",
-        choices=("none", "variance", "rank"),
+        choices=(
+            "none",
+            "variance",
+            "rank",
+            "muni_corr",
+            "muni_rank",
+            "muni_rank_corr",
+            "muni_corr_state",
+            "muni_rank_state",
+            "muni_rank_corr_state",
+        ),
         help=(
             "Optional within-municipality auxiliary loss on top of aggregated MSE: "
             "'variance' = hinge if pixel-pred std < --aux-min-std; "
-            "'rank' = 1 - corr(pred, NDVI proxy) on each chunk. Default: none"
+            "'rank' = 1 - corr(pred, NDVI proxy) on each chunk. The muni_* choices "
+            "separate municipalities within each harvest year (or year×IBGE UF when "
+            "suffixed with _state) and require muni-mean inputs. Default: none"
+        ),
+    )
+    parser.add_argument(
+        "--mse-within-state-year",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Replace pooled municipal MSE with MSE after demeaning pred/target "
+            "within each (harvest year × IBGE UF) group. Pushes learning onto "
+            "intra-state residuals. Default: false"
         ),
     )
     parser.add_argument(
@@ -568,10 +698,114 @@ def parse_args():
         help="Weight for --aux-loss relative to municipal MSE (default: 0.1)",
     )
     parser.add_argument(
+        "--recon-mode",
+        type=str,
+        default="none",
+        choices=("none", "pooled", "sequence"),
+        help=(
+            "Parallel generative head that reconstructs inputs from the embedder "
+            "(pooled modality summaries, or per-timestep sequence). "
+            "Muni-mean DualSTNet only. Default: none"
+        ),
+    )
+    parser.add_argument(
+        "--recon-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for --recon-mode loss relative to municipal MSE (default: 0)",
+    )
+    parser.add_argument(
+        "--aux-yield-probe",
+        type=str,
+        default="none",
+        choices=("none", "linear", "mlp"),
+        help=(
+            "Parallel yield head on the fused embedding (linear or small MLP). "
+            "Forces the encoder to keep yield-separable features; DualSTNet only. "
+            "Default: none"
+        ),
+    )
+    parser.add_argument(
+        "--aux-yield-probe-weight",
+        type=float,
+        default=0.0,
+        help="Weight for --aux-yield-probe MSE relative to municipal MSE (default: 0)",
+    )
+    parser.add_argument(
+        "--aux-embed-loss",
+        type=str,
+        default="none",
+        choices=(
+            "none",
+            "muni_supcon",
+            "muni_ordinal",
+            "muni_supcon_state",
+            "muni_ordinal_state",
+        ),
+        help=(
+            "Auxiliary loss on fused embeddings within each harvest year "
+            "(or year×IBGE UF when suffixed with _state): "
+            "'muni_supcon' = supervised contrastive over yield terciles; "
+            "'muni_ordinal' = cosine similarity should track yield closeness. "
+            "DualSTNet muni-mean only. Default: none"
+        ),
+    )
+    parser.add_argument(
+        "--aux-embed-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for --aux-embed-loss relative to municipal MSE (default: 0)",
+    )
+    parser.add_argument(
+        "--aux-embed-temperature",
+        type=float,
+        default=0.2,
+        help="Temperature for muni_supcon embedding loss (default: 0.2)",
+    )
+    parser.add_argument(
+        "--aux-embed-bins",
+        type=int,
+        default=3,
+        help="Yield quantile bins for muni_supcon (default: 3 = terciles)",
+    )
+    parser.add_argument(
+        "--recon-stopgrad-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If set, reconstruction targets a detached embedding (trains recon head "
+            "only; ablation vs letting recon grads update the trunks)."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze DualSTNet spectral/climate trunks; train decoder (+ recon) only.",
+    )
+    parser.add_argument(
         "--aux-min-std",
         type=float,
         default=0.05,
         help="Minimum within-muni pixel std (t/ha) for variance aux loss (default: 0.05)",
+    )
+    parser.add_argument(
+        "--aux-min-munis",
+        type=int,
+        default=3,
+        help="Minimum municipalities from one year needed for a muni_* loss.",
+    )
+    parser.add_argument(
+        "--aux-rank-temperature",
+        type=float,
+        default=0.5,
+        help="Pairwise logistic temperature for muni_rank losses in target z-score units.",
+    )
+    parser.add_argument(
+        "--aux-rank-min-gap",
+        type=float,
+        default=0.1,
+        help="Ignore target pairs closer than this z-score gap in muni_rank losses.",
     )
     # --- Training runtime (defaults in training_runtime.py; override when debugging) ---
     parser.add_argument(
@@ -1023,11 +1257,33 @@ def model_kwargs_from_args(args) -> dict:
             kw["soil_fusion"] = "none"
         kw["use_spectral"] = feature_layout_uses_spectral(args.feature_layout)
         kw["use_climate"] = feature_layout_uses_climate(args.feature_layout)
-        kw["climate_pooling"] = "mean"
-        if kw["temporal_pooling"] == "attention":
+        explicit_pool = getattr(args, "climate_pooling", None)
+        if explicit_pool:
+            kw["climate_pooling"] = str(explicit_pool)
+        elif kw["temporal_pooling"] == "attention":
             kw["climate_pooling"] = "attention"
+        else:
+            kw["climate_pooling"] = "mean"
+        for src, dst in (
+            ("climate_d_model", "climate_d_model"),
+            ("climate_n_head", "climate_n_head"),
+            ("climate_d_inner", "climate_d_inner"),
+        ):
+            val = getattr(args, src, None)
+            if val is not None:
+                kw[dst] = int(val)
         kw["climate_max_seq_len"] = int(
             getattr(args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN)
+        )
+        kw.update(
+            decoder_type=str(getattr(args, "decoder_type", "legacy")),
+            decoder_hidden_dims=str(getattr(args, "decoder_hidden_dims", "256,128")),
+            decoder_dropout=getattr(args, "decoder_dropout", None),
+            decoder_activation=str(getattr(args, "decoder_activation", "gelu")),
+            decoder_norm=str(getattr(args, "decoder_norm", "layer")),
+            decoder_num_experts=int(getattr(args, "decoder_num_experts", 4)),
+            recon_mode=str(getattr(args, "recon_mode", "none") or "none"),
+            aux_yield_probe=str(getattr(args, "aux_yield_probe", "none") or "none"),
         )
     else:
         kw["static_input"] = feature_layout_is_static(layout)
@@ -1188,6 +1444,9 @@ def train(args):
         climate_sequencelength=getattr(
             args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN
         ),
+        climate_extra_features=str(getattr(args, "climate_extra_features", "") or ""),
+        spectral_features=str(getattr(args, "spectral_features", "bands") or "bands"),
+        climate_keep_raw=bool(getattr(args, "climate_keep_raw", True)),
         train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
@@ -1219,6 +1478,9 @@ def train(args):
         climate_sequencelength=getattr(
             args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN
         ),
+        climate_extra_features=str(getattr(args, "climate_extra_features", "") or ""),
+        spectral_features=str(getattr(args, "spectral_features", "bands") or "bands"),
+        climate_keep_raw=bool(getattr(args, "climate_keep_raw", True)),
         train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
@@ -1250,6 +1512,9 @@ def train(args):
         climate_sequencelength=getattr(
             args, "climate_sequencelength", CLIMATE_MAX_SEQ_LEN
         ),
+        climate_extra_features=str(getattr(args, "climate_extra_features", "") or ""),
+        spectral_features=str(getattr(args, "spectral_features", "bands") or "bands"),
+        climate_keep_raw=bool(getattr(args, "climate_keep_raw", True)),
         train_mid_yield_keep_fraction=args.train_mid_yield_keep_fraction,
         train_mid_yield_lo=args.train_mid_yield_lo,
         train_mid_yield_hi=args.train_mid_yield_hi,
@@ -1293,7 +1558,10 @@ def train(args):
     )
     model_kw = model_kwargs_from_args(args)
     if dual:
-        spectral_dim = feature_layout_spectral_dim(args.feature_layout)
+        spectral_dim = int(
+            getattr(traindataloader.dataset, "spectral_input_dim", 0)
+            or feature_layout_spectral_dim(args.feature_layout)
+        )
         climate_dim = int(getattr(traindataloader.dataset, "climate_input_dim", 5) or 5)
         model = DualSTNetRegression(
             spectral_dim=spectral_dim,
@@ -1317,6 +1585,17 @@ def train(args):
     )
     # Use regression-specific initialization with smaller output layer weights
     model.apply(weight_init_regression)
+
+    if bool(getattr(args, "freeze_encoder", False)):
+        frozen = 0
+        for name, param in model.named_parameters():
+            if name.startswith("spectral.") or name.startswith("climate."):
+                param.requires_grad = False
+                frozen += 1
+        print(
+            f"Freeze encoder: froze {frozen} spectral/climate tensors; "
+            f"trainable now {get_ntrainparams(model)}"
+        )
 
     # Load pretrained model weights (will load full state later if resuming)
     pretrained_checkpoint = None
@@ -2069,6 +2348,9 @@ def get_aggregated_dataloader(
     min_images: int = 0,
     min_months: int = 0,
     climate_sequencelength: int | None = None,
+    climate_extra_features: str = "",
+    spectral_features: str = "bands",
+    climate_keep_raw: bool = True,
     train_mid_yield_keep_fraction=DEFAULT_TRAIN_MID_YIELD_KEEP_FRACTION,
     train_mid_yield_lo=DEFAULT_TRAIN_MID_YIELD_LO,
     train_mid_yield_hi=DEFAULT_TRAIN_MID_YIELD_HI,
@@ -2104,6 +2386,9 @@ def get_aggregated_dataloader(
         min_images=min_images,
         min_months=min_months,
         climate_sequencelength=climate_sequencelength,
+        climate_extra_features=climate_extra_features,
+        spectral_features=spectral_features,
+        climate_keep_raw=climate_keep_raw,
         train_mid_yield_keep_fraction=train_mid_yield_keep_fraction,
         train_mid_yield_lo=train_mid_yield_lo,
         train_mid_yield_hi=train_mid_yield_hi,

@@ -36,7 +36,6 @@ from datasets.daily_climate import CLIMATE_MAX_SEQ_LEN, climate_sidecar_path
 from datasets.extra_scaler import InputScaler, scale_soil_channels, scale_soil_channels_legacy
 from datasets.feature_layout import (
     feature_layout_choices,
-    feature_layout_input_dim,
     feature_layout_needs_climate_sidecar,
     feature_layout_needs_soil_sidecar,
     normalize_feature_layout,
@@ -70,12 +69,11 @@ from run_paths import (
     resolve_checkpoint_path,
     run_dir_from_path,
 )
+from training.inference_core import build_stnet_from_checkpoint
 from utils_aggregated import (
     denormalize_head_output,
     resolve_head_output,
     resolve_inference_target,
-    resolve_model_kwargs,
-    stnet_regression_input_dim_from_state_dict,
 )
 
 
@@ -950,6 +948,7 @@ def reconstruct_spatial_predictions(
     extra_scaler: InputScaler | None = None,
     use_mask_cache: bool = True,
     climate_sequencelength: int | None = None,
+    climate_extra_features: str = "",
 ):
     """
     Reconstruct spatial layout of predictions by processing pixels in same order as preprocessing.
@@ -1108,6 +1107,7 @@ def reconstruct_spatial_predictions(
             if climate_sequencelength is not None
             else CLIMATE_MAX_SEQ_LEN
         ),
+        climate_extra_features=climate_extra_features,
     )
 
     model.eval()
@@ -1913,35 +1913,15 @@ def load_stnet_from_checkpoint(
     checkpoint = torch.load(
         checkpoint_path, map_location=device, weights_only=False
     )
-    state_dict = checkpoint["model_state"]
-    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
-    layout = normalize_feature_layout(feature_layout)
-    expected_dim = feature_layout_input_dim(layout)
-    if input_dim != expected_dim:
-        raise ValueError(
-            f"Checkpoint {checkpoint_path} has input_dim={input_dim} but "
-            f"feature_layout {layout!r} implies {expected_dim}."
-        )
-    ck_fl = checkpoint.get("feature_layout")
-    if ck_fl is not None and normalize_feature_layout(ck_fl) != layout:
-        raise ValueError(
-            f"Checkpoint feature_layout={ck_fl!r} does not match config {layout!r}."
-        )
-
     run_config = load_latest_run_config(checkpoint_path)
-    model_kw = resolve_model_kwargs(run_config, checkpoint)
-    model = STNetRegression(
-        input_dim=input_dim,
-        num_outputs=1,
-        max_seq_len=sequencelength,
-        **model_kw,
-    ).to(device)
-    if hasattr(model, "_orig_mod"):
-        model._orig_mod.load_state_dict(state_dict, strict=False)
-    else:
-        model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    return model, input_dim
+    model, meta = build_stnet_from_checkpoint(
+        checkpoint,
+        device=device,
+        sequencelength=sequencelength,
+        run_config=run_config,
+        feature_layout=normalize_feature_layout(feature_layout),
+    )
+    return model, int(meta["input_dim"])
 
 
 def map_bundle_to_arrays(
@@ -2438,38 +2418,18 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     print(f"Loading checkpoint from {args.checkpoint}...")
-    state_dict = checkpoint["model_state"]
-    input_dim = stnet_regression_input_dim_from_state_dict(state_dict)
-    print(f"STNet input_dim from checkpoint: {input_dim}")
     feature_layout = normalize_feature_layout(args.feature_layout)
-    expected_dim = feature_layout_input_dim(feature_layout)
-    if input_dim != expected_dim:
-        raise ValueError(
-            f"Checkpoint has input_dim={input_dim} but feature_layout {feature_layout!r} "
-            f"implies {expected_dim}."
-        )
-    ck_fl = checkpoint.get("feature_layout")
-    if ck_fl is not None and normalize_feature_layout(ck_fl) != feature_layout:
-        raise ValueError(
-            f"Checkpoint feature_layout={ck_fl!r} does not match config {feature_layout!r}."
-        )
-
-    # Create model
     print("Creating model...")
     device = torch.device(args.device)
-    model_kw = resolve_model_kwargs(run_config, checkpoint)
-    model = STNetRegression(
-        input_dim=input_dim,
-        num_outputs=1,
-        max_seq_len=args.sequencelength,
-        **model_kw,
-    ).to(device)
-
-    # Load model weights
-    if hasattr(model, "_orig_mod"):
-        model._orig_mod.load_state_dict(state_dict, strict=False)
-    else:
-        model.load_state_dict(state_dict, strict=False)
+    model, model_meta = build_stnet_from_checkpoint(
+        checkpoint,
+        device=device,
+        sequencelength=args.sequencelength,
+        run_config=run_config,
+        feature_layout=feature_layout,
+    )
+    input_dim = int(model_meta["input_dim"])
+    print(f"STNet input_dim from checkpoint: {input_dim}")
     print("Model loaded successfully")
 
     # Default figures output next to the checkpoint run

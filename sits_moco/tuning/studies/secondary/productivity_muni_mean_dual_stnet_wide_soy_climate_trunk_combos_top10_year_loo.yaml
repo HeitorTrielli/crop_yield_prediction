@@ -1,0 +1,1861 @@
+# Year-LOO climate-trunk mixes for the 10 best finished full DualSTNet
+# year-LOO trials across state sets (PR, PR+RS, PR+RS+SP, PR+RS+SP+GO,
+# PR+RS+SP+GO+SC, SC). Ranked by mean val R². Ablations and the climate-trunk
+# studies themselves are excluded. The five-state study is only partly
+# finished; its completed trials sit below this top 10.
+#
+# Same seven climate-trunk mixes as the PR combo study. The Sentinel trunk
+# keeps the parent width, heads, dropout, depth, learning rate, batch size,
+# and sequence length.
+#   attention  climate pooling = learned attention (4 queries); otherwise mean
+#   extras     dry_spell + soybean growing degree days + daily rain−ETo
+#   width      climate d_model and n_head differ from the Sentinel trunk
+#              (128-wide → half width and half the heads; 64-wide → 128 / 4 heads;
+#               32-wide → 64 / 4 heads)
+#
+# 10 parents × 7 mixes = 70 trials. Each trial is year-LOO 2020–2024.
+# Scaler files are per state set and do not overwrite the original LOO scalers.
+#
+# Preview / run:
+#   python run_tuning_study.py show tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_climate_trunk_combos_top10_year_loo.yaml --list-trials
+#   python run_tuning_study.py run  tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_climate_trunk_combos_top10_year_loo.yaml --skip-completed
+
+name: productivity_muni_mean_dual_stnet_wide_soy_climate_trunk_combos_top10_year_loo
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean_soy
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: dual_spectral_daily_climate_soil
+  soil_fusion: late
+  climate_sequencelength: 183
+  temporal_pooling: ndvi
+  attn_pool_queries: 4
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [40, 120]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 15
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  refit_extra_scaler: true
+  suffix_prefix: dual_stnet_wide_soy_clim_trunk_combos_top10_yloo
+
+search:
+  strategy: list
+  trials:
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_011 obj=0.46486. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_006 obj=0.46156. Spectral 128/4/128, dropout 0.4, 1 layer(s), lr 0.0005, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_021 obj=0.45950. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 40, seq 30. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 30
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 128
+      climate_n_head: 4
+      climate_d_inner: 128
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 128
+      climate_n_head: 4
+      climate_d_inner: 128
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 128
+      climate_n_head: 4
+      climate_d_inner: 128
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_008 obj=0.45531. Spectral 64/2/128, dropout 0.3, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 64
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 128
+      climate_n_head: 4
+      climate_d_inner: 128
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_020 obj=0.45397. Spectral 128/2/128, dropout 0.2, 1 layer(s), lr 0.001, batch 128, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 1
+      batchsize: 128
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_0.5_1.5_focused_v2_year_loo trial_006 obj=0.44943. Spectral 128/2/128, dropout 0.0, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.0
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_079 obj=0.44451. Spectral 32/2/128, dropout 0.2, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_015 obj=0.44388. Spectral 128/2/128, dropout 0.4, 1 layer(s), lr 0.001, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 1
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 1
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_018 obj=0.44366. Spectral 128/8/256, dropout 0.4, 2 layer(s), lr 0.001, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.001
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 4
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: attention.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: extras.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: width.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: attention+extras.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: attention+width.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: none
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: extras+width.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: mean
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+
+    # pr_rs_sp_go_0.5_1.5_top100_year_loo trial_072 obj=0.44303. Spectral 128/4/128, dropout 0.2, 2 layer(s), lr 0.0005, batch 40, seq 45. Mix: all.
+    - learning_rate: 0.0005
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+      batchsize: 40
+      sequencelength: 45
+      yield_csv: files/pam_soy_pr_rs_sp_go_mapbiomas_coverage_0.5_1.5.csv
+      climate_pooling: attention
+      climate_extra_features: "dry_spell,gdd,wb"
+      climate_d_model: 64
+      climate_n_head: 2
+      climate_d_inner: 64
+      year_loo_folds:
+        - holdout_year: 2020
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2020.json
+        - holdout_year: 2021
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2021.json
+        - holdout_year: 2022
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2022.json
+        - holdout_year: 2023
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2023.json
+        - holdout_year: 2024
+          extra_scaler: files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_0.5_1.5_climate_timing_loo2024.json
+

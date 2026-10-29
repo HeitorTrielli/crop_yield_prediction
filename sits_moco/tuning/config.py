@@ -14,8 +14,20 @@ OBJECTIVES = {
     "val_loss": {"mode": "min", "column": "valloss"},
     "val_r2": {"mode": "max", "column": "r2"},
     "val_rmse": {"mode": "min", "column": "rmse"},
+    "val_within_state_r2": {"mode": "max", "column": "within_state_r2"},
+    "val_within_state_spearman": {"mode": "max", "column": "within_state_spearman"},
     "test_r2": {"mode": "max", "column": "r2", "log": "testlog"},
     "test_loss": {"mode": "min", "column": "testloss", "log": "testlog"},
+    "test_within_state_r2": {
+        "mode": "max",
+        "column": "within_state_r2",
+        "log": "testlog",
+    },
+    "test_within_state_spearman": {
+        "mode": "max",
+        "column": "within_state_spearman",
+        "log": "testlog",
+    },
 }
 
 SEARCH_STRATEGIES = ("grid", "random", "list", "feature_sweep")
@@ -38,6 +50,10 @@ BOOL_PARAMS = frozenset(
         "auto_chunks_per_grad",
         "no_coverage_filter",
         "refit_extra_scaler",
+        "recon_stopgrad_encoder",
+        "freeze_encoder",
+        "mse_within_state_year",
+        "climate_keep_raw",
     }
 )
 
@@ -55,6 +71,9 @@ INT_PARAMS = frozenset(
         "model_n_head",
         "model_n_layers",
         "model_d_inner",
+        "decoder_num_experts",
+        "aux_min_munis",
+        "aux_embed_bins",
         "pixel_chunk_size",
         "prefetch_chunks",
         "dataloader_prefetch_factor",
@@ -70,6 +89,9 @@ INT_PARAMS = frozenset(
         "holdout_year",
         "attn_pool_queries",
         "climate_sequencelength",
+        "climate_d_model",
+        "climate_n_head",
+        "climate_d_inner",
     }
 )
 
@@ -79,8 +101,15 @@ FLOAT_PARAMS = frozenset(
         "weight_decay",
         "sample_ratio",
         "model_dropout",
+        "decoder_dropout",
         "aux_loss_weight",
         "aux_min_std",
+        "aux_rank_temperature",
+        "aux_rank_min_gap",
+        "recon_loss_weight",
+        "aux_yield_probe_weight",
+        "aux_embed_loss_weight",
+        "aux_embed_temperature",
         "auto_chunks_per_grad_vram_frac",
         "auto_chunks_per_grad_vram_target_frac",
         "min_coverage_ratio",

@@ -1,0 +1,136 @@
+# PR-only year-LOO of top-3 arches from each modality ablation
+#
+# Source: results/tuning/productivity_muni_mean_dual_stnet_wide_soy_{nosoil,noclimate,...}
+# (non year-LOO modality grids on pam_soy_pr coverage 0.8–1.2).
+# Re-run as year-LOO on PR MapBiomas coverage 0.5–1.5.
+#
+# Single-drop only (nosoil / noclimate / nosentinel) — still ≥2 feature sources.
+# 3 modalities × 3 arches = 9 trials; each runs LOO 2020–2024.
+#
+# Preview / run:
+#   python run_tuning_study.py show tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_ablation_top3_year_loo.yaml --list-trials
+#   python run_tuning_study.py run  tuning/studies/secondary/productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_ablation_top3_year_loo.yaml --skip-completed
+
+name: productivity_muni_mean_dual_stnet_wide_soy_pr_0.5_1.5_ablation_top3_year_loo
+
+objective: val_r2
+
+output_dir: ./results/tuning
+
+base:
+  datapath: ~/sits_moco_data/npy_muni_mean_soy
+  target: productivity
+  harvest_years: "2020,2021,2022,2023,2024"
+  feature_layout: dual_spectral_daily_climate_soil
+  soil_fusion: late
+  climate_sequencelength: 183
+  temporal_pooling: ndvi
+  yield_csv: files/pam_soy_pr_mapbiomas_coverage_0.5_1.5.csv
+  no_coverage_filter: true
+  logdir: ./results
+  seed: 101010
+  epochs: 1000
+  workers: 4
+  sequencelength: 45
+  batchsize: 40
+  weight_decay: 5.0e-4
+  sample_ratio: 1.0
+  rc: false
+  warmup_epochs: 0
+  schedule: [40, 120]
+  no_compile: true
+  overwrite_run: true
+  early_stop_patience: 15
+  checkpoint_every: 0
+  pixel_chunk_size: 8
+  chunks_per_grad: 1
+  prefetch_chunks: 4
+  quiet_training: true
+  refit_extra_scaler: true
+  suffix_prefix: dual_stnet_wide_soy_pr_0.5_1.5_abl_top3_yloo
+
+search:
+  strategy: list
+  year_loo: [2020, 2021, 2022, 2023, 2024]
+  extra_scaler_template: files/train_input_scaler_dual_muni_mean_soy_pr_0.5_1.5_loo{holdout_year}.json
+  trials:
+    # nosoil top1 ← trial_079 obj=0.4832 test_r2=0.2904169447272168
+    - feature_layout: dual_spectral_daily_climate
+      learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.3
+      model_n_layers: 1
+
+    # nosoil top2 ← trial_063 obj=0.472746 test_r2=0.2146749668401937
+    - feature_layout: dual_spectral_daily_climate
+      learning_rate: 1.0e-3
+      model_d_model: 64
+      model_n_head: 4
+      model_d_inner: 256
+      model_dropout: 0.4
+      model_n_layers: 1
+
+    # nosoil top3 ← trial_018 obj=0.46954 test_r2=0.3138566278336077
+    - feature_layout: dual_spectral_daily_climate
+      learning_rate: 1.0e-3
+      model_d_model: 32
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+
+    # noclimate top1 ← trial_008 obj=0.325213 test_r2=0.1614391603670543
+    - feature_layout: spectral_soil
+      learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.3
+      model_n_layers: 1
+
+    # noclimate top2 ← trial_033 obj=0.315982 test_r2=0.1389323033774177
+    - feature_layout: spectral_soil
+      learning_rate: 1.0e-3
+      model_d_model: 128
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.3
+      model_n_layers: 1
+
+    # noclimate top3 ← trial_078 obj=0.309739 test_r2=0.1268038744730534
+    - feature_layout: spectral_soil
+      learning_rate: 1.0e-3
+      model_d_model: 96
+      model_n_head: 4
+      model_d_inner: 128
+      model_dropout: 0.2
+      model_n_layers: 2
+
+    # nosentinel top1 ← trial_032 obj=0.444814 test_r2=0.2761972200912815
+    - feature_layout: dual_daily_climate_soil
+      learning_rate: 5.0e-4
+      model_d_model: 64
+      model_n_head: 8
+      model_d_inner: 256
+      model_dropout: 0.3
+      model_n_layers: 2
+
+    # nosentinel top2 ← trial_100 obj=0.437033 test_r2=0.2777386619905264
+    - feature_layout: dual_daily_climate_soil
+      learning_rate: 1.0e-3
+      model_d_model: 96
+      model_n_head: 2
+      model_d_inner: 128
+      model_dropout: 0.4
+      model_n_layers: 2
+
+    # nosentinel top3 ← trial_007 obj=0.42766 test_r2=0.2839542135786856
+    - feature_layout: dual_daily_climate_soil
+      learning_rate: 1.0e-3
+      model_d_model: 96
+      model_n_head: 4
+      model_d_inner: 64
+      model_dropout: 0.3
+      model_n_layers: 2
