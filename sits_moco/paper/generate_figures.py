@@ -12,7 +12,7 @@ from generate_arch_figure import main as build_arch_figure
 
 ROOT = Path(__file__).resolve().parents[1]
 LOO = ROOT / "loo_pixel_results/pr_only_trial_005"
-MAMBORE = ROOT / "loo_pixel_results/mambore_2024"
+MAMBORE = ROOT / "loo_pixel_results/intramunicipal_candidates"
 OUT = Path(__file__).resolve().parent / "figures"
 OUT.mkdir(parents=True, exist_ok=True)
 YEARS = [2020, 2021, 2022, 2023, 2024]

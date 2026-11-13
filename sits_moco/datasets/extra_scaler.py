@@ -24,9 +24,11 @@ import numpy as np
 
 from .constants import NO_DATA_VALUE
 from .daily_climate import (
+    CLIMATE_TIMING_CHANNEL_NAMES,
     DAILY_CLIMATE_CHANNEL_NAMES,
     N_DAILY_CLIMATE,
     climate_sidecar_path,
+    climate_timing_features,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -159,6 +161,9 @@ class InputScaler:
         daily_climate_mean: np.ndarray | None = None,
         daily_climate_std: np.ndarray | None = None,
         daily_climate_var: np.ndarray | None = None,
+        daily_derived_mean: dict[str, float] | None = None,
+        daily_derived_std: dict[str, float] | None = None,
+        daily_derived_var: dict[str, float] | None = None,
         n_frames: int | dict[str, int] = 0,
         path: Path | str | None = None,
         meta: dict[str, Any] | None = None,
@@ -202,6 +207,20 @@ class InputScaler:
         self.daily_climate_var = _var_or_sq(
             daily_climate_var, self.daily_climate_std, N_DAILY_CLIMATE
         )
+
+        dd_mean = dict(daily_derived_mean or {})
+        dd_std = dict(daily_derived_std or {})
+        dd_var = dict(daily_derived_var or {})
+        self.daily_derived_mean: dict[str, float] = {}
+        self.daily_derived_std: dict[str, float] = {}
+        self.daily_derived_var: dict[str, float] = {}
+        for name, mu in dd_mean.items():
+            sd = float(dd_std.get(name, 1.0))
+            if sd < STD_FLOOR:
+                sd = 1.0
+            self.daily_derived_mean[str(name)] = float(mu)
+            self.daily_derived_std[str(name)] = sd
+            self.daily_derived_var[str(name)] = float(dd_var.get(name, sd * sd))
 
         d_mean = dict(derived_mean or {})
         d_std = dict(derived_std or {})
@@ -289,6 +308,19 @@ class InputScaler:
             np.float32
         )
 
+    def zscore_daily_derived(self, x: np.ndarray, name: str) -> np.ndarray:
+        """Z-score one climate-trunk extra column. No clip."""
+        if name not in self.daily_derived_mean:
+            raise KeyError(
+                f"Scaler has no daily climate extra {name!r}. "
+                "Refit with --refit-extra-scaler on a daily-climate train split "
+                "(the JSON needs a daily_climate_derived block)."
+            )
+        out = np.asarray(x, dtype=np.float32)
+        return (
+            (out - self.daily_derived_mean[name]) / self.daily_derived_std[name]
+        ).astype(np.float32)
+
     def to_dict(self) -> dict[str, Any]:
         n_frames = self.n_frames
         if isinstance(n_frames, dict):
@@ -350,6 +382,20 @@ class InputScaler:
                 "daily_climate": "raw_daily_xavier_pr_eto_rs_tmax_tmin",
             },
         }
+        if self.daily_derived_mean:
+            payload["daily_climate_derived"] = {
+                name: {
+                    "mean": self.daily_derived_mean[name],
+                    "std": self.daily_derived_std[name],
+                    "var": self.daily_derived_var[name],
+                }
+                for name in self.daily_derived_mean
+            }
+            payload["units"]["daily_climate_derived"] = (
+                "dry_spell_days=consecutive pr<1mm (nodata freezes the streak); "
+                "gdd_cum_c=soybean degree-days base 10C, Tmax capped at 30C, "
+                "cumulative from Oct 1; wb_daily_mm=daily pr-ETo"
+            )
         # Prefer per-channel counts stored in meta when present.
         meta = dict(self.meta)
         for key, block in (
@@ -393,6 +439,7 @@ class InputScaler:
         derived = payload.get("derived") or {}
         soil = payload.get("soil") or {}
         daily_climate = payload.get("daily_climate") or {}
+        daily_derived = payload.get("daily_climate_derived") or {}
         reserved = {
             "version",
             "aggregation",
@@ -403,6 +450,7 @@ class InputScaler:
             "extras_delta",
             "soil",
             "daily_climate",
+            "daily_climate_derived",
             "derived",
             "units",
             "channels",
@@ -414,6 +462,21 @@ class InputScaler:
         d_mean = {k: float(derived[k]["mean"]) for k in derived if "mean" in derived[k]}
         d_std = {k: float(derived[k]["std"]) for k in derived if "std" in derived[k]}
         d_var = {k: float(derived[k]["var"]) for k in derived if "var" in derived[k]}
+        dd_mean = {
+            k: float(daily_derived[k]["mean"])
+            for k in daily_derived
+            if isinstance(daily_derived[k], dict) and "mean" in daily_derived[k]
+        }
+        dd_std = {
+            k: float(daily_derived[k]["std"])
+            for k in daily_derived
+            if isinstance(daily_derived[k], dict) and "std" in daily_derived[k]
+        }
+        dd_var = {
+            k: float(daily_derived[k]["var"])
+            for k in daily_derived
+            if isinstance(daily_derived[k], dict) and "var" in daily_derived[k]
+        }
         src = Path(path).expanduser().resolve() if path is not None else None
         return cls(
             spectral_mean=spec["mean"],
@@ -431,6 +494,9 @@ class InputScaler:
             daily_climate_mean=daily_climate.get("mean"),
             daily_climate_std=daily_climate.get("std"),
             daily_climate_var=daily_climate.get("var"),
+            daily_derived_mean=dd_mean,
+            daily_derived_std=dd_std,
+            daily_derived_var=dd_var,
             derived_mean=d_mean,
             derived_std=d_std,
             derived_var=d_var,
@@ -493,6 +559,14 @@ class InputScaler:
             self.daily_climate_var,
         ):
             lines.append(f"    {name:18s}  mean={mu:12.4f}  std={sd:12.4f}  var={va:12.4f}")
+        if self.daily_derived_mean:
+            lines.append("  daily_climate_derived (climate trunk extras)")
+            for name in self.daily_derived_mean:
+                lines.append(
+                    f"    {name:18s}  mean={self.daily_derived_mean[name]:12.4f}  "
+                    f"std={self.daily_derived_std[name]:12.4f}  "
+                    f"var={self.daily_derived_var[name]:12.4f}"
+                )
         lines.append("  extras_delta")
         for name, mu, sd, va in zip(
             EXTRA_CHANNEL_NAMES,
@@ -577,6 +651,7 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
     delta_frames: list[np.ndarray] = []
     soil_rows: list[np.ndarray] = []
     daily_climate_frames: list[np.ndarray] = []
+    daily_derived_frames: list[np.ndarray] = []
     n_series = 0
     n_missing = 0
     for key in iterator:
@@ -652,6 +727,12 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
                         )
                 if clim.ndim == 2 and clim.shape[1] >= N_DAILY_CLIMATE:
                     clim = clim[:, :N_DAILY_CLIMATE]
+                    # Per municipality, before concatenating days. A streak or
+                    # degree-day sum must not cross from one town into the next.
+                    feats, feat_ok = climate_timing_features(clim)
+                    feats = np.where(feat_ok, feats, np.nan).astype(np.float32, copy=False)
+                    if np.isfinite(feats).any():
+                        daily_derived_frames.append(feats)
                     invalid = (clim == NO_DATA_VALUE) | ~np.isfinite(clim)
                     clim = np.where(invalid, np.nan, clim)
                     if np.isfinite(clim).any():
@@ -717,6 +798,20 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         dc_var = np.ones(N_DAILY_CLIMATE)
         dc_n = np.zeros(N_DAILY_CLIMATE, dtype=np.int64)
 
+    daily_derived_mean = daily_derived_std = daily_derived_var = None
+    if daily_derived_frames:
+        der_mat = np.concatenate(daily_derived_frames, axis=0)
+        dd_mu, dd_sd, dd_va, _dd_n = _moments(der_mat)
+        daily_derived_mean = {
+            name: float(dd_mu[i]) for i, name in enumerate(CLIMATE_TIMING_CHANNEL_NAMES)
+        }
+        daily_derived_std = {
+            name: float(dd_sd[i]) for i, name in enumerate(CLIMATE_TIMING_CHANNEL_NAMES)
+        }
+        daily_derived_var = {
+            name: float(dd_va[i]) for i, name in enumerate(CLIMATE_TIMING_CHANNEL_NAMES)
+        }
+
     harvest_years: list[int] = []
     if keys and isinstance(keys[0], tuple):
         harvest_years = sorted({int(y) for _, y in keys})
@@ -756,6 +851,9 @@ def fit_extra_scaler_from_dataset(dataset, *, progress: bool = True) -> InputSca
         daily_climate_mean=dc_mean,
         daily_climate_std=dc_std,
         daily_climate_var=dc_var,
+        daily_derived_mean=daily_derived_mean,
+        daily_derived_std=daily_derived_std,
+        daily_derived_var=daily_derived_var,
         derived_mean=derived_mean,
         derived_std=derived_std,
         derived_var=derived_var,

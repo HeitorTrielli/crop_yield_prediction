@@ -6,3 +6,7 @@ __pycache__/
 files/
 sits_moco_data/
 *.zip
+
+*/loo_pixel_results/
+
+*/scripts

@@ -11,6 +11,23 @@ import pandas as pd
 from run_paths import trainlog_path
 
 
+def _scalar_float(value: Any) -> float | None:
+    """Coerce a cell to float; tolerate Series from duplicate-index rows."""
+    if isinstance(value, pd.Series):
+        value = value.iloc[-1]
+    if isinstance(value, pd.DataFrame):
+        value = value.iloc[-1, 0]
+    try:
+        if pd.isna(value):
+            return None
+    except (ValueError, TypeError):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _read_log_csv(path: Path) -> pd.DataFrame | None:
     if not path.is_file():
         return None
@@ -21,8 +38,29 @@ def _read_log_csv(path: Path) -> pd.DataFrame | None:
     if df.empty:
         return None
     if "epoch" in df.columns:
+        # Resume can append a second epoch sequence; keep the latest row per epoch
+        # so the index stays unique for .loc lookups.
+        df = df.drop_duplicates(subset=["epoch"], keep="last")
         df = df.set_index("epoch")
     return df
+
+
+def _best_row(df: pd.DataFrame, column: str, mode: str) -> tuple[Any, pd.Series, float] | None:
+    """Pick best row by column; safe with duplicate index labels."""
+    numeric = pd.to_numeric(df[column], errors="coerce")
+    if isinstance(numeric, pd.DataFrame):
+        numeric = numeric.iloc[:, 0]
+    valid = numeric.notna()
+    if not bool(valid.any()):
+        return None
+    series = numeric[valid]
+    pos = int(series.to_numpy().argmin() if mode == "min" else series.to_numpy().argmax())
+    idx = series.index[pos]
+    row = df.loc[idx]
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[-1]
+    value = float(series.iloc[pos])
+    return idx, row, value
 
 
 def _trainlog_epoch_stats(run_dir: Path) -> dict[str, Any]:
@@ -32,18 +70,16 @@ def _trainlog_epoch_stats(run_dir: Path) -> dict[str, Any]:
         return {}
     epochs = pd.Series(pd.to_numeric(df.index, errors="coerce"), index=df.index)
     mask = epochs.notna()
-    if not mask.any():
+    if not bool(mask.any()):
         return {}
     out: dict[str, Any] = {"n_epochs": int(epochs[mask].max())}
     col = "valloss" if "valloss" in df.columns else ("r2" if "r2" in df.columns else None)
     if col is None:
         return out
-    values = pd.to_numeric(df[col], errors="coerce")
-    ok = mask & values.notna()
-    if not ok.any():
+    picked = _best_row(df, col, "min" if col == "valloss" else "max")
+    if picked is None:
         return out
-    subset = values[ok]
-    raw_idx = subset.idxmin() if col == "valloss" else subset.idxmax()
+    raw_idx, _row, _value = picked
     try:
         out["best_epoch"] = str(int(pd.to_numeric(raw_idx)))
     except (TypeError, ValueError):
@@ -108,9 +144,8 @@ def best_epoch_metrics(
             "objective_column": column,
         }
 
-    numeric = pd.to_numeric(df[column], errors="coerce")
-    valid = numeric.notna()
-    if not valid.any():
+    picked = _best_row(df, column, mode)
+    if picked is None:
         return {
             "status": "no_valid_metric",
             "run_dir": str(run_dir.resolve()),
@@ -118,10 +153,8 @@ def best_epoch_metrics(
             "objective": objective,
         }
 
-    series = numeric[valid]
-    idx = series.idxmin() if mode == "min" else series.idxmax()
-    row = df.loc[idx]
-    metrics = {str(k): float(v) if pd.notna(v) else None for k, v in row.items()}
+    idx, row, objective_value = picked
+    metrics = {str(k): _scalar_float(v) for k, v in row.items()}
 
     result: dict[str, Any] = {
         "status": "ok",
@@ -131,7 +164,7 @@ def best_epoch_metrics(
         "objective_column": column,
         "objective_mode": mode,
         "best_epoch": str(idx),
-        "objective_value": float(series.loc[idx]),
+        "objective_value": objective_value,
         "metrics": metrics,
     }
     train_stats = _trainlog_epoch_stats(run_dir)
@@ -147,7 +180,7 @@ def best_epoch_metrics(
     if test_df is not None:
         test_row = test_df.iloc[0]
         result["test_metrics"] = {
-            str(k): float(v) if pd.notna(v) else None for k, v in test_row.items()
+            str(k): _scalar_float(v) for k, v in test_row.items()
         }
 
     config_path = run_dir / "training" / "config.json"
@@ -169,8 +202,29 @@ def best_epoch_metrics(
     return result
 
 
-_VAL_METRIC_KEYS = ("rmse", "mae", "r2", "mape", "trainloss", "valloss")
-_TEST_METRIC_KEYS = ("rmse", "mae", "r2", "mape", "testloss")
+_VAL_METRIC_KEYS = (
+    "rmse",
+    "mae",
+    "r2",
+    "mape",
+    "trainloss",
+    "valloss",
+    "within_state_r2",
+    "within_state_spearman",
+    "within_state_n_cells",
+    "within_state_n",
+)
+_TEST_METRIC_KEYS = (
+    "rmse",
+    "mae",
+    "r2",
+    "mape",
+    "testloss",
+    "within_state_r2",
+    "within_state_spearman",
+    "within_state_n_cells",
+    "within_state_n",
+)
 
 
 def _mean_numeric(values: list[Any]) -> float | None:
@@ -310,12 +364,33 @@ def trial_row(
         row[key] = value
 
     metrics = outcome.get("metrics") or {}
-    for mk in ("rmse", "mae", "r2", "mape", "trainloss", "valloss"):
+    for mk in (
+        "rmse",
+        "mae",
+        "r2",
+        "mape",
+        "trainloss",
+        "valloss",
+        "within_state_r2",
+        "within_state_spearman",
+        "within_state_n_cells",
+        "within_state_n",
+    ):
         if mk in metrics:
             row[f"val_{mk}"] = metrics[mk]
 
     test_metrics = outcome.get("test_metrics") or {}
-    for mk in ("rmse", "mae", "r2", "mape", "testloss"):
+    for mk in (
+        "rmse",
+        "mae",
+        "r2",
+        "mape",
+        "testloss",
+        "within_state_r2",
+        "within_state_spearman",
+        "within_state_n_cells",
+        "within_state_n",
+    ):
         if mk in test_metrics:
             row[f"test_{mk}"] = test_metrics[mk]
 

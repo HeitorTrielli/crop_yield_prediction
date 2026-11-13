@@ -87,8 +87,42 @@ SPECTRAL_GROUPS: dict[str, dict[str, Any]] = {
     "tri": {"spectral": "none", "indices": INDEX_GROUPS["tri"]},
     "bands_ndvi": {"spectral": "zscore", "indices": INDEX_GROUPS["ndvi"]},
     "bands_core": {"spectral": "zscore", "indices": INDEX_GROUPS["core"]},
+    "bands_veg": {"spectral": "zscore", "indices": INDEX_GROUPS["veg"]},
+    "bands_tri": {"spectral": "zscore", "indices": INDEX_GROUPS["tri"]},
+    "bands_water": {"spectral": "zscore", "indices": INDEX_GROUPS["water"]},
     "bands_fullidx": {"spectral": "zscore", "indices": INDEX_GROUPS["fullidx"]},
 }
+
+
+def parse_spectral_features(spec: str | None) -> dict[str, Any]:
+    """Resolve a dual-STNet spectral feature group name.
+
+    Empty / ``bands`` / ``none`` → z-scored Sentinel-2 bands only.
+    Keys match ``SPECTRAL_GROUPS`` (indices-only or bands+indices).
+    """
+    text = "bands" if spec is None else str(spec).strip().lower().replace("-", "_")
+    if not text or text in {"none", "off", "default", "raw"}:
+        text = "bands"
+    if text not in SPECTRAL_GROUPS:
+        known = ", ".join(sorted(SPECTRAL_GROUPS))
+        raise ValueError(
+            f"Unknown spectral_features {spec!r}. Expected one of: {known}"
+        )
+    group = SPECTRAL_GROUPS[text]
+    return {
+        "name": text,
+        "spectral": str(group["spectral"]),
+        "indices": tuple(group["indices"]),
+    }
+
+
+def spectral_feature_dim(spec: str | None) -> int:
+    parsed = parse_spectral_features(spec)
+    n = 10 if parsed["spectral"] == "zscore" else 0
+    n += len(parsed["indices"])
+    if n <= 0:
+        raise ValueError(f"spectral_features {spec!r} produces an empty spectral trunk")
+    return n
 
 CLIMATE_WIDTH: dict[str, int] = {
     "none": 0,

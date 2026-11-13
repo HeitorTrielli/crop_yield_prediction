@@ -72,24 +72,34 @@ class STNetEncoder(nn.Module):
             self.attn_pool = None
             self.out_dim = d_model
 
-    def forward(self, x, mask, doy, weight) -> torch.Tensor:
+    def encode_tokens(self, x, mask, doy, weight) -> torch.Tensor:
+        """Return pre-pool transformer tokens ``[B, T, d_model]``."""
         x = x.permute((0, 2, 1))
         x = self.mlp1(x)
         x = x.permute((0, 2, 1))
 
         x = self.inlayernorm(x)
         x = self.dropout(x + self.position_enc(doy))
-        x = self.transformerencoder(x, src_key_padding_mask=mask)
+        return self.transformerencoder(x, src_key_padding_mask=mask)
 
+    def pool_tokens(self, tokens, mask, weight) -> torch.Tensor:
+        """Pool transformer tokens to ``[B, out_dim]``."""
         if self.temporal_pooling == "attention":
-            return self.attn_pool(x, mask, weight)
+            return self.attn_pool(tokens, mask, weight)
 
         if self.temporal_pooling == "mean":
-            valid = (~mask).to(dtype=x.dtype)
+            valid = (~mask).to(dtype=tokens.dtype)
             valid = valid / torch.clamp(valid.sum(1, keepdim=True), min=1e-8)
-            return torch.bmm(valid.unsqueeze(1), x).squeeze(1)
+            return torch.bmm(valid.unsqueeze(1), tokens).squeeze(1)
 
         weight = self.dropout(weight)
         weight_sum = torch.clamp(weight.sum(1).unsqueeze(1), min=1e-8)
         weight = weight / weight_sum
-        return torch.bmm(weight.unsqueeze(1), x).squeeze(1)
+        return torch.bmm(weight.unsqueeze(1), tokens).squeeze(1)
+
+    def forward(self, x, mask, doy, weight, *, return_sequence: bool = False):
+        tokens = self.encode_tokens(x, mask, doy, weight)
+        pooled = self.pool_tokens(tokens, mask, weight)
+        if return_sequence:
+            return pooled, tokens
+        return pooled

@@ -192,6 +192,12 @@ def _trial_is_valid(sample: dict, search: dict) -> bool:
         n_head = int(n_head)
         if d_model % n_head != 0:
             return False
+    base = search.get("base") or {}
+    c_d = sample.get("climate_d_model", base.get("climate_d_model", d_model))
+    c_h = sample.get("climate_n_head", base.get("climate_n_head", n_head))
+    if c_d is not None and c_h is not None:
+        if int(c_d) % int(c_h) != 0:
+            return False
     return True
 
 

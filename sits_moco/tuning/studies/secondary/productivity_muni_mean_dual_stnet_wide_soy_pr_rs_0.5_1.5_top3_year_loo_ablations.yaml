@@ -99,6 +99,7 @@ search:
       model_n_layers: 1
     # trial_063 → nosentinel_noclimate (remove sentinel+climate) · layout=soil
     - feature_layout: soil
+      soil_fusion: early
       learning_rate: 1.0e-3
       model_d_model: 128
       model_n_head: 2
@@ -147,6 +148,7 @@ search:
       model_n_layers: 2
     # trial_060 → nosentinel_noclimate (remove sentinel+climate) · layout=soil
     - feature_layout: soil
+      soil_fusion: early
       learning_rate: 1.0e-3
       model_d_model: 128
       model_n_head: 4
@@ -195,6 +197,7 @@ search:
       model_n_layers: 1
     # trial_047 → nosentinel_noclimate (remove sentinel+climate) · layout=soil
     - feature_layout: soil
+      soil_fusion: early
       learning_rate: 5.0e-4
       model_d_model: 128
       model_n_head: 2

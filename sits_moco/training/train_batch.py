@@ -160,6 +160,14 @@ def process_train_batch(
             head_output=head_output,
         )
 
+    aux_loss_type = str(getattr(args, "aux_loss", "none") or "none").lower()
+    if aux_loss_type in {"muni_corr", "muni_rank", "muni_rank_corr"}:
+        raise ValueError(
+            f"--aux-loss {aux_loss_type} requires municipal-aggregate inputs "
+            "(at most one row per municipality); pixel-chunk training cannot retain "
+            "cross-municipality prediction graphs safely."
+        )
+
     targets = targets.to(device).float()
     total_loss = 0.0
     batch_has_gradients = False
@@ -168,7 +176,6 @@ def process_train_batch(
     use_pipeline_h2d = pipeline_h2d(args, device)
     log_fmt = _fmt_agg(aggregation)
     pixel_pool = pixel_pool_for_head(aggregation, head_output)
-    aux_loss_type = str(getattr(args, "aux_loss", "none") or "none").lower()
     aux_loss_weight = float(getattr(args, "aux_loss_weight", 0.0) or 0.0)
     aux_min_std = _aux_min_std_in_head_units(
         float(getattr(args, "aux_min_std", 0.05) or 0.05),

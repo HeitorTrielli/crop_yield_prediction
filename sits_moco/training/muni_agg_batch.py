@@ -419,6 +419,12 @@ def process_train_muni_agg_batch(
     """One forward/backward over the whole municipality batch."""
     from torch.amp import autocast
 
+    from training.aux_losses import (
+        within_group_mse_loss,
+        within_year_municipality_loss,
+        within_year_ordinal_embed_loss,
+        within_year_supcon_loss,
+    )
     from training.pipeline import scan_skip_municipalities
     from training_runtime import mark_cudagraph_step, zero_grad
     from utils_aggregated import HEAD_OUTPUT_ZSCORE
@@ -451,8 +457,24 @@ def process_train_muni_agg_batch(
     _log_fastpath_once(len(kept))
     x = muni_agg_on_device(stacked, device, args)
     mark_cudagraph_step()
+    recon_mode = str(getattr(args, "recon_mode", "none") or "none").lower()
+    recon_weight = float(getattr(args, "recon_loss_weight", 0.0) or 0.0)
+    aux_probe = str(getattr(args, "aux_yield_probe", "none") or "none").lower()
+    aux_probe_weight = float(getattr(args, "aux_yield_probe_weight", 0.0) or 0.0)
+    aux_embed = str(getattr(args, "aux_embed_loss", "none") or "none").lower()
+    aux_embed_weight = float(getattr(args, "aux_embed_loss_weight", 0.0) or 0.0)
+    need_encode = hasattr(model, "encode") and (
+        (recon_mode != "none" and recon_weight > 0)
+        or (aux_probe != "none" and aux_probe_weight > 0)
+        or (aux_embed != "none" and aux_embed_weight > 0)
+    )
     with autocast("cuda", dtype=torch.bfloat16):
-        preds = model(x)
+        if need_encode:
+            enc = model.encode(x, need_sequence=recon_mode == "sequence")
+            preds = model.decoder(enc["fused"])
+        else:
+            enc = None
+            preds = model(x)
     if run_stats is not None:
         run_stats["forward_calls"] = run_stats.get("forward_calls", 0) + 1
         run_stats["chunks_processed"] = run_stats.get("chunks_processed", 0) + 1
@@ -474,9 +496,108 @@ def process_train_muni_agg_batch(
         std = _stats_on(target_std, pred_n)
         pred_n = (pred_n - mean) / std
 
+    kept_years = [years[i] for i in kept] if years is not None else None
+    kept_codes = [municipalities[i] for i in kept]
     # Match per-municipality MSE + sequential backward: sum of per-row means.
-    per_muni = torch.mean((pred_n - tgt_n) ** 2, dim=1)
-    loss_sum = per_muni.sum()
+    # Optional within-(year×state) demean MSE pushes learning onto intra-UF residuals.
+    if bool(getattr(args, "mse_within_state_year", False)):
+        within = within_group_mse_loss(
+            pred_n,
+            tgt_n,
+            kept_years,
+            municipality_codes=kept_codes,
+            by_state=True,
+            min_count=2,
+        )
+        loss_sum = within * float(len(kept))
+    else:
+        per_muni = torch.mean((pred_n - tgt_n) ** 2, dim=1)
+        loss_sum = per_muni.sum()
+    _STATE_MUNI_AUX = {
+        "muni_corr",
+        "muni_rank",
+        "muni_rank_corr",
+        "muni_corr_state",
+        "muni_rank_state",
+        "muni_rank_corr_state",
+    }
+    aux_loss_type = str(getattr(args, "aux_loss", "none") or "none").lower()
+    if aux_loss_type in _STATE_MUNI_AUX:
+        aux_loss = within_year_municipality_loss(
+            pred_n,
+            tgt_n,
+            kept_years,
+            mode=aux_loss_type,
+            min_count=int(getattr(args, "aux_min_munis", 3) or 3),
+            rank_temperature=float(
+                getattr(args, "aux_rank_temperature", 0.5) or 0.5
+            ),
+            min_target_gap=float(getattr(args, "aux_rank_min_gap", 0.1) or 0.1),
+            municipality_codes=kept_codes,
+        )
+        # MSE is a sum over municipalities; scale the O(1) auxiliary loss to
+        # preserve an interpretable per-municipality relative weight.
+        weight = float(getattr(args, "aux_loss_weight", 0.0) or 0.0)
+        loss_sum = loss_sum + weight * len(kept) * aux_loss
+
+    if (
+        recon_mode != "none"
+        and recon_weight > 0
+        and enc is not None
+        and hasattr(model, "reconstruction_loss_from_encode")
+    ):
+        stopgrad = bool(getattr(args, "recon_stopgrad_encoder", False))
+        recon_loss = model.reconstruction_loss_from_encode(
+            enc, stopgrad_encoder=stopgrad
+        ).to(dtype=loss_sum.dtype)
+        loss_sum = loss_sum + recon_weight * len(kept) * recon_loss
+
+    if (
+        aux_probe != "none"
+        and aux_probe_weight > 0
+        and enc is not None
+        and hasattr(model, "aux_yield_probe_loss_from_encode")
+    ):
+        probe_loss = model.aux_yield_probe_loss_from_encode(enc, tgt_n).to(
+            dtype=loss_sum.dtype
+        )
+        # Same scaling convention as recon / muni_* aux: O(1) loss × N munis.
+        loss_sum = loss_sum + aux_probe_weight * len(kept) * probe_loss
+
+    if aux_embed != "none" and aux_embed_weight > 0 and enc is not None:
+        fused = enc["fused"].to(torch.float32)
+        embed_by_state = aux_embed.endswith("_state")
+        embed_kind = aux_embed[: -len("_state")] if embed_by_state else aux_embed
+        if embed_kind == "muni_supcon":
+            embed_loss = within_year_supcon_loss(
+                fused,
+                tgt_n,
+                kept_years,
+                temperature=float(
+                    getattr(args, "aux_embed_temperature", 0.2) or 0.2
+                ),
+                n_bins=int(getattr(args, "aux_embed_bins", 3) or 3),
+                min_count=int(getattr(args, "aux_min_munis", 3) or 3),
+                municipality_codes=kept_codes,
+                by_state=embed_by_state,
+            )
+        elif embed_kind == "muni_ordinal":
+            embed_loss = within_year_ordinal_embed_loss(
+                fused,
+                tgt_n,
+                kept_years,
+                min_count=int(getattr(args, "aux_min_munis", 3) or 3),
+                min_target_gap=float(
+                    getattr(args, "aux_rank_min_gap", 0.1) or 0.1
+                ),
+                municipality_codes=kept_codes,
+                by_state=embed_by_state,
+            )
+        else:
+            raise ValueError(f"Unknown aux_embed_loss {aux_embed!r}")
+        loss_sum = loss_sum + aux_embed_weight * len(kept) * embed_loss.to(
+            dtype=loss_sum.dtype
+        )
     scaler.scale(loss_sum).backward()
     if run_stats is not None:
         run_stats["backward_calls"] = run_stats.get("backward_calls", 0) + 1

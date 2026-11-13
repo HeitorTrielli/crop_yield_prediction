@@ -91,7 +91,14 @@ def build_stnet_from_checkpoint(
         use_climate = clim_w is not None
         if feature_layout is not None:
             spectral_dim = feature_layout_spectral_dim(feature_layout)
-            climate_dim = feature_layout_climate_input_dim(feature_layout) or climate_dim
+            layout_climate = feature_layout_climate_input_dim(feature_layout)
+            # Layout width is the raw sidecar (5). Extras and a refit scaler
+            # make the checkpoint first layer wider; that shape is the one
+            # the data transform must match.
+            if clim_w is not None:
+                climate_dim = int(clim_w.shape[1])
+            else:
+                climate_dim = layout_climate or climate_dim
             use_spectral = feature_layout_uses_spectral(feature_layout)
             use_climate = feature_layout_uses_climate(feature_layout)
         dual_kw = {
@@ -109,8 +116,19 @@ def build_stnet_from_checkpoint(
                 "soil_fusion",
                 "climate_pooling",
                 "climate_max_seq_len",
+                "climate_d_model",
+                "climate_n_head",
+                "climate_d_inner",
                 "use_spectral",
                 "use_climate",
+                "decoder_type",
+                "decoder_hidden_dims",
+                "decoder_dropout",
+                "decoder_activation",
+                "decoder_norm",
+                "decoder_num_experts",
+                "recon_mode",
+                "aux_yield_probe",
             }
         }
         dual_kw.pop("climate_max_seq_len", None)
@@ -130,7 +148,13 @@ def build_stnet_from_checkpoint(
             k: v
             for k, v in model_kw.items()
             if k
-            not in {"climate_pooling", "climate_max_seq_len"}
+            not in {
+                "climate_pooling",
+                "climate_max_seq_len",
+                "climate_d_model",
+                "climate_n_head",
+                "climate_d_inner",
+            }
         }
         model = STNetRegression(
             input_dim=input_dim,

@@ -51,6 +51,7 @@ from datasets import (
     USCropsAggregatedNPY,
     filter_yield_pandas_by_coverage,
 )
+from datasets.daily_climate import climate_extra_spec_from_run_config
 from datasets.feature_layout import normalize_feature_layout
 from evaluate_incomplete_series import (
     batched_predict_all_periods,
@@ -358,6 +359,7 @@ def _build_dataset(
         max_coverage_ratio=max_coverage_ratio,
         legacy_input_scaling=ctx.legacy_input_scaling,
         climate_sequencelength=ctx.climate_sequencelength,
+        climate_extra_features=climate_extra_spec_from_run_config(ctx.run_config),
     )
     _apply_run_extra_scaler(ctx, dataset)
     return dataset
@@ -712,6 +714,7 @@ def run_guarapuava_heatmaps(
             feature_layout=ctx.feature_layout,
             extra_scaler=extra_scaler,
             climate_sequencelength=ctx.climate_sequencelength,
+            climate_extra_features=climate_extra_spec_from_run_config(ctx.run_config),
         )
         if bundle[0] is None:
             print(f"  Skipped {label}: inference failed")

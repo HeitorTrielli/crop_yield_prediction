@@ -29,6 +29,32 @@ DAILY_CLIMATE_CHANNEL_NAMES: tuple[str, ...] = (
     "tmax_c",
     "tmin_c",
 )
+# Extra columns derived from the raw daily sidecar. They are appended only
+# to the climate trunk (after the five Xavier channels), never to Sentinel.
+CLIMATE_TIMING_CHANNEL_NAMES: tuple[str, ...] = (
+    "dry_spell_days",
+    "gdd_cum_c",
+    "wb_daily_mm",
+)
+DRY_SPELL_MM = 1.0
+SOY_GDD_TBASE_C = 10.0
+SOY_GDD_TMAX_CAP_C = 30.0
+_CLIMATE_EXTRA_ALIASES: dict[str, str] = {
+    "dry_spell": "dry_spell_days",
+    "dry_spell_days": "dry_spell_days",
+    "dryspell": "dry_spell_days",
+    "gdd": "gdd_cum_c",
+    "gdd_cum": "gdd_cum_c",
+    "gdd_cum_c": "gdd_cum_c",
+    "graus_dia": "gdd_cum_c",
+    "growing_degree_days": "gdd_cum_c",
+    "wb": "wb_daily_mm",
+    "wb_daily": "wb_daily_mm",
+    "wb_daily_mm": "wb_daily_mm",
+    "water_balance": "wb_daily_mm",
+    "rain_eto": "wb_daily_mm",
+    "pr_eto": "wb_daily_mm",
+}
 CLIMATE_SIDECAR_SUFFIX = "_climate_daily.npy"
 
 _YEAR_RANGE_RE = re.compile(r"^(\d{4})-(\d{4})$")
@@ -103,6 +129,113 @@ def broadcast_climate(climate_tc: np.ndarray, n_pixels: int) -> np.ndarray:
     if clim.ndim != 2:
         raise ValueError(f"Expected [T, C] climate, got {clim.shape}")
     return np.broadcast_to(clim[None, :, :], (int(n_pixels), clim.shape[0], clim.shape[1])).copy()
+
+
+def parse_climate_extra_features(spec: str | None) -> tuple[str, ...]:
+    """Parse a comma list into climate-trunk extra column names.
+
+    Accepted tokens: ``dry_spell``, ``gdd`` (soybean growing degree days),
+    ``wb`` (daily rain minus ETo), or ``all``. Empty / ``none`` means no extras.
+    """
+    text = "" if spec is None else str(spec).strip()
+    if not text or text.lower() in {"none", "off", "false"}:
+        return ()
+    out: list[str] = []
+    for part in text.replace(";", ",").split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        if key == "all":
+            for name in CLIMATE_TIMING_CHANNEL_NAMES:
+                if name not in out:
+                    out.append(name)
+            continue
+        name = _CLIMATE_EXTRA_ALIASES.get(key)
+        if name is None:
+            known = ", ".join(("dry_spell", "gdd", "wb", "all"))
+            raise ValueError(
+                f"Unknown climate extra {part.strip()!r}. Expected one of: {known}"
+            )
+        if name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def climate_extra_spec_from_run_config(run_config: dict | None) -> str:
+    """CLI string saved on the training run, or empty when the run has none."""
+    cli = (run_config or {}).get("cli") or {}
+    val = cli.get("climate_extra_features")
+    return "" if val is None else str(val)
+
+
+def climate_timing_features(raw_tc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Derived daily climate columns from one raw series ``[T, 5]``.
+
+    Returns ``(features, valid)`` with features ``[T, 3]`` in the order
+    ``dry_spell_days, gdd_cum_c, wb_daily_mm`` and a boolean mask of the same
+    shape. Invalid source days are finite on the cumulative columns (the
+    running value is frozen) and marked False in ``valid`` so scaler moments
+    can ignore them.
+
+    * dry spell: consecutive days with rain < 1 mm. A missing rain day keeps
+      the current streak and does not increment or reset it.
+    * soybean growing degree days: cumulative
+      ``max(0, (min(Tmax, 30) + Tmin) / 2 - 10)`` from the first day of the
+      series (Oct 1). A missing temperature day does not add degree days.
+    * water balance: that day's rain minus ETo, not a running sum.
+    """
+    x = np.asarray(raw_tc, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] < N_DAILY_CLIMATE:
+        raise ValueError(
+            f"climate_timing_features expects [T, {N_DAILY_CLIMATE}], got {x.shape}"
+        )
+    pr = x[:, 0]
+    eto = x[:, 1]
+    tmax = x[:, 3]
+    tmin = x[:, 4]
+    pr_bad = (pr == NO_DATA_VALUE) | ~np.isfinite(pr)
+    eto_bad = (eto == NO_DATA_VALUE) | ~np.isfinite(eto)
+    t_bad = (
+        (tmax == NO_DATA_VALUE)
+        | ~np.isfinite(tmax)
+        | (tmin == NO_DATA_VALUE)
+        | ~np.isfinite(tmin)
+    )
+    n = int(x.shape[0])
+    dry = np.zeros(n, dtype=np.float32)
+    gdd = np.zeros(n, dtype=np.float32)
+    wb = np.zeros(n, dtype=np.float32)
+    dry_ok = np.zeros(n, dtype=bool)
+    gdd_ok = np.zeros(n, dtype=bool)
+    wb_ok = np.zeros(n, dtype=bool)
+    streak = 0.0
+    cum = 0.0
+    for i in range(n):
+        if pr_bad[i]:
+            dry[i] = streak
+        else:
+            if float(pr[i]) < DRY_SPELL_MM:
+                streak += 1.0
+            else:
+                streak = 0.0
+            dry[i] = streak
+            dry_ok[i] = True
+        if t_bad[i]:
+            gdd[i] = cum
+        else:
+            tmx = min(float(tmax[i]), SOY_GDD_TMAX_CAP_C)
+            daily = max(0.0, 0.5 * (tmx + float(tmin[i])) - SOY_GDD_TBASE_C)
+            cum += daily
+            gdd[i] = cum
+            gdd_ok[i] = True
+        if pr_bad[i] or eto_bad[i]:
+            wb[i] = 0.0
+        else:
+            wb[i] = float(pr[i]) - float(eto[i])
+            wb_ok[i] = True
+    feats = np.stack([dry, gdd, wb], axis=1).astype(np.float32, copy=False)
+    valid = np.stack([dry_ok, gdd_ok, wb_ok], axis=1)
+    return feats, valid
 
 
 def climate_valid_mask(climate_ntc: np.ndarray) -> np.ndarray:

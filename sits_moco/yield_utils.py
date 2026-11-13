@@ -282,10 +282,19 @@ _MODEL_KWARG_FIELDS = (
     ("model_n_layers", "n_layers", int),
     ("model_d_inner", "d_inner", int),
     ("model_dropout", "dropout", float),
+    ("decoder_type", "decoder_type", str),
+    ("decoder_hidden_dims", "decoder_hidden_dims", str),
+    ("decoder_dropout", "decoder_dropout", float),
+    ("decoder_activation", "decoder_activation", str),
+    ("decoder_norm", "decoder_norm", str),
+    ("decoder_num_experts", "decoder_num_experts", int),
     ("temporal_pooling", "temporal_pooling", str),
     ("attn_pool_queries", "attn_pool_queries", int),
     ("soil_fusion", "soil_fusion", str),
     ("climate_pooling", "climate_pooling", str),
+    ("climate_d_model", "climate_d_model", int),
+    ("climate_n_head", "climate_n_head", int),
+    ("climate_d_inner", "climate_d_inner", int),
     ("climate_max_seq_len", "climate_max_seq_len", int),
     ("climate_sequencelength", "climate_max_seq_len", int),
     ("static_input", "static_input", bool),
@@ -320,8 +329,27 @@ def resolve_model_kwargs(
         }
         if mk.get("climate_pooling") is not None:
             kwargs["climate_pooling"] = str(mk["climate_pooling"])
+        for key in ("climate_d_model", "climate_n_head", "climate_d_inner"):
+            if mk.get(key) is not None:
+                kwargs[key] = int(mk[key])
         if mk.get("climate_max_seq_len") is not None:
             kwargs["climate_max_seq_len"] = int(mk["climate_max_seq_len"])
+        for key in (
+            "decoder_type",
+            "decoder_hidden_dims",
+            "decoder_activation",
+            "decoder_norm",
+        ):
+            if mk.get(key) is not None:
+                kwargs[key] = str(mk[key])
+        if mk.get("decoder_dropout") is not None:
+            kwargs["decoder_dropout"] = float(mk["decoder_dropout"])
+        if mk.get("decoder_num_experts") is not None:
+            kwargs["decoder_num_experts"] = int(mk["decoder_num_experts"])
+        if mk.get("recon_mode") is not None:
+            kwargs["recon_mode"] = str(mk["recon_mode"])
+        if mk.get("aux_yield_probe") is not None:
+            kwargs["aux_yield_probe"] = str(mk["aux_yield_probe"])
     else:
         kwargs = {}
         for cli_key, ctor_key, caster in _MODEL_KWARG_FIELDS:
@@ -350,10 +378,46 @@ def is_dual_stnet_state_dict(state_dict: dict) -> bool:
 def soil_fusion_from_state_dict(state_dict: dict, *, soil_dim: int = 4) -> str:
     """Infer early vs late soil fusion from STNet / DualSTNet weight shapes."""
     if is_dual_stnet_state_dict(state_dict):
-        dec_w = state_dict.get("decoder.0.weight")
-        if dec_w is None:
-            return "none"
-        decoder_in = int(dec_w.shape[1])
+        decoder_input_keys = (
+            "decoder.0.weight",  # legacy
+            "decoder.weight",  # linear
+            "decoder.0.0.weight",  # MLP
+            "decoder.blocks.0.branch.0.weight",  # residual
+            "decoder.linear.weight",  # linear + nonlinear correction
+            "decoder.gate.0.weight",  # gated
+            "decoder.joint.0.0.weight",  # modality additive + interaction
+            "decoder.experts.0.0.0.weight",  # mixture of MLP experts
+            "decoder.layers.0.0.weight",  # dense
+            "decoder.input.0.weight",  # highway
+            "decoder.projection.weight",  # Fourier features
+            "decoder.layers.0.linear.weight",  # maxout
+        )
+        dec_w = next(
+            (state_dict[key] for key in decoder_input_keys if key in state_dict),
+            None,
+        )
+        if dec_w is not None:
+            decoder_in = int(dec_w.shape[1])
+        else:
+            # Pure additive heads expose the modality widths separately.
+            additive = [
+                value
+                for key, value in state_dict.items()
+                if key.startswith("decoder.additive.") and key.endswith(".weight")
+            ]
+            if additive:
+                decoder_in = sum(int(weight.shape[1]) for weight in additive)
+            else:
+                # Modality-attention heads project each modality separately.
+                projections = [
+                    value
+                    for key, value in state_dict.items()
+                    if key.startswith("decoder.projections.")
+                    and key.endswith(".weight")
+                ]
+                if not projections:
+                    return "none"
+                decoder_in = sum(int(weight.shape[1]) for weight in projections)
         pooled = 0
         d_model_w = state_dict.get("spectral.mlp1.2.lin.weight")
         if d_model_w is not None:
@@ -584,6 +648,81 @@ def regression_metrics(y_pred, y_true, *, target_column: str = "production_t"):
         mape = np.nan
 
     return {"rmse": rmse, "mae": mae, "r2": r2, "mape": mape}
+
+
+def within_state_year_metrics(
+    y_pred,
+    y_true,
+    municipality_codes,
+    years,
+    *,
+    min_count: int = 20,
+) -> dict[str, float]:
+    """n-weighted mean R² / Spearman inside each (year × IBGE UF) cell.
+
+    Ignores cells with fewer than ``min_count`` municipalities. Returns NaN when
+    no cell qualifies. This is the honest multi-state ranking metric: pooled R²
+    can look strong while within-state ranking is near zero.
+    """
+    from training.aux_losses import ibge_state_from_code
+
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    if len(municipality_codes) != len(y_pred) or len(years) != len(y_pred):
+        return {
+            "within_state_r2": float("nan"),
+            "within_state_spearman": float("nan"),
+            "within_state_n_cells": 0.0,
+            "within_state_n": 0.0,
+        }
+
+    groups: dict[tuple, list[int]] = {}
+    for i, (code, year) in enumerate(zip(municipality_codes, years)):
+        if year is None:
+            continue
+        state = ibge_state_from_code(code)
+        if state is None:
+            continue
+        if not np.isfinite(y_pred[i]) or not np.isfinite(y_true[i]):
+            continue
+        groups.setdefault((int(year), state), []).append(i)
+
+    r2_w = 0.0
+    sp_w = 0.0
+    n_tot = 0
+    n_cells = 0
+    for indices in groups.values():
+        if len(indices) < int(min_count):
+            continue
+        yp = y_pred[indices]
+        yt = y_true[indices]
+        cell = regression_metrics(yp, yt, target_column="yield_t_ha")
+        # Spearman via rank Pearson (no scipy dependency here).
+        pred_rank = yp.argsort().argsort().astype(np.float64)
+        true_rank = yt.argsort().argsort().astype(np.float64)
+        pred_c = pred_rank - pred_rank.mean()
+        true_c = true_rank - true_rank.mean()
+        denom = np.sqrt((pred_c**2).sum() * (true_c**2).sum())
+        spearman = float((pred_c * true_c).sum() / denom) if denom > 1e-12 else 0.0
+        n = len(indices)
+        r2_w += float(cell["r2"]) * n
+        sp_w += spearman * n
+        n_tot += n
+        n_cells += 1
+
+    if n_tot == 0:
+        return {
+            "within_state_r2": float("nan"),
+            "within_state_spearman": float("nan"),
+            "within_state_n_cells": 0.0,
+            "within_state_n": 0.0,
+        }
+    return {
+        "within_state_r2": r2_w / n_tot,
+        "within_state_spearman": sp_w / n_tot,
+        "within_state_n_cells": float(n_cells),
+        "within_state_n": float(n_tot),
+    }
 
 
 def _metric_prefix_for_column(target_column: str) -> str:
@@ -940,6 +1079,8 @@ def test_epoch_aggregated(
     target_column = getattr(criterion, "target_column", "production_t")
     all_aggregated_preds = []
     all_targets = []
+    all_codes: list = []
+    all_years: list = []
     chunk_size = _pixel_chunk_size(args)
     batch_total = len(dataloader)
     epoch_start = time.perf_counter()
@@ -1013,11 +1154,25 @@ def test_epoch_aggregated(
 
             all_aggregated_preds.append(aggregated_preds.cpu().float().numpy())
             all_targets.append(targets.cpu().numpy())
+            all_codes.extend(list(municipalities))
+            if years is None:
+                all_years.extend([None] * len(municipalities))
+            else:
+                all_years.extend(list(years))
 
         all_aggregated_preds = np.concatenate(all_aggregated_preds)
         all_targets = np.concatenate(all_targets)
         scores = regression_metrics_bundle(
             all_aggregated_preds, all_targets, target_columns=target_column
+        )
+        scores.update(
+            within_state_year_metrics(
+                all_aggregated_preds,
+                all_targets,
+                all_codes,
+                all_years,
+                min_count=int(getattr(args, "within_state_min_count", 20) or 20),
+            )
         )
 
     return losses.avg, scores
