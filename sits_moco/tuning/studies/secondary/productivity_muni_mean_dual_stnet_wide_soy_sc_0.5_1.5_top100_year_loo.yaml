@@ -3,7 +3,7 @@
 # Year leave-one-out CV over harvest years 2020–2024 for the same top-100
 # DualSTNet arches as productivity_muni_mean_dual_stnet_wide_soy_pr_rs_0.5_1.5_top100.
 # Each trial runs 5 folds; objective is mean val_r2 across folds.
-# Fold Y trains on all other years; valid=test=year Y (CSV split ignored).
+# Fold Y: train/valid within other years (muni split); test=year Y only (CSV split ignored).
 # Input scaler is refit per fold onto that fold's train years.
 #
 # Coverage: MapBiomas/IBGE [0.5, 1.5].

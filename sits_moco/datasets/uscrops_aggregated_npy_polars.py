@@ -121,17 +121,41 @@ COVERAGE_RATIO_COL = "coverage_ratio"
 PRODUCTIVITY_DEV_SOURCE_COL = "yield_t_ha"
 PRODUCTIVITY_DEV_COL = "yield_t_ha_dev"
 YEAR_LOO_HOLDOUT_SPLIT = "holdout"
+DEFAULT_LOO_VALID_RATIO = 0.2
 
 
-def apply_year_loo_split(yield_df: pl.DataFrame, holdout_year: int) -> pl.DataFrame:
+def apply_year_loo_split(
+    yield_df: pl.DataFrame,
+    holdout_year: int,
+    *,
+    valid_ratio: float = DEFAULT_LOO_VALID_RATIO,
+    seed: int = 27,
+    municipality_code_col: str = "municipality_code",
+) -> pl.DataFrame:
     """
-    Ignore the CSV split column: train = every year except ``holdout_year``;
-    valid and test both use that year (leave-one-year-out).
+    Ignore the CSV split column for year leave-one-out:
+
+    - ``test`` = all rows in ``holdout_year`` (LOO year; never used for
+      checkpoint selection)
+    - non-holdout years are split by municipality into ``train`` / ``valid``
+      using ``valid_ratio`` (same assignment across those years)
+
+    Early stopping and best-checkpoint selection must use ``valid`` only.
     """
     if "year" not in yield_df.columns:
         raise ValueError(
             "Year leave-one-out requires a 'year' column in the yield CSV"
         )
+    if municipality_code_col not in yield_df.columns:
+        raise ValueError(
+            "Year leave-one-out requires "
+            f"{municipality_code_col!r} in the yield CSV"
+        )
+    if not (0.0 < float(valid_ratio) < 1.0):
+        raise ValueError(
+            f"loo valid_ratio must be in (0, 1), got {valid_ratio}"
+        )
+
     hy = int(holdout_year)
     years = sorted(
         {
@@ -144,24 +168,61 @@ def apply_year_loo_split(yield_df: pl.DataFrame, holdout_year: int) -> pl.DataFr
         raise ValueError(
             f"--holdout-year {hy} is not in the yield CSV years {years}"
         )
-    n_hold = len(yield_df.filter(pl.col("year") == hy))
-    n_train = len(yield_df.filter(pl.col("year") != hy))
-    if n_hold == 0:
+    n_test = len(yield_df.filter(pl.col("year") == hy))
+    n_non_hold = len(yield_df.filter(pl.col("year") != hy))
+    if n_test == 0:
         raise ValueError(f"--holdout-year {hy}: no rows in the yield CSV")
-    if n_train == 0:
+    if n_non_hold == 0:
         raise ValueError(
             f"--holdout-year {hy}: no remaining years for training"
         )
-    print(
-        f"  Year LOO: holdout={hy} → valid=test (n={n_hold}); "
-        f"train=other years (n={n_train})"
+
+    codes = pl.col(municipality_code_col).cast(pl.Utf8)
+    train_years_df = yield_df.filter(pl.col("year") != hy).with_columns(
+        codes.alias(municipality_code_col)
     )
-    return yield_df.with_columns(
+    munis = sorted(
+        {
+            str(m)
+            for m in train_years_df[municipality_code_col].drop_nulls().to_list()
+            if m is not None and str(m).strip() != ""
+        }
+    )
+    if len(munis) < 2:
+        raise ValueError(
+            f"--holdout-year {hy}: need at least 2 municipalities in "
+            f"non-holdout years to form train/valid, found {len(munis)}"
+        )
+
+    rng = np.random.RandomState(int(seed))
+    shuffled = np.array(munis, dtype=object)
+    rng.shuffle(shuffled)
+    n_valid_munis = int(round(len(shuffled) * float(valid_ratio)))
+    n_valid_munis = min(max(n_valid_munis, 1), len(shuffled) - 1)
+    valid_munis = {str(m) for m in shuffled[:n_valid_munis].tolist()}
+    n_train_munis = len(shuffled) - n_valid_munis
+
+    split_expr = (
         pl.when(pl.col("year") == hy)
-        .then(pl.lit(YEAR_LOO_HOLDOUT_SPLIT))
+        .then(pl.lit("test"))
+        .when(codes.is_in(sorted(valid_munis)))
+        .then(pl.lit("valid"))
         .otherwise(pl.lit("train"))
         .alias("split")
     )
+    out = yield_df.with_columns(codes.alias(municipality_code_col)).with_columns(
+        split_expr
+    )
+    n_train = len(out.filter(pl.col("split") == "train"))
+    n_valid = len(out.filter(pl.col("split") == "valid"))
+    print(
+        f"  Year LOO: holdout={hy} → test only (n={n_test}); "
+        f"train/valid within other years "
+        f"(train n={n_train} / {n_train_munis} munis; "
+        f"valid n={n_valid} / {n_valid_munis} munis; "
+        f"valid_ratio={float(valid_ratio):.3g}, seed={int(seed)})"
+    )
+    return out
 
 
 def parse_exclude_muni_years(spec: str | None) -> list[tuple[str, int]]:
@@ -582,6 +643,7 @@ class USCropsAggregatedNPY(Dataset):
         train_mid_yield_hi: float = DEFAULT_TRAIN_MID_YIELD_HI,
         train_mid_yield_bin_width: float = DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
         holdout_year: Optional[int] = None,
+        loo_valid_ratio: float = DEFAULT_LOO_VALID_RATIO,
         exclude_muni_years: str | None = None,
         normalize_targets: bool | None = None,
         legacy_input_scaling: bool = False,
@@ -707,8 +769,15 @@ class USCropsAggregatedNPY(Dataset):
         )
 
         self.holdout_year = int(holdout_year) if holdout_year is not None else None
+        self.loo_valid_ratio = float(loo_valid_ratio)
         if self.holdout_year is not None:
-            yield_df = apply_year_loo_split(yield_df, self.holdout_year)
+            yield_df = apply_year_loo_split(
+                yield_df,
+                self.holdout_year,
+                valid_ratio=self.loo_valid_ratio,
+                seed=int(seed),
+                municipality_code_col=municipality_code_col,
+            )
 
         # Train-only mid-band undersample (before productivity_dev baselines / split filter).
         yield_df = undersample_train_mid_yield_band(
@@ -735,18 +804,11 @@ class USCropsAggregatedNPY(Dataset):
 
         # Filter by split (skip filter when mode is "all" to use train/valid/test entries)
         if "split" in yield_df.columns and mode != "all":
-            split_mapping = {
-                "train": "train",
-                "valid": "valid",
-                "eval": "eval",
-                "test": "test",
-            }
-            target_split = split_mapping.get(mode, mode)
-            if self.holdout_year is not None and mode in ("valid", "eval", "test"):
-                target_split = YEAR_LOO_HOLDOUT_SPLIT
-            elif mode in ("valid", "eval", "test"):
-                # IID muni holdout CSVs label the val/test pool as "holdout"
-                # (shared by valid and test, same as year-LOO).
+            # "eval" is an alias of validation for checkpoint selection.
+            target_split = "valid" if mode == "eval" else mode
+            if self.holdout_year is None and mode in ("valid", "eval", "test"):
+                # IID muni holdout CSVs may label the val/test pool as "holdout"
+                # (shared by valid and test). Year-LOO writes distinct train/valid/test.
                 n_named = yield_df.filter(pl.col("split") == target_split).height
                 n_hold = yield_df.filter(
                     pl.col("split") == YEAR_LOO_HOLDOUT_SPLIT

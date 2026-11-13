@@ -118,6 +118,7 @@ FLOAT_PARAMS = frozenset(
         "train_mid_yield_lo",
         "train_mid_yield_hi",
         "train_mid_yield_bin_width",
+        "loo_valid_ratio",
     }
 )
 

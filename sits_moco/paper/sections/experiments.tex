@@ -14,8 +14,9 @@ Training and checkpoint selection use the municipal-mean path (Section~\ref{sec:
 \subsection{Year leave-one-out design}
 \label{sec:loo}
 We evaluate temporal generalization with year leave-one-out cross-validation (LOO) over harvest years 2020--2024.
-For each fold with left-out year $Y$, all municipality--years with harvest year $\neq Y$ are used for training on the municipal-mean path, and year $Y$ is held out entirely so that no municipality from $Y$ enters training.
-Model selection within the fold uses the municipal-mean validation loss on year $Y$; after training, each fold is scored on year $Y$ under both the municipal-mean path and the post-training pixel path.
+For each fold with left-out year $Y$, municipality--years with harvest year $\neq Y$ form the train/validation pool on the municipal-mean path, and year $Y$ is held out entirely for testing so that no observation from $Y$ enters training or checkpoint selection.
+Within the non-$Y$ years, municipalities are split once into an 80\%/20\% train/validation partition (shared across those years); early stopping and best-checkpoint selection use only the validation municipalities.
+After training, each fold is scored on year $Y$ under both the municipal-mean path and the post-training pixel path.
 Input standardization is refit on each fold's training years.
 This yields five independently trained checkpoints, one per left-out year.
 
@@ -60,4 +61,4 @@ Appendix~\ref{app:muni-mean-eval} reports the municipal-mean counterparts of the
 \label{sec:exp-ablations}
 To isolate each modality we retrain three ablations on the same year-LOO folds as the full model, each omitting one input stream: no soil (Sentinel-2 + climate), no climate (Sentinel-2 + soil), and no Sentinel-2 (climate + soil).
 Hyperparameters match full MSTNet; only the inputs change---late soil fusion is dropped, or the climate trunk is removed, or the Sentinel-2 trunk is removed.
-Checkpoint selection still uses municipal-mean validation loss on the held-out year; Section~\ref{sec:ablations} and Appendix~\ref{app:ablations-muni} report pixel-path and municipal-mean scores.
+Checkpoint selection still uses municipal-mean validation loss within the train years of each fold (never the left-out year); Section~\ref{sec:ablations} and Appendix~\ref{app:ablations-muni} report pixel-path and municipal-mean scores.

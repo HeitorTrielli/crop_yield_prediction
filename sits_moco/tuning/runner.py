@@ -63,6 +63,7 @@ FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "head_output": ("--head-output",),
     "harvest_years": ("--harvest-years",),
     "holdout_year": ("--holdout-year",),
+    "loo_valid_ratio": ("--loo-valid-ratio",),
     "feature_layout": ("--feature-layout",),
     "extra_scaler": ("--extra-scaler",),
     "refit_extra_scaler": ("--refit-extra-scaler",),

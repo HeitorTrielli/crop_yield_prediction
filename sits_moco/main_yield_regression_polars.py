@@ -37,6 +37,7 @@ from datasets.feature_layout import (
     normalize_feature_layout,
 )
 from datasets.uscrops_aggregated_npy_polars import (
+    DEFAULT_LOO_VALID_RATIO,
     DEFAULT_MAX_COVERAGE_RATIO,
     DEFAULT_MIN_COVERAGE_RATIO,
     DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
@@ -480,8 +481,18 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Leave-one-year-out: train on --harvest-years except this year; "
-            "valid and test both use this year (ignores the CSV split column)."
+            "Leave-one-year-out: train/valid on --harvest-years except this year; "
+            "test uses only this year (ignores the CSV split column). "
+            "Checkpoint selection uses validation within the train years."
+        ),
+    )
+    parser.add_argument(
+        "--loo-valid-ratio",
+        type=float,
+        default=DEFAULT_LOO_VALID_RATIO,
+        help=(
+            "With --holdout-year: fraction of municipalities in non-holdout years "
+            f"assigned to validation (remainder train). Default: {DEFAULT_LOO_VALID_RATIO}."
         ),
     )
     parser.add_argument(
@@ -964,6 +975,11 @@ def parse_args():
                 f"--holdout-year {args.holdout_year} must be one of --harvest-years "
                 f"{sorted(args.harvest_years_set)}"
             )
+    args.loo_valid_ratio = float(args.loo_valid_ratio)
+    if not (0.0 < args.loo_valid_ratio < 1.0):
+        raise ValueError(
+            f"--loo-valid-ratio must be in (0, 1), got {args.loo_valid_ratio}"
+        )
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1073,6 +1089,7 @@ def compute_target_statistics(
     train_mid_yield_bin_width=DEFAULT_TRAIN_MID_YIELD_BIN_WIDTH,
     seed=DEFAULT_SEED,
     holdout_year: int | None = None,
+    loo_valid_ratio: float = DEFAULT_LOO_VALID_RATIO,
     exclude_muni_years: str | None = None,
 ):
     """
@@ -1103,7 +1120,12 @@ def compute_target_statistics(
         )
     yield_df = apply_exclude_muni_years(yield_df, exclude_muni_years)
     if holdout_year is not None:
-        yield_df = apply_year_loo_split(yield_df, int(holdout_year))
+        yield_df = apply_year_loo_split(
+            yield_df,
+            int(holdout_year),
+            valid_ratio=float(loo_valid_ratio),
+            seed=int(seed),
+        )
     yield_df = undersample_train_mid_yield_band(
         yield_df,
         keep_fraction=train_mid_yield_keep_fraction,
@@ -1369,11 +1391,13 @@ def train(args):
             "train_years_in_csv": train_years,
             "eval_years_in_csv": [hy],
             "year_loo": True,
+            "loo_valid_ratio": float(args.loo_valid_ratio),
         }
         split_design = split_design_for_config(csv_design, args.harvest_years_set)
         print(
-            f"Year leave-one-out: holdout={hy} (valid=test); "
-            f"train years={train_years}"
+            f"Year leave-one-out: holdout={hy} (test only); "
+            f"train/valid within years={train_years} "
+            f"(loo_valid_ratio={float(args.loo_valid_ratio):.3g})"
         )
     else:
         split_design = split_design_for_config(
@@ -1402,6 +1426,7 @@ def train(args):
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         seed=args.seed,
         holdout_year=args.holdout_year,
+        loo_valid_ratio=args.loo_valid_ratio,
         exclude_muni_years=args.exclude_muni_years,
     )
     print(
@@ -1452,6 +1477,7 @@ def train(args):
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         holdout_year=args.holdout_year,
+        loo_valid_ratio=args.loo_valid_ratio,
         exclude_muni_years=args.exclude_muni_years,
         normalize_targets=normalize_targets,
         **dl_opts,
@@ -1486,6 +1512,7 @@ def train(args):
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         holdout_year=args.holdout_year,
+        loo_valid_ratio=args.loo_valid_ratio,
         exclude_muni_years=args.exclude_muni_years,
         normalize_targets=normalize_targets,
         **dl_opts,
@@ -1520,6 +1547,7 @@ def train(args):
         train_mid_yield_hi=args.train_mid_yield_hi,
         train_mid_yield_bin_width=args.train_mid_yield_bin_width,
         holdout_year=args.holdout_year,
+        loo_valid_ratio=args.loo_valid_ratio,
         exclude_muni_years=args.exclude_muni_years,
         normalize_targets=normalize_targets,
         **dl_opts,
@@ -2127,6 +2155,7 @@ def train(args):
             "holdout_year": (
                 int(args.holdout_year) if args.holdout_year is not None else None
             ),
+            "loo_valid_ratio": float(args.loo_valid_ratio),
             "exclude_muni_years": args.exclude_muni_years,
             "head_output": head_output,
             "normalize_targets": bool(normalize_targets),
@@ -2360,6 +2389,7 @@ def get_aggregated_dataloader(
     persistent_workers: bool = False,
     prefetch_factor: int | None = 4,
     holdout_year: int | None = None,
+    loo_valid_ratio: float = DEFAULT_LOO_VALID_RATIO,
     exclude_muni_years: str | None = None,
     normalize_targets: bool | None = None,
 ):
@@ -2394,6 +2424,7 @@ def get_aggregated_dataloader(
         train_mid_yield_hi=train_mid_yield_hi,
         train_mid_yield_bin_width=train_mid_yield_bin_width,
         holdout_year=holdout_year,
+        loo_valid_ratio=loo_valid_ratio,
         exclude_muni_years=exclude_muni_years,
         normalize_targets=normalize_targets,
     )
