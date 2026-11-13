@@ -1,0 +1,620 @@
+{
+  "version": 1,
+  "sessions": [
+    {
+      "session_index": 0,
+      "kind": "initial",
+      "cli": {
+        "aggregation": "mean",
+        "aggregations": [
+          "mean"
+        ],
+        "attn_pool_queries": 4,
+        "auto_chunks_per_grad": false,
+        "auto_chunks_per_grad_min": 1,
+        "auto_chunks_per_grad_narrow_threshold": 32,
+        "auto_chunks_per_grad_refine_radius": 24,
+        "auto_chunks_per_grad_vram_frac": 0.95,
+        "auto_chunks_per_grad_vram_target_frac": 0.9,
+        "auto_pixel_chunk_size_min": null,
+        "auto_pixel_chunk_size_step": 100,
+        "aux_loss": "none",
+        "aux_loss_weight": 0.1,
+        "aux_min_std": 0.05,
+        "batch_empty_cache": false,
+        "batchsize": 40,
+        "checkpoint_every": 0,
+        "chunks_per_grad": 1,
+        "climate_d_inner": null,
+        "climate_d_model": null,
+        "climate_extra_features": "",
+        "climate_n_head": null,
+        "climate_pooling": null,
+        "climate_sequencelength": 183,
+        "compile_mode": "default",
+        "dataloader_persistent_workers": true,
+        "dataloader_prefetch_factor": 4,
+        "datapath": "/home/emap/sits_moco_data/npy_muni_mean_soy",
+        "dataset": "USCropsAggregatedNPY",
+        "device": "cuda",
+        "disable_pipeline_h2d": false,
+        "early_stop_patience": 15,
+        "epochs": 1000,
+        "exclude_muni_years": null,
+        "extra_scaler": "files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_sc_0.5_1.5_loo2023.json",
+        "feature_layout": "dual_spectral_daily_climate_soil",
+        "h2d_pin_host": false,
+        "harvest_years": "2020,2021,2022,2023,2024",
+        "harvest_years_set": [
+          2020,
+          2021,
+          2022,
+          2023,
+          2024
+        ],
+        "head_output": null,
+        "holdout_year": 2023,
+        "interp": false,
+        "learning_rate": 0.001,
+        "legacy_zero_grad": false,
+        "logdir": "./results",
+        "max_coverage_ratio": null,
+        "min_coverage_ratio": null,
+        "min_images": 0,
+        "min_months": 0,
+        "model_d_inner": 256,
+        "model_d_model": 128,
+        "model_dropout": 0.3,
+        "model_n_head": 4,
+        "model_n_layers": 1,
+        "no_compile": true,
+        "no_coverage_filter": true,
+        "no_dataloader_pin_memory": false,
+        "normalize_targets": true,
+        "npy_cache_size": 20,
+        "num_outputs": 1,
+        "overwrite_run": true,
+        "pixel_chunk_size": 8,
+        "prefetch_chunks": 4,
+        "pretrained": null,
+        "pretrained_climate": null,
+        "quiet_training": true,
+        "rc": false,
+        "refit_extra_scaler": true,
+        "run_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023",
+        "sample_ratio": 1.0,
+        "schedule": [
+          40,
+          120
+        ],
+        "seed": 101010,
+        "sequencelength": 45,
+        "skip_batch_empty_cache": true,
+        "soil_fusion": "late",
+        "suffix": "dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_yloo_trial_044_loo2023",
+        "target": "productivity",
+        "target_column": "yield_t_ha",
+        "target_columns": [
+          "yield_t_ha"
+        ],
+        "target_names": [
+          "productivity"
+        ],
+        "target_unit": "t/ha",
+        "temporal_pooling": "ndvi",
+        "train_mid_yield_bin_width": 0.25,
+        "train_mid_yield_hi": 4.25,
+        "train_mid_yield_keep_fraction": null,
+        "train_mid_yield_lo": 3.0,
+        "units": [
+          "t/ha"
+        ],
+        "warmup_epochs": 0,
+        "weight_decay": 0.0005,
+        "workers": 4,
+        "yield_csv": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/files/pam_soy_pr_rs_sp_go_sc_mapbiomas_coverage_0.5_1.5.csv",
+        "zero_grad_set_to_none": true
+      },
+      "computed": {
+        "model_run_name": "Productivity_DualSTNetRegression_20_21_22_23_24_Seed101010_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_yloo_trial_044_loo2023",
+        "experiment_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023",
+        "feature_layout": "dual_spectral_daily_climate_soil",
+        "input_dim": 14,
+        "target": "productivity",
+        "yield_target_column": "yield_t_ha",
+        "municipality_aggregation": "mean",
+        "target_unit": "t/ha",
+        "target_names": [
+          "productivity"
+        ],
+        "num_outputs": 1,
+        "target_mean": 2.935288560555182,
+        "target_std": 0.8821545714578084,
+        "extra_scaler_path": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_sc_0.5_1.5_loo2023.json",
+        "extra_scaler": {
+          "version": 2,
+          "aggregation": "spatial_mean_per_muni_date",
+          "std_floor": 1e-06,
+          "n_frames": {
+            "spectral": 81581,
+            "extras": 27083,
+            "extras_delta": 27083,
+            "soil": 4467,
+            "daily_climate": 783343
+          },
+          "spectral": {
+            "channels": [
+              "B2",
+              "B3",
+              "B4",
+              "B5",
+              "B6",
+              "B7",
+              "B8",
+              "B8A",
+              "B11",
+              "B12"
+            ],
+            "mean": [
+              0.056396275758743286,
+              0.08556961268186569,
+              0.09851820766925812,
+              0.14690406620502472,
+              0.2714427709579468,
+              0.3219074308872223,
+              0.3239835202693939,
+              0.34499743580818176,
+              0.2831113040447235,
+              0.19300685822963715
+            ],
+            "std": [
+              0.023959528654813766,
+              0.02523087151348591,
+              0.04416549205780029,
+              0.03888540714979172,
+              0.058939795941114426,
+              0.08620577305555344,
+              0.08411553502082825,
+              0.08719801902770996,
+              0.05694729462265968,
+              0.062062010169029236
+            ],
+            "var": [
+              0.0005740590277127922,
+              0.0006365968729369342,
+              0.0019505906384438276,
+              0.0015120749594643712,
+              0.003473899560049176,
+              0.007431435398757458,
+              0.007075423840433359,
+              0.007603494916111231,
+              0.0032429941929876804,
+              0.0038516931235790253
+            ],
+            "n_frames_per_channel": [
+              81580,
+              81581,
+              81580,
+              81581,
+              81581,
+              81581,
+              81581,
+              81581,
+              81581,
+              81581
+            ]
+          },
+          "extras": {
+            "channels": [
+              "rain_cum_mm",
+              "dry_streak_days",
+              "eto_cum_mm",
+              "rs_cum_mjm2",
+              "tmax_cum_cday",
+              "tmin_cum_cday"
+            ],
+            "mean": [
+              484.1229553222656,
+              2.846961259841919,
+              2778.715576171875,
+              1741.54833984375,
+              1889.7874755859375,
+              430.0246276855469
+            ],
+            "std": [
+              296.190185546875,
+              2.03672456741333,
+              1614.2725830078125,
+              1035.9530029296875,
+              1125.932861328125,
+              254.85365295410156
+            ],
+            "var": [
+              87728.625,
+              4.148247241973877,
+              2605876.0,
+              1073198.5,
+              1267724.75,
+              64950.38671875
+            ],
+            "n_frames_per_channel": [
+              27083,
+              27083,
+              26558,
+              26558,
+              26558,
+              26558
+            ]
+          },
+          "extras_delta": {
+            "channels": [
+              "rain_cum_mm_delta",
+              "dry_streak_days_delta",
+              "eto_cum_mm_delta",
+              "rs_cum_mjm2_delta",
+              "tmax_cum_cday_delta",
+              "tmin_cum_cday_delta"
+            ],
+            "mean": [
+              40.869651794433594,
+              0.11396707594394684,
+              243.20394897460938,
+              153.03292846679688,
+              164.53250122070312,
+              36.95640563964844
+            ],
+            "std": [
+              77.34677124023438,
+              2.380063533782959,
+              245.0215301513672,
+              159.61390686035156,
+              159.05514526367188,
+              35.302486419677734
+            ],
+            "var": [
+              5982.5224609375,
+              5.66470193862915,
+              60035.546875,
+              25476.59765625,
+              25298.541015625,
+              1246.2655029296875
+            ],
+            "n_frames_per_channel": [
+              27083,
+              27083,
+              26558,
+              26558,
+              26558,
+              26558
+            ]
+          },
+          "soil": {
+            "channels": [
+              "clay_pct",
+              "silt_pct",
+              "sand_pct",
+              "soc_t_ha"
+            ],
+            "mean": [
+              45.36835479736328,
+              22.887836456298828,
+              31.73244857788086,
+              54.03657531738281
+            ],
+            "std": [
+              15.04482650756836,
+              8.777721405029297,
+              20.295076370239258,
+              11.038545608520508
+            ],
+            "var": [
+              226.34681701660156,
+              77.04838562011719,
+              411.89013671875,
+              121.84947967529297
+            ],
+            "n_frames_per_channel": [
+              4467,
+              4467,
+              4467,
+              4467
+            ]
+          },
+          "daily_climate": {
+            "channels": [
+              "pr_mm",
+              "eto_mm",
+              "rs_mjm2",
+              "tmax_c",
+              "tmin_c"
+            ],
+            "mean": [
+              5.213573932647705,
+              4.4738874435424805,
+              20.40784454345703,
+              30.137861251831055,
+              18.79753303527832
+            ],
+            "std": [
+              10.319206237792969,
+              1.375927448272705,
+              6.425053119659424,
+              4.032932281494141,
+              3.030597448348999
+            ],
+            "var": [
+              106.48602294921875,
+              1.8931764364242554,
+              41.281307220458984,
+              16.264541625976562,
+              9.184520721435547
+            ],
+            "n_frames_per_channel": [
+              783343,
+              783343,
+              783343,
+              783343,
+              783343
+            ]
+          },
+          "derived": {
+            "wb_mm": {
+              "mean": -2288.342529296875,
+              "std": 1382.7999267578125,
+              "var": 1912135.5
+            },
+            "dtr_cday": {
+              "mean": 1459.7552490234375,
+              "std": 872.660888671875,
+              "var": 761537.0625
+            },
+            "tmean_cday": {
+              "mean": 1159.909423828125,
+              "std": 689.8945922851562,
+              "var": 475954.5625
+            }
+          },
+          "units": {
+            "spectral": "reflectance_0_1_after_1e-4",
+            "extras": "raw_npy_units",
+            "soil": "mapbiomas_solo_pct_and_t_ha",
+            "daily_climate": "raw_daily_xavier_pr_eto_rs_tmax_tmin",
+            "daily_climate_derived": "dry_spell_days=consecutive pr<1mm (nodata freezes the streak); gdd_cum_c=soybean degree-days base 10C, Tmax capped at 30C, cumulative from Oct 1; wb_daily_mm=daily pr-ETo"
+          },
+          "daily_climate_derived": {
+            "dry_spell_days": {
+              "mean": 1.8044407367706299,
+              "std": 2.7478888034820557,
+              "var": 7.5508928298950195
+            },
+            "gdd_cum_c": {
+              "mean": 1195.577392578125,
+              "std": 747.1226806640625,
+              "var": 558192.3125
+            },
+            "wb_daily_mm": {
+              "mean": 0.7419712543487549,
+              "std": 11.00164794921875,
+              "var": 121.03624725341797
+            }
+          },
+          "datapath": "/home/emap/sits_moco_data/npy_muni_mean_soy",
+          "n_series": 4467,
+          "n_missing": 0,
+          "harvest_years": [
+            2020,
+            2021,
+            2022,
+            2024
+          ],
+          "feature_layout": "dual_spectral_daily_climate_soil"
+        },
+        "holdout_year": 2023,
+        "exclude_muni_years": null,
+        "head_output": "zscore",
+        "normalize_targets": true,
+        "productivity_dev_baseline": null,
+        "min_images": 0,
+        "min_months": 0,
+        "num_train_municipalities": 4467,
+        "num_valid_municipalities": 1163,
+        "num_test_municipalities": 1163,
+        "dataloader_meta": {
+          "train": {
+            "ndims": 14,
+            "num_outputs": 1,
+            "num_municipalities": 4467,
+            "use_xavier": false,
+            "feature_layout": "dual_spectral_daily_climate_soil",
+            "target_columns": [
+              "yield_t_ha"
+            ]
+          },
+          "valid": {
+            "ndims": 14,
+            "num_outputs": 1,
+            "num_municipalities": 1163,
+            "use_xavier": false,
+            "feature_layout": "dual_spectral_daily_climate_soil",
+            "target_columns": [
+              "yield_t_ha"
+            ]
+          },
+          "test": {
+            "ndims": 14,
+            "num_outputs": 1,
+            "num_municipalities": 1163,
+            "use_xavier": false,
+            "feature_layout": "dual_spectral_daily_climate_soil",
+            "target_columns": [
+              "yield_t_ha"
+            ]
+          }
+        },
+        "imagery_years_available": [
+          2020,
+          2021,
+          2022,
+          2023,
+          2024
+        ],
+        "imagery_years_used": [
+          2020,
+          2021,
+          2022,
+          2023,
+          2024
+        ],
+        "split_design": {
+          "holdout_years": [
+            2023
+          ],
+          "train_years_in_csv": [
+            2020,
+            2021,
+            2022,
+            2024
+          ],
+          "eval_years_in_csv": [
+            2023
+          ],
+          "year_loo": true,
+          "harvest_years_filter": [
+            2020,
+            2021,
+            2022,
+            2023,
+            2024
+          ],
+          "holdout_years_in_harvest_filter": [
+            2023
+          ],
+          "holdout_years_excluded_by_harvest_filter": []
+        },
+        "model_kwargs": {
+          "d_model": 128,
+          "n_head": 4,
+          "n_layers": 1,
+          "d_inner": 256,
+          "dropout": 0.3,
+          "temporal_pooling": "ndvi",
+          "attn_pool_queries": 4,
+          "soil_fusion": "late",
+          "use_spectral": true,
+          "use_climate": true,
+          "climate_pooling": "mean",
+          "climate_max_seq_len": 183
+        },
+        "early_stop_patience": 15,
+        "chunk_pipeline": {
+          "auto_chunks_per_grad": false,
+          "chunks_per_grad_requested": 1,
+          "chunks_per_grad_effective": 1,
+          "pixel_chunk_size_requested": 8,
+          "pixel_chunk_size_effective": 8,
+          "max_pixels_per_backward_requested": 8,
+          "max_pixels_per_backward_effective": 8,
+          "restored_from_prior_session": false,
+          "search_trials": []
+        },
+        "epoch_plan": {
+          "start_epoch": 0,
+          "end_epoch_exclusive": 1000,
+          "num_epochs_this_session": 1000
+        }
+      },
+      "run_paths": {
+        "experiment_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023",
+        "run_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023",
+        "training_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023/training",
+        "predictions_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023/predictions",
+        "figures_dir": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023/figures",
+        "best_model_path": "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023/training/model_best.pth"
+      },
+      "resume": null,
+      "environment": {
+        "saved_at_utc": "2026-10-13T06:50:03.227132+00:00",
+        "argv": [
+          "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/main_yield_regression_polars.py",
+          "--target",
+          "productivity",
+          "--harvest-years",
+          "2020,2021,2022,2023,2024",
+          "-b",
+          "40",
+          "--checkpoint-every",
+          "0",
+          "--chunks-per-grad",
+          "1",
+          "--climate-sequencelength",
+          "183",
+          "--datapath",
+          "/home/emap/sits_moco_data/npy_muni_mean_soy",
+          "--early-stop-patience",
+          "15",
+          "-e",
+          "1000",
+          "--extra-scaler",
+          "files/train_input_scaler_dual_muni_mean_soy_pr_rs_sp_go_sc_0.5_1.5_loo2023.json",
+          "--feature-layout",
+          "dual_spectral_daily_climate_soil",
+          "--holdout-year",
+          "2023",
+          "-lr",
+          "0.001",
+          "-l",
+          "./results",
+          "--model-d-inner",
+          "256",
+          "--model-d-model",
+          "128",
+          "--model-dropout",
+          "0.3",
+          "--model-n-head",
+          "4",
+          "--model-n-layers",
+          "1",
+          "--no-compile",
+          "--no-coverage-filter",
+          "--overwrite-run",
+          "--pixel-chunk-size",
+          "8",
+          "--prefetch-chunks",
+          "4",
+          "--quiet-training",
+          "--refit-extra-scaler",
+          "--run-dir",
+          "/mnt/c/Users/ADM/Desktop/Produtividade/crop_yield_prediction/sits_moco/results/tuning/productivity_muni_mean_dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_year_loo/trial_044/loo2023",
+          "--sample-ratio",
+          "1",
+          "--schedule",
+          "40",
+          "120",
+          "--seed",
+          "101010",
+          "-seq",
+          "45",
+          "--soil-fusion",
+          "late",
+          "-s",
+          "dual_stnet_wide_soy_pr_rs_sp_go_sc_0.5_1.5_top100_yloo_trial_044_loo2023",
+          "--temporal-pooling",
+          "ndvi",
+          "--warmup-epochs",
+          "0",
+          "--weight-decay",
+          "0.0005",
+          "-j",
+          "4",
+          "--yield-csv",
+          "files/pam_soy_pr_rs_sp_go_sc_mapbiomas_coverage_0.5_1.5.csv"
+        ],
+        "python": "3.12.13",
+        "torch": "2.9.1+cu128",
+        "numpy": "2.3.5",
+        "polars": "1.35.2",
+        "torch_compiled": false
+      }
+    }
+  ]
+}
